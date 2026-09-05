@@ -1,0 +1,25 @@
+.vscode
+
+# zig
+.zig-cache
+zig-out
+*.a
+*.so
+*.dylib
+*.o
+
+# Claude Code
+.claude/settings.local.json
+.claude/teams/
+.claude/tasks/
+.claude/projects/
+.claude/scratchpad.md
+.claude/session-counter
+.claude/logs/
+
+# zr
+.zr_history
+
+# OS
+.DS_Store
+Thumbs.db
