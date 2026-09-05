@@ -1,21 +1,18 @@
 .vscode
 
 # zig
-.zig-cache
-zig-out
+.zig-cache/
+zig-out/
+zig-pkg/
 *.a
 *.so
 *.dylib
 *.o
-
-# Claude Code
-.claude/settings.local.json
-.claude/teams/
-.claude/tasks/
-.claude/projects/
-.claude/scratchpad.md
-.claude/session-counter
-.claude/logs/
+*.log
+*.db
+test_*
+/test
+verify_*
 
 # zr
 .zr_history
