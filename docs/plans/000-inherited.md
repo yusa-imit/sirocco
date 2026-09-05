@@ -1,5 +1,8 @@
 # sirocco — Milestones
 
+> Inherited roadmap, frozen at the kingdom restructure (2026-09-05). New work is planned in
+> docs/plans/NNN-*.md via plan PRs (citadel/protocol/GITHUB.md).
+
 > 마일스톤은 **이름(테마)** 으로 관리한다. 버전 번호는 릴리즈 시점에 `build.zig.zon` 현재 버전 + 1 로 결정한다.
 > 상세 요구사항: `docs/PRD.md`. 진행 상황은 이 파일의 체크박스가 단일 진실이다.
 
