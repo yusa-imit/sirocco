@@ -15,13 +15,12 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  # Native macOS runners cannot link libSystem with Zig 0.15 on GitHub's images
+  # (undefined _abort/_malloc/...), so tests run on Linux only; macOS/Windows are
+  # covered by cross-compilation below and by the local (macOS) autonomous sessions.
   build-and-test:
-    name: Build & Test (${{ matrix.os }})
-    runs-on: ${{ matrix.os }}
-    strategy:
-      fail-fast: false
-      matrix:
-        os: [ubuntu-latest, macos-latest]
+    name: Build & Test
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5
       - name: Install Zig
