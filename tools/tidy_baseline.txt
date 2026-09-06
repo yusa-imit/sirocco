@@ -1,0 +1,3 @@
+# tidy function-length baseline (tiger-style.md §5, ratchet ceiling function_len_redzone_max=72).
+# format: path:function:lines_max — one entry per line; recorded lines_max may only shrink.
+# empty: no function in this repo is over function_len_max (70) as of this baseline's creation.

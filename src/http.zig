@@ -1,4 +1,5 @@
-//! sirocco.http — HTTP/1.1 parser, client (retry/redirect/pool/proxy), server (graceful shutdown), HTTP/2 (HPACK, streams).
+//! sirocco.http — HTTP/1.1 parser, client (retry/redirect/pool/proxy).
+//! Server (graceful shutdown), HTTP/2 (HPACK, streams).
 //!
 //! Planned files (see docs/PRD.md):
 //!   - `http/parser.zig`

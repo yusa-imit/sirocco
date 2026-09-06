@@ -1,4 +1,5 @@
-//! sirocco.tls — TLS 1.3 client/server on std.crypto.tls with async handshake, ALPN, SNI, PEM loading.
+//! sirocco.tls — TLS 1.3 client/server on std.crypto.tls with async handshake.
+//! Covers ALPN, SNI, PEM loading.
 //!
 //! Planned files (see docs/PRD.md):
 //!   - `tls/client.zig`

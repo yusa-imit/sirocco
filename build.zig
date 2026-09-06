@@ -46,6 +46,31 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&run_mod_tests.step);
     test_step.dependOn(&run_exe_tests.step);
 
+    // Tidy — Tiger Style mechanical checks (tools/tidy.zig), run over src/bench/tests.
+    const tidy_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tools/tidy.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+    const run_tidy_tests = b.addRunArtifact(tidy_tests);
+    const tidy_exe = b.addExecutable(.{
+        .name = "tidy",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tools/tidy_main.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+    b.installArtifact(tidy_exe);
+    const run_tidy_exe = b.addRunArtifact(tidy_exe);
+    run_tidy_exe.addArgs(&.{ "src", "bench", "tests" });
+    run_tidy_exe.step.dependOn(&run_tidy_tests.step);
+    const tidy_step = b.step("tidy", "Run Tiger Style mechanical checks");
+    tidy_step.dependOn(&run_tidy_exe.step);
+    test_step.dependOn(&run_tidy_exe.step);
+
     // Benchmarks
     const bench = b.addExecutable(.{
         .name = "sirocco-bench",

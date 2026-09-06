@@ -1,4 +1,5 @@
-//! sirocco.io — Event loop, completions, timers, cancellation. Backends: kqueue, epoll, io_uring, iocp.
+//! sirocco.io — Event loop, completions, timers, cancellation.
+//! Backends: kqueue, epoll, io_uring, iocp.
 //!
 //! Planned files (see docs/PRD.md):
 //!   - `io/completion.zig`
