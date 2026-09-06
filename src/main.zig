@@ -1,3 +1,7 @@
+//! sirocco CLI — minimal diagnostics: `version` and `--help`.
+//!
+//! Grows subcommands as PRD phases land; see docs/PRD.md.
+
 const std = @import("std");
 const sirocco = @import("sirocco");
 

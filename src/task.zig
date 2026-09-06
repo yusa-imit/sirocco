@@ -1,4 +1,5 @@
-//! sirocco.task — Thread pool, bounded channel, wait group, hierarchical cancellation, multi-loop scheduler.
+//! sirocco.task — Thread pool, bounded channel, wait group.
+//! Hierarchical cancellation, multi-loop scheduler.
 //!
 //! Planned files (see docs/PRD.md):
 //!   - `task/thread_pool.zig`
