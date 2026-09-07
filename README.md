@@ -6,7 +6,7 @@ sirocco는 kqueue/epoll/io_uring/IOCP를 하나의 완성 기반(completion-base
 
 [![CI](https://github.com/yusa-imit/sirocco/workflows/CI/badge.svg)](https://github.com/yusa-imit/sirocco/actions)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
-[![Zig](https://img.shields.io/badge/zig-0.15.x-orange.svg)](https://ziglang.org)
+[![Zig](https://img.shields.io/badge/zig-0.16.x-orange.svg)](https://ziglang.org)
 
 ---
 

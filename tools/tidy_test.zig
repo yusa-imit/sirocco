@@ -423,10 +423,12 @@ const real_paths = [_][]const u8{
 
 test "tidy: every real src/ file today produces zero violations under lib bans" {
     const gpa = std.testing.allocator;
+    const io = std.testing.io;
     const source_bytes_max = 64 * 1024;
 
     for (real_paths) |path| {
-        const source = try std.fs.cwd().readFileAlloc(gpa, path, source_bytes_max);
+        const dir = std.Io.Dir.cwd();
+        const source = try dir.readFileAlloc(io, path, gpa, .limited(source_bytes_max));
         defer gpa.free(source);
 
         var options = baseOptions(path);

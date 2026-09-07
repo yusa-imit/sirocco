@@ -22,13 +22,10 @@ const baseline_entries_max = 256;
 const baseline_bytes_max = 64 * 1024;
 const header_probe_bytes_max = 256;
 
-pub fn main() !void {
-    var gpa_state: std.heap.GeneralPurposeAllocator(.{}) = .{};
-    defer _ = gpa_state.deinit();
-    const gpa = gpa_state.allocator();
-
-    const args = try std.process.argsAlloc(gpa);
-    defer std.process.argsFree(gpa, args);
+pub fn main(init: std.process.Init) !void {
+    const gpa = init.gpa;
+    const io = init.io;
+    const args = try init.minimal.args.toSlice(init.arena.allocator());
     assert(args.len >= 1);
 
     var dirs_buf: [dirs_max][]const u8 = undefined;
@@ -40,17 +37,17 @@ pub fn main() !void {
     assert(dirs.len > 0);
     assert(dirs.len <= dirs_max);
 
-    var baseline = try loadBaseline(gpa);
+    var baseline = try loadBaseline(io, gpa);
     defer baseline.deinit(gpa);
 
     var stderr_buffer: [4096]u8 = undefined;
-    var stderr_writer = std.fs.File.stderr().writer(&stderr_buffer);
+    var stderr_writer = std.Io.File.stderr().writer(io, &stderr_buffer);
     const err_out = &stderr_writer.interface;
     defer err_out.flush() catch {};
 
     var violations_total: usize = 0;
     for (dirs) |dir_path| {
-        violations_total += try checkDir(gpa, dir_path, baseline.entries, err_out);
+        violations_total += try checkDir(io, gpa, dir_path, baseline.entries, err_out);
     }
 
     if (violations_total > 0) {
@@ -74,9 +71,11 @@ const Baseline = struct {
 /// Loads and parses `tidy_baseline.txt` from the working directory. A missing file is not an
 /// error: it means no function is baselined yet. Format: `path:function:lines_max` one entry
 /// per line; blank lines and lines starting with `#` are ignored.
-fn loadBaseline(gpa: std.mem.Allocator) !Baseline {
+fn loadBaseline(io: std.Io, gpa: std.mem.Allocator) !Baseline {
     const baseline_path = "tidy_baseline.txt";
-    const contents = std.fs.cwd().readFileAlloc(gpa, baseline_path, baseline_bytes_max) catch |err| switch (err) {
+    const dir = std.Io.Dir.cwd();
+    const limit: std.Io.Limit = .limited(baseline_bytes_max);
+    const contents = dir.readFileAlloc(io, baseline_path, gpa, limit) catch |err| switch (err) {
         error.FileNotFound => try gpa.dupe(u8, ""),
         else => return err,
     };
@@ -110,6 +109,7 @@ fn loadBaseline(gpa: std.mem.Allocator) !Baseline {
 /// Recursively scans `dir_path` for `.zig` files and returns the total violation count across
 /// all of them (0 if `dir_path` does not exist — `bench`/`tests` are optional in some repos).
 fn checkDir(
+    io: std.Io,
     gpa: std.mem.Allocator,
     dir_path: []const u8,
     baseline: []const tidy.BaselineEntry,
@@ -117,11 +117,12 @@ fn checkDir(
 ) !usize {
     assert(dir_path.len > 0);
 
-    var dir = std.fs.cwd().openDir(dir_path, .{ .iterate = true }) catch |err| switch (err) {
+    const open_options: std.Io.Dir.OpenOptions = .{ .iterate = true };
+    var dir = std.Io.Dir.cwd().openDir(io, dir_path, open_options) catch |err| switch (err) {
         error.FileNotFound => return 0,
         else => return err,
     };
-    defer dir.close();
+    defer dir.close(io);
 
     var walker = try dir.walk(gpa);
     defer walker.deinit();
@@ -129,14 +130,14 @@ fn checkDir(
     var violations_total: usize = 0;
     var iterations: usize = 0;
     while (iterations < files_max) : (iterations += 1) {
-        const entry = (try walker.next()) orelse break;
+        const entry = (try walker.next(io)) orelse break;
         if (entry.kind != .file) continue;
         if (!std.mem.endsWith(u8, entry.basename, ".zig")) continue;
 
         const rel_path = try std.fs.path.join(gpa, &.{ dir_path, entry.path });
         defer gpa.free(rel_path);
 
-        violations_total += try checkFile(gpa, rel_path, baseline, err_out);
+        violations_total += try checkFile(io, gpa, rel_path, baseline, err_out);
     }
     assert(iterations <= files_max);
 
@@ -145,6 +146,7 @@ fn checkDir(
 
 /// Reads, checks, and reports one `.zig` file; returns its violation count.
 fn checkFile(
+    io: std.Io,
     gpa: std.mem.Allocator,
     path: []const u8,
     baseline: []const tidy.BaselineEntry,
@@ -153,7 +155,7 @@ fn checkFile(
     assert(path.len > 0);
     assert(std.mem.endsWith(u8, path, ".zig"));
 
-    const source = try std.fs.cwd().readFileAlloc(gpa, path, source_bytes_max);
+    const source = try std.Io.Dir.cwd().readFileAlloc(io, path, gpa, .limited(source_bytes_max));
     defer gpa.free(source);
 
     const src_prefix = "src" ++ std.fs.path.sep_str;

@@ -17,9 +17,10 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  # Native macOS runners cannot link libSystem with Zig 0.15 on GitHub's images
-  # (undefined _abort/_malloc/...), so tests run on Linux only; macOS/Windows are
-  # covered by cross-compilation below and by the local (macOS) autonomous sessions.
+  # Native macOS runners could not link libSystem with Zig 0.15 on GitHub's images
+  # (undefined _abort/_malloc/...); unverified whether 0.16 fixes this (see plan 001
+  # Risks), so tests still run on Linux only. macOS/Windows are covered by
+  # cross-compilation below and by the local (macOS) autonomous sessions.
   build-and-test:
     name: Build & Test
     runs-on: ubuntu-latest
@@ -27,8 +28,6 @@ jobs:
       - uses: actions/checkout@v5
       - name: Install Zig
         uses: mlugg/setup-zig@v2
-        with:
-          version: 0.15.2
       - name: Clear Zig cache
         run: rm -rf .zig-cache zig-out
       - name: Format check
@@ -56,8 +55,6 @@ jobs:
       - uses: actions/checkout@v5
       - name: Install Zig
         uses: mlugg/setup-zig@v2
-        with:
-          version: 0.15.2
       - name: Clear Zig cache
         run: rm -rf .zig-cache zig-out
       - name: Build
