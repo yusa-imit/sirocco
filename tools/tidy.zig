@@ -176,7 +176,7 @@ fn effectiveFunctionMax(options: CheckOptions, name: []const u8) u32 {
 /// `pub fn` declaration; null otherwise (nested declarations are excluded by the caller checking
 /// `depth == 0` before calling this).
 fn functionNameAt(line: []const u8) ?[]const u8 {
-    const trimmed = std.mem.trimLeft(u8, line, " \t");
+    const trimmed = std.mem.trimStart(u8, line, " \t");
     const rest = if (std.mem.startsWith(u8, trimmed, "pub fn "))
         trimmed["pub fn ".len..]
     else if (std.mem.startsWith(u8, trimmed, "fn "))
