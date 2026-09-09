@@ -9,6 +9,8 @@ const std = @import("std");
 
 pub const version = std.SemanticVersion{ .major = 0, .minor = 1, .patch = 0 };
 
+pub const stdx = @import("stdx.zig");
+
 pub const io = @import("io.zig");
 pub const net = @import("net.zig");
 pub const tls = @import("tls.zig");
