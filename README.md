@@ -52,8 +52,14 @@ pub fn main(init: std.process.Init) !void {
 
 ## Install
 
-```bash
-zig fetch --save https://github.com/yusa-imit/sirocco/archive/refs/tags/v0.1.0.tar.gz
+No tag has been cut yet (`git tag -l` is empty) — there is nothing to `zig fetch` from GitHub
+today. During development, point `build.zig.zon` at a local checkout instead:
+
+```zig
+// build.zig.zon
+.dependencies = .{
+    .sirocco = .{ .path = "../sirocco" },
+},
 ```
 
 ```zig
@@ -61,6 +67,10 @@ zig fetch --save https://github.com/yusa-imit/sirocco/archive/refs/tags/v0.1.0.t
 const sirocco = b.dependency("sirocco", .{ .target = target, .optimize = optimize });
 exe.root_module.addImport("sirocco", sirocco.module("sirocco"));
 ```
+
+Once a release is tagged, this section switches to `zig fetch --save
+https://github.com/yusa-imit/sirocco/archive/refs/tags/v<version>.tar.gz` naming that tag —
+see `CHANGELOG.md` for what shipped in each release.
 
 ## Build
 
