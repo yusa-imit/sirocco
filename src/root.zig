@@ -7,7 +7,7 @@
 
 const std = @import("std");
 
-pub const version = std.SemanticVersion{ .major = 0, .minor = 1, .patch = 0 };
+pub const version = std.SemanticVersion{ .major = 0, .minor = 2, .patch = 0 };
 
 pub const stdx = @import("stdx.zig");
 

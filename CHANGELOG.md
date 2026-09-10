@@ -5,9 +5,9 @@ All notable changes to this project are documented in this file. The format foll
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html) with the `0.x` MINOR-may-break
 exemption recorded in `citadel/protocol/VERSIONING.md`.
 
-## [Unreleased]
+## [0.2.0] - 2026-09-11
 
-Plan `001` (Zig 0.16 migration and Tiger Style baseline). No tag cut yet.
+Plan `001` (Zig 0.16 migration and Tiger Style baseline).
 
 ### Added
 
