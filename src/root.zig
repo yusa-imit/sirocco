@@ -3,7 +3,7 @@
 //! Library root. Consumers `@import("sirocco")` and reach modules as
 //! `sirocco.<module>`. Every module is independent; import only what you use.
 //!
-//! See docs/PRD.md for the full design and docs/milestones.md for progress.
+//! See docs/PRD.md for the full design and docs/plans/ for progress.
 
 const std = @import("std");
 
