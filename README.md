@@ -2,13 +2,15 @@
 
 > The wind that drives the fleet — an implementation of `std.Io.VTable` for Zig
 
-sirocco는 Zig 0.16의 `std.Io.VTable`을 구현하는 제로 의존성 파운데이션 컴포넌트다. 공개 표면은
-`Runtime.io()`가 반환하는 `std.Io` 하나뿐이며, 소비자는 `std.Io`·`Io.net`·`Io.Dir`/`Io.File`·
-`std.http.Client`·`std.crypto.tls.Client` 등 이미 알고 있는 std 타입으로 그대로 sirocco 위에서
-동작한다. kqueue(macOS/BSD)·epoll(Linux) 백엔드로 109개 vtable 슬롯을 채우며, 아직 네이티브로
-구현하지 않은 슬롯(`dir*`, `process*`/`child*`, `random`/`randomSecure`, `progressParentFile`)은
-내장된 `Io.Threaded`로 명시적으로 위임한다. silica·zoltraak 서버, zr의 다운로더·원격 캐시,
-sailor의 네트워크 위젯, synod의 Transport가 이 위에서 `main()`의 한 줄만 바꿔 동작한다.
+sirocco는 Zig 0.16의 `std.Io.VTable`을 구현하는 것을 목표로 하는 제로 의존성 파운데이션
+컴포넌트다. 목표 공개 표면은 `Runtime.io()`가 반환하는 `std.Io` 하나뿐이며, 소비자는
+`std.Io`·`Io.net`·`Io.Dir`/`Io.File`·`std.http.Client`·`std.crypto.tls.Client` 등 이미 알고
+있는 std 타입으로 그대로 sirocco 위에서 동작하게 될 예정이다. 설계상 kqueue(macOS/BSD)·
+epoll(Linux) 백엔드로 109개 vtable 슬롯을 채우고, 아직 네이티브로 구현하지 않은 슬롯
+(`dir*`, `process*`/`child*`, `random`/`randomSecure`, `progressParentFile`)은 내장된
+`Io.Threaded`로 명시적으로 위임하도록 되어 있다 (아래 Status 참고 — 현재는 이 구현이 아직
+시작 전이다). 완성되면 silica·zoltraak 서버, zr의 다운로더·원격 캐시, sailor의 네트워크
+위젯, synod의 Transport가 이 위에서 `main()`의 한 줄만 바꿔 동작하는 것이 목표다.
 
 [![CI](https://github.com/yusa-imit/sirocco/workflows/CI/badge.svg)](https://github.com/yusa-imit/sirocco/actions)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
