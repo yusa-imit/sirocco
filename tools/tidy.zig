@@ -12,7 +12,8 @@
 //!
 //! See `citadel/core/rules/tiger-style.md` §5 "Mechanical checks" for the rule table this file
 //! implements, and `docs/plans/001-zig-0.16-and-tiger-baseline.md` item 2 for the acceptance
-//! criteria. Status: red phase — type declarations only, `checkSource` is not implemented.
+//! criteria. `checkSource` is implemented and wired as a `zig build tidy` step (a dependency of
+//! `zig build test` since v0.2.0).
 
 const std = @import("std");
 
