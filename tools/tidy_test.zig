@@ -1,9 +1,8 @@
-//! tools/tidy_test.zig — red-phase tests for `tools/tidy.zig`'s `checkSource`.
+//! tools/tidy_test.zig — tests for `tools/tidy.zig`'s `checkSource`.
 //!
-//! `checkSource` does not exist yet (its body is `@compileError`), so every test below is
-//! expected to fail the *build*, not just an assertion, until the zig-developer implements it.
-//! That is the intended TDD red state for this cycle — do not weaken these tests to make them
-//! pass; implement `checkSource` against them instead.
+//! `checkSource` is implemented; these are its acceptance tests, written first under TDD and
+//! now green. Weakening a test here to pass without a corresponding `checkSource` fix defeats
+//! its purpose as a regression guard.
 //!
 //! Convention pinned here, since the design doc leaves it open: a function's line count is
 //! measured *inclusively* from the line containing `fn <name>(` (or `pub fn <name>(`) through
