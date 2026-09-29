@@ -17,13 +17,16 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  # Native macOS runners could not link libSystem with Zig 0.15 on GitHub's images
-  # (undefined _abort/_malloc/...); unverified whether 0.16 fixes this (see plan 001
-  # Risks), so tests still run on Linux only. macOS/Windows are covered by
-  # cross-compilation below and by the local (macOS) autonomous sessions.
+  # Native macOS runner: the Io fiber core (plan 002) switches contexts in per-arch assembly,
+  # which cross-compilation cannot execute. Zig 0.15 could not link libSystem on GitHub's
+  # images; this job is the check for whether 0.16 can (plan 002 item 1).
   build-and-test:
-    name: Build & Test
-    runs-on: ubuntu-latest
+    name: Build & Test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
     steps:
       - uses: actions/checkout@v5
       - name: Install Zig
