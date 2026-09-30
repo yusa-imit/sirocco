@@ -5,6 +5,23 @@ All notable changes to this project are documented in this file. The format foll
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html) with the `0.x` MINOR-may-break
 exemption recorded in `citadel/protocol/VERSIONING.md`.
 
+## [Unreleased]
+
+Plan `002` (fiber scheduler and futex core).
+
+### Added
+
+- `sirocco.Runtime` (`src/runtime.zig`): walking skeleton of the `std.Io` implementation. Every
+  one of the 109 `Io.VTable` slots is forwarded from an embedded `Io.Threaded`
+  (`Options.unimplemented = .forward`) or taken from `Io.failing` (`.fail`); `io()` and
+  `baselineIo()` hand out the runtime's vtable and the untouched `Io.Threaded` oracle.
+- CI builds and tests on a native `macos-latest` runner as well as `ubuntu-latest`.
+
+### Removed
+
+- The six stub modules `sirocco.io`, `.net`, `.tls`, `.http`, `.ws`, `.task` (they only raised
+  `error.NotImplemented`; ADR 0001 retired their API).
+
 ## [0.2.0] - 2026-09-11
 
 Plan `001` (Zig 0.16 migration and Tiger Style baseline).

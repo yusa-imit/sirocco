@@ -16,11 +16,11 @@ plan may not — context switching is per-arch assembly and aarch64-darwin runs 
 
 ## Scope
 
-- [ ] 1. Enable a native macOS runner in `.github/workflows/ci.yml` (`macos-latest`, aarch64),
+- [x] 1. Enable a native macOS runner in `.github/workflows/ci.yml` (`macos-latest`, aarch64),
       or record the exact link failure and the fallback in `docs/adr/`. Why first: cross-compile
       cannot execute a context switch, and this plan's core is arch-specific assembly.
       Verify: `gh run list` shows a green `Build & Test (macos-latest)` job on the PR.
-- [ ] 2. Delete `src/{io,net,tls,http,ws,task}.zig` and their `root.zig` re-exports; land
+- [x] 2. Delete `src/{io,net,tls,http,ws,task}.zig` and their `root.zig` re-exports; land
       `src/runtime.zig` with `Runtime`, `Options`, `Backend`, `Unimplemented`, `init`/`deinit`/
       `io()`/`baselineIo()`, every slot copied from the embedded `Io.Threaded` (`.fail` installs
       `Io.failing`'s stub), the `@typeInfo(Io.VTable).@"struct".fields.len == 109` comptime guard,
