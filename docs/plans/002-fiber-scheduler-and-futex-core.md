@@ -27,7 +27,7 @@ plan may not — context switching is per-arch assembly and aarch64-darwin runs 
       and the invariant that no `Runtime` field points into `Runtime` — state is recovered with
       `@fieldParentPtr("threaded", t)`, so `io()` is the only place taking its address.
       Verify: `zig build test` — `rt.io().vtable != rt.baselineIo().vtable`, forwarded call works.
-- [ ] 3. `tests/parity/` harness: `expectSameResult(rt, call, args)` runs one call on `rt.io()`
+- [x] 3. `tests/parity/` harness: `expectSameResult(rt, call, args)` runs one call on `rt.io()`
       and on `rt.baselineIo()` and compares tag, payload and error name; `tests/parity/slots.zig`
       holds a comptime table of all 109 slot names in `native`, `delegated` and `divergent` lists
       and fails the build if a name is in none. Why before any slot lands: it is the mechanism

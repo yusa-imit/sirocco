@@ -15,6 +15,11 @@ Plan `002` (fiber scheduler and futex core).
   one of the 109 `Io.VTable` slots is forwarded from an embedded `Io.Threaded`
   (`Options.unimplemented = .forward`) or taken from `Io.failing` (`.fail`); `io()` and
   `baselineIo()` hand out the runtime's vtable and the untouched `Io.Threaded` oracle.
+- Differential test suite (`tests/parity/`, part of `zig build test`): `expectSameResult` runs one
+  call on `rt.io()` and on `rt.baselineIo()` and compares tag, payload and error name;
+  `slots.zig` lists all 109 slots as `native`, `delegated` or `divergent` and fails the build if
+  a slot is in none of them, in two, or misnamed; first parity tests for `clockResolution`,
+  `dirAccess` and `dirStatFile`.
 - CI builds and tests on a native `macos-latest` runner as well as `ubuntu-latest`.
 
 ### Removed
