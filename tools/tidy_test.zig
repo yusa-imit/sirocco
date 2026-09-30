@@ -412,12 +412,8 @@ test "tidy: missing_header flags a source whose first line is code" {
 const real_paths = [_][]const u8{
     "src/root.zig",
     "src/main.zig",
-    "src/io.zig",
-    "src/net.zig",
-    "src/tls.zig",
-    "src/http.zig",
-    "src/ws.zig",
-    "src/task.zig",
+    "src/runtime.zig",
+    "src/stdx.zig",
 };
 
 test "tidy: every real src/ file today produces zero violations under lib bans" {
