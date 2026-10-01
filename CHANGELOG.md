@@ -32,6 +32,13 @@ Plan `002` (fiber scheduler and futex core).
 - The six stub modules `sirocco.io`, `.net`, `.tls`, `.http`, `.ws`, `.task` (they only raised
   `error.NotImplemented`; ADR 0001 retired their API).
 
+### Fixed
+
+- Fiber switch no longer uses std's inline-asm `Io.fiber.contextSwitch`: LLVM miscompiled it in
+  x86_64 ReleaseSmall (the message pointer never reached `rsi`), crashing every `sched` test.
+  `src/sched.zig` now has its own naked per-arch switch that saves the callee-saved registers,
+  and CI runs ReleaseSmall on Linux again.
+
 ## [0.2.0] - 2026-09-11
 
 Plan `001` (Zig 0.16 migration and Tiger Style baseline).
