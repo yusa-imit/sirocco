@@ -13,9 +13,6 @@
 //! neighbouring stack, and there are no guard pages yet. The `Sched` must not move after `init`
 //! (fibers hold a pointer to it), so `init` fills the caller's storage in place.
 //!
-//! Known defect: on x86_64 the tests SEGV in ReleaseSmall (aarch64 passes in all four modes);
-//! see the open bug issue. Debug, ReleaseSafe and ReleaseFast pass on both.
-//!
 //! Allocation: `init` allocates two blocks (fiber table, stack arena) from `gpa`; `Sched` stores
 //! no allocator, so nothing allocates afterwards, and `deinit` takes the same `gpa` back.
 //!
@@ -26,7 +23,8 @@
 //! `deinit`: `unpark_foreign` touches the futex word after the carrier may have finished.
 //!
 //! Sketch: `spawn` touches one `Fiber` record and the top cache line of one stack; a switch
-//! saves and restores 3 words plus the callee-saved registers std's assembly spills; zero
+//! saves and restores 3 words plus the callee-saved registers (rbx, r12-r15 / x19-x28, d8-d15,
+//! x30), pushed on the old stack; zero
 //! syscalls on the ready path, one futex wait per idle period.
 
 const std = @import("std");
@@ -56,8 +54,10 @@ inbox: ?*Fiber,
 inbox_version: u32,
 
 /// True when `Io.fiber` has context-switch assembly sirocco's entry trampolines also cover.
+/// Windows is excluded: the switch assembly assumes the SysV/AAPCS64 argument registers and
+/// does not maintain the TEB stack bounds.
 pub const supported = switch (builtin.cpu.arch) {
-    .aarch64, .x86_64 => Io.fiber.supported,
+    .aarch64, .x86_64 => Io.fiber.supported and builtin.os.tag != .windows,
     else => false,
 };
 
@@ -397,6 +397,20 @@ fn switch_context_asm(old: *Io.fiber.Context, new: *Io.fiber.Context) callconv(.
             \\ ret
         ),
         else => unreachable, // `supported` is false and `init` refused.
+    }
+}
+
+// The assembly above hard-codes this layout (offsets 0, 8, 16).
+comptime {
+    if (supported) {
+        const names = switch (builtin.cpu.arch) {
+            .x86_64 => .{ "rsp", "rbp", "rip" },
+            else => .{ "sp", "fp", "pc" },
+        };
+        assert(@sizeOf(Io.fiber.Context) == 24);
+        assert(@offsetOf(Io.fiber.Context, names[0]) == 0);
+        assert(@offsetOf(Io.fiber.Context, names[1]) == 8);
+        assert(@offsetOf(Io.fiber.Context, names[2]) == 16);
     }
 }
 
