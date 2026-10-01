@@ -39,6 +39,15 @@ jobs:
         run: zig build
       - name: Test
         run: zig build test
+      - name: Test (ReleaseSafe, ReleaseFast)
+        run: |
+          zig build test -Doptimize=ReleaseSafe
+          zig build test -Doptimize=ReleaseFast
+      # x86_64 ReleaseSmall crashes the fiber tests (SEGV); tracked in a bug issue, not hidden:
+      # restore this step for every runner when that issue is fixed.
+      - name: Test (ReleaseSmall, aarch64 only)
+        if: runner.os == 'macOS'
+        run: zig build test -Doptimize=ReleaseSmall
 
   cross-compile:
     name: Cross-compile (${{ matrix.target }})

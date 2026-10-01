@@ -413,6 +413,7 @@ const real_paths = [_][]const u8{
     "src/root.zig",
     "src/main.zig",
     "src/runtime.zig",
+    "src/sched.zig",
     "src/stdx.zig",
 };
 

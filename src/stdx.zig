@@ -8,6 +8,12 @@ const std = @import("std");
 
 pub const assert = std.debug.assert;
 
+/// Invariant that must hold in every build mode: traps instead of continuing on corrupt state
+/// (plain `assert` is compiled out in ReleaseFast/ReleaseSmall).
+pub fn assert_always(ok: bool) void {
+    if (!ok) @trap();
+}
+
 /// No-op that documents a condition which is legitimately sometimes true.
 pub fn maybe(ok: bool) void {
     _ = ok;

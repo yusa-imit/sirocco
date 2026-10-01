@@ -21,6 +21,11 @@ Plan `002` (fiber scheduler and futex core).
   a slot is in none of them, in two, or misnamed; first parity tests for `clockResolution`,
   `dirAccess` and `dirStatFile`.
 - CI builds and tests on a native `macos-latest` runner as well as `ubuntu-latest`.
+- Internal fiber substrate (`src/sched.zig`, not public): `fibers_max` stacks allocated once in
+  `init`, a FIFO ready queue, `spawn`/`yield`/`park`/`unpark`, a stack canary checked at fiber
+  exit, and a lock-free `unpark_foreign` inbox that wakes a carrier blocked in the baseline
+  futex. aarch64 and x86_64 only (`Sched.supported`); no vtable slot uses it yet.
+- `stdx.assert_always`: an invariant check that stays on in ReleaseFast and ReleaseSmall.
 
 ### Removed
 
