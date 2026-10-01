@@ -337,9 +337,11 @@ fn switch_to_carrier(sched: *Sched, fiber: *Fiber) void {
 // context) and that clobbers the frame registers on aarch64. Here the switch is a whole function:
 // it pushes the callee-saved registers on the old stack, stores `sp`/`fp`/resume `pc` in `old`,
 // loads them from `new` and jumps. Resuming `old` later pops the registers and returns to the
-// caller of `switch_context`. A fresh fiber's `Context` is jumped to, never returned into.
-fn switch_context_asm(old: *Io.fiber.Context, new: *Io.fiber.Context) callconv(.naked) void {
-    _ = .{ old, new };
+// caller of `switch_context`. It declares no Zig parameters (the self-hosted x86_64 backend
+// rejects unused arguments of a naked function); the C-convention pointer type in
+// `switch_context` carries `old` in rdi/x0 and `new` in rsi/x1. A fresh fiber's `Context` is
+// jumped to, never returned into.
+fn switch_context_asm() callconv(.naked) void {
     switch (builtin.cpu.arch) {
         .x86_64 => asm volatile (
             \\ pushq %%rbx
