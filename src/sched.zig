@@ -13,6 +13,9 @@
 //! neighbouring stack, and there are no guard pages yet. The `Sched` must not move after `init`
 //! (fibers hold a pointer to it), so `init` fills the caller's storage in place.
 //!
+//! Known defect: on x86_64 the tests SEGV in ReleaseSmall (aarch64 passes in all four modes);
+//! see the open bug issue. Debug, ReleaseSafe and ReleaseFast pass on both.
+//!
 //! Allocation: `init` allocates two blocks (fiber table, stack arena) from `gpa`; `Sched` stores
 //! no allocator, so nothing allocates afterwards, and `deinit` takes the same `gpa` back.
 //!
