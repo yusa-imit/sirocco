@@ -35,7 +35,7 @@ plan may not — context switching is per-arch assembly and aarch64-darwin runs 
       differences, each citing the std doc comment that permits it) must exist before the first
       divergence is written. Verify: `zig build test` plus a negative test that removing a name
       from the table is a comptime error.
-- [ ] 4. `src/sched.zig` fiber substrate, no slots installed yet: all `fibers_max` stacks
+- [x] 4. `src/sched.zig` fiber substrate, no slots installed yet: all `fibers_max` stacks
       allocated once in `init`, an intrusive ready queue, `park`/`unpark`, switching via
       `Io.fiber.contextSwitch`, a stack canary checked at fiber exit, and `.auto` resolving to
       `.threaded` when `!Io.fiber.supported`. The carrier thread blocks through the baseline's

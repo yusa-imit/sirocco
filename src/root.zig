@@ -15,4 +15,6 @@ pub const Runtime = @import("runtime.zig");
 
 test {
     std.testing.refAllDecls(@This());
+    // Internal substrate: tested here, deliberately not public (ADR 0001: the surface is `Io`).
+    _ = @import("sched.zig");
 }

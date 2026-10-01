@@ -15,6 +15,10 @@ pub fn build(b: *std.Build) void {
     const mod = b.addModule("sirocco", .{
         .root_source_file = b.path("src/root.zig"),
         .target = target,
+        // `src/sched.zig` switches stacks with `Io.fiber.contextSwitch`, which rewrites the frame
+        // pointer without being able to declare it clobbered; the compiler must never hold a
+        // live value in it, so sirocco code is always built with frame pointers.
+        .omit_frame_pointer = false,
     });
 
     // CLI executable (diagnostics, version, small utilities)
@@ -38,7 +42,16 @@ pub fn build(b: *std.Build) void {
     if (b.args) |args| run_cmd.addArgs(args);
 
     // Tests
-    const mod_tests = b.addTest(.{ .root_module = mod });
+    // Own module (same root file) so `-Doptimize` reaches the tests: the fiber switch is
+    // optimizer-sensitive and must be exercised in every mode, not only Debug.
+    const mod_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/root.zig"),
+            .target = target,
+            .optimize = optimize,
+            .omit_frame_pointer = false,
+        }),
+    });
     const run_mod_tests = b.addRunArtifact(mod_tests);
     const exe_tests = b.addTest(.{ .root_module = exe.root_module });
     const run_exe_tests = b.addRunArtifact(exe_tests);
