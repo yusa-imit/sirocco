@@ -9,6 +9,13 @@ exemption recorded in `citadel/protocol/VERSIONING.md`.
 
 Plan `002` (fiber scheduler and futex core).
 
+### Fixed
+
+- Fiber switch no longer uses std's inline-asm `Io.fiber.contextSwitch`: LLVM miscompiled it in
+  x86_64 ReleaseSmall (the message pointer never reached `rsi`), crashing every `sched` test.
+  `src/sched.zig` now has its own naked per-arch switch that saves the callee-saved registers,
+  and CI runs ReleaseSmall on Linux again.
+
 ### Added
 
 - `sirocco.Runtime` (`src/runtime.zig`): walking skeleton of the `std.Io` implementation. Every

@@ -15,9 +15,8 @@ pub fn build(b: *std.Build) void {
     const mod = b.addModule("sirocco", .{
         .root_source_file = b.path("src/root.zig"),
         .target = target,
-        // `src/sched.zig` switches stacks with `Io.fiber.contextSwitch`, which rewrites the frame
-        // pointer without being able to declare it clobbered; the compiler must never hold a
-        // live value in it, so sirocco code is always built with frame pointers.
+        // `src/sched.zig` swaps the frame pointer on every fiber switch; building with frame
+        // pointers keeps the compiler from holding a live value in it across a switch.
         .omit_frame_pointer = false,
     });
 
