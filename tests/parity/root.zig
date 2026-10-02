@@ -6,4 +6,5 @@ test {
     _ = @import("slots.zig");
     _ = @import("time.zig");
     _ = @import("dir.zig");
+    _ = @import("concurrency.zig");
 }

@@ -13,6 +13,7 @@
 
 const std = @import("std");
 const Io = std.Io;
+const Runtime = @import("sirocco").Runtime;
 const fixtures = @import("fixtures.zig");
 
 const assert = std.debug.assert;
@@ -24,16 +25,14 @@ pub const Divergence = struct {
     contract: []const u8,
 };
 
-/// Slots implemented on sirocco's own fibers. Empty until plan 002 item 5.
-pub const native: []const []const u8 = &.{};
+/// Slots implemented on sirocco's own fibers (where `Runtime.fibers_supported`; elsewhere they
+/// are forwarded, and `tests/parity/concurrency.zig` checks that too). Parity tests:
+/// `tests/parity/concurrency.zig`.
+pub const native: []const []const u8 = &.{ "async", "await", "cancel" };
 
 /// Slots still forwarded to the embedded `Io.Threaded`.
 pub const delegated: []const []const u8 = &.{
     "crashHandler",
-    "async",
-    "concurrent",
-    "await",
-    "cancel",
     "groupAsync",
     "groupConcurrent",
     "groupAwait",
@@ -140,9 +139,17 @@ pub const delegated: []const []const u8 = &.{
     "netLookup",
 };
 
-/// Native slots that may legitimately differ from `Io.Threaded`. Empty until a divergence is
-/// written; the contract citation must exist before the first one.
-pub const divergent: []const Divergence = &.{};
+/// Native slots that may legitimately differ from `Io.Threaded`; each cites the std text that
+/// permits the difference.
+pub const divergent: []const Divergence = &.{
+    .{
+        .name = "concurrent",
+        .contract = "Io.ConcurrentError.ConcurrencyUnavailable doc comment: \"May occur due " ++
+            "to a temporary condition such as resource exhaustion, or to the Io implementation " ++
+            "not supporting concurrency.\" sirocco is single-carrier until plan 003, so it " ++
+            "always returns it where Io.Threaded succeeds.",
+    },
+};
 
 comptime {
     if (audit(native, delegated, divergent)) |problem| @compileError(problem);
@@ -221,14 +228,14 @@ test "an empty table is reported" {
 }
 
 test "a name in two lists is reported" {
-    const problem = comptime audit(&.{"async"}, delegated, divergent) orelse "";
-    try std.testing.expect(contains(problem, "`async`"));
+    const problem = comptime audit(&.{"crashHandler"}, delegated, divergent) orelse "";
+    try std.testing.expect(contains(problem, "`crashHandler`"));
     try std.testing.expect(contains(problem, "more than once"));
 }
 
 test "a name repeated inside one list is reported" {
-    const problem = comptime audit(native, delegated ++ &[_][]const u8{"async"}, divergent);
-    try std.testing.expect(contains(problem orelse "", "`async`"));
+    const problem = comptime audit(native, delegated ++ &[_][]const u8{"crashHandler"}, divergent);
+    try std.testing.expect(contains(problem orelse "", "`crashHandler`"));
 }
 
 test "delegated slots are the baseline's own function, native ones are not" {
@@ -240,11 +247,14 @@ test "delegated slots are the baseline's own function, native ones are not" {
     inline for (delegated) |name| {
         try std.testing.expect(@field(vtable, name) == @field(baseline, name));
     }
+    // Native slots exist only where the fiber switch does; elsewhere they stay forwarded.
+    const expect_native = Runtime.fibers_supported;
     inline for (native) |name| {
-        try std.testing.expect(@field(vtable, name) != @field(baseline, name));
+        try std.testing.expectEqual(expect_native, @field(vtable, name) != @field(baseline, name));
     }
     inline for (divergent) |entry| {
-        try std.testing.expect(@field(vtable, entry.name) != @field(baseline, entry.name));
+        const differs = @field(vtable, entry.name) != @field(baseline, entry.name);
+        try std.testing.expectEqual(expect_native, differs);
     }
 }
 
