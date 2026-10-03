@@ -1,20 +1,27 @@
 //! sirocco.Runtime — a `std.Io` implementation assembled from `Io.Threaded`'s vtable.
 //!
-//! Purpose: `Runtime.io()` is sirocco's entire public surface (ADR 0001). This walking skeleton
-//! installs no native slot yet: `.forward` copies every slot from the embedded `Io.Threaded`
-//! and `.fail` copies every slot from `Io.failing`, so each later plan-002 item replaces one
-//! slot group here and a test that leans on the fallback can be run under `.fail` to fail loudly.
+//! Purpose: `Runtime.io()` is sirocco's entire public surface (ADR 0001). `.forward` copies every
+//! slot from the embedded `Io.Threaded` and `.fail` copies every slot from `Io.failing`; sirocco's
+//! native slots are then written over that base, one group per plan-002 item, so a test that
+//! leans on the fallback can be run under `.fail` to fail loudly. Native today: the
+//! future-producing set `async`/`concurrent`/`await`/`cancel` (`src/concurrency.zig`, on the
+//! fibers of `src/sched.zig`), installed in both modes. Where `fibers_supported` is false
+//! (Windows, 32-bit and other architectures) the set is not installed and stays forwarded, so
+//! `.auto` and `.threaded` keep working on every target.
 //!
 //! Invariants: the vtable has exactly 109 slots (`slots_count`, a comptime guard against a std
 //! bump); no field of `Runtime` holds a pointer into `Runtime` — `io()` and `baselineIo()` are
 //! the only places that take an address, so a `Runtime` may be moved until the first `io()`
 //! call and must stay put afterwards. sirocco state is recovered from `Io.userdata` with
-//! `@fieldParentPtr("threaded", t)`.
+//! `@fieldParentPtr("threaded", t)`. The fiber scheduler is the one self-referential part (fibers
+//! point at their `Sched`), so it is built in place by the first `io()` call, never in `init`;
+//! `sched_pin` records its address and every later `io()` asserts it did not move.
 //!
 //! Allocation: `init` allocates nothing itself; `gpa` is handed to `Io.Threaded`, which uses it
-//! lazily for `async`/`concurrent`/`groupAsync`/`groupConcurrent` closures, thread stacks and
-//! process spawn, so "no allocation after init" is not yet true; it becomes true per slot group
-//! as native slots replace the forwarded ones (plan 002 items 4-8).
+//! lazily for `groupAsync`/`groupConcurrent` closures, thread stacks and process spawn. The first
+//! `io()` allocates the fiber table and stacks (two blocks) from the same `gpa`, and the native
+//! `async` still allocates one task record per started task, as Threaded does; "no allocation
+//! after init" becomes true per slot group in later plan-002 items.
 //!
 //! Process-wide effects: `Io.Threaded.init` installs `SIGIO`/`SIGPIPE` handlers and `deinit`
 //! restores them, so overlapping runtimes must be torn down in reverse order of creation.
@@ -26,6 +33,8 @@
 const std = @import("std");
 const Io = std.Io;
 const stdx = @import("stdx.zig");
+const Sched = @import("sched.zig");
+const concurrency = @import("concurrency.zig");
 
 const assert = stdx.assert;
 
@@ -39,6 +48,20 @@ vtable: Io.VTable,
 /// The resolved backend; never `.auto`.
 backend: Backend,
 unimplemented: Unimplemented,
+/// Fiber scheduler; valid only while `sched_state == .ready`, built in place by the first `io()`.
+sched: Sched,
+sched_state: SchedState,
+/// `@intFromPtr(&sched)` when it was built, else 0; asserts the `Runtime` has not moved.
+sched_pin: usize,
+fibers_max: u32,
+fiber_stack_size: u32,
+
+/// True when the native future-producing slots (and with them the fiber scheduler) exist here.
+pub const fibers_supported = Sched.supported;
+
+/// Life cycle of `sched`; `.unsupported` is a comptime fact of the target, `.unavailable` is the
+/// outcome of an out-of-memory scheduler build (async then runs inline, concurrent refuses).
+pub const SchedState = enum { pending, ready, unavailable, unsupported };
 
 // Number of `Io.VTable` slots in the pinned std; ADR 0001 requires a build failure on a bump.
 const slots_count = 109;
@@ -53,7 +76,7 @@ pub const Backend = enum {
     kqueue,
     epoll,
     uring,
-    /// Always available: every slot runs on `Io.Threaded`'s thread pool.
+    /// Always available: slots not native to sirocco run on `Io.Threaded`'s thread pool.
     threaded,
 };
 
@@ -69,6 +92,12 @@ pub const Options = struct {
     environ: std.process.Environ,
     /// Program name for `processExecutablePath` on OpenBSD and Haiku; `.empty` elsewhere.
     argv0: Io.Threaded.Argv0,
+    /// Fibers that may be alive at once (async tasks in flight); past it `async` runs inline.
+    /// Positive. One stack of `fiber_stack_size` bytes is allocated per fiber at the first `io()`.
+    fibers_max: u32,
+    /// Bytes per fiber stack: a multiple of 16, at least `Sched.stack_size_min`. std's `Io` call
+    /// chain runs on these stacks, so Debug builds want well over the minimum.
+    fiber_stack_size: u32,
 };
 
 pub const InitError = error{
@@ -76,15 +105,19 @@ pub const InitError = error{
     BackendUnavailable,
 };
 
-/// Builds a runtime. Precondition: `options` is fully specified; no default is implied. The
-/// result becomes self-referential at the first `io()`/`baselineIo()` call (std stores
-/// `Threaded.io()` inside `Threaded` itself), so do not move it after that.
+/// Builds a runtime. Precondition: `options` is fully specified; no default is implied, and the
+/// fiber limits satisfy `Sched.Options`. The result becomes self-referential at the first
+/// `io()`/`baselineIo()` call (std stores `Threaded.io()` inside `Threaded` itself) and, through
+/// the scheduler, at the first `io()`; do not move it after that.
 pub fn init(gpa: std.mem.Allocator, options: Options) InitError!Runtime {
     const backend: Backend = switch (options.backend) {
         .auto, .threaded => .threaded,
         .kqueue, .epoll, .uring => return error.BackendUnavailable,
     };
     assert(backend == .threaded);
+    assert(options.fibers_max > 0);
+    assert(options.fiber_stack_size >= Sched.stack_size_min);
+    assert(options.fiber_stack_size % 16 == 0);
 
     var threaded: Io.Threaded = .init(gpa, .{
         .stack_size = std.Thread.SpawnConfig.default_stack_size,
@@ -94,31 +127,45 @@ pub fn init(gpa: std.mem.Allocator, options: Options) InitError!Runtime {
         .environ = options.environ,
         .disable_memory_mapping = false,
     });
-    const base: Io.VTable = switch (options.unimplemented) {
+    var base: Io.VTable = switch (options.unimplemented) {
         .forward => threaded.io().vtable.*,
         .fail => Io.failing.vtable.*,
     };
+    if (fibers_supported) concurrency.install(&base);
     return .{
         .threaded = threaded,
         .vtable = base,
         .backend = backend,
         .unimplemented = options.unimplemented,
+        .sched = undefined,
+        .sched_state = if (fibers_supported) .pending else .unsupported,
+        .sched_pin = 0,
+        .fibers_max = options.fibers_max,
+        .fiber_stack_size = options.fiber_stack_size,
     };
 }
 
-/// Releases the embedded `Io.Threaded` (joins its worker threads). Precondition: no `Io` value
-/// obtained from this runtime is used afterwards.
+/// Releases the scheduler and the embedded `Io.Threaded` (joins its worker threads).
+/// Preconditions: no `Io` value obtained from this runtime is used afterwards, and every future
+/// from `async` was awaited or cancelled (no fiber is alive).
 pub fn deinit(rt: *Runtime) void {
     assert(rt.backend == .threaded);
+    if (rt.sched_state == .ready) {
+        assert(rt.sched_pin == @intFromPtr(&rt.sched));
+        rt.sched.deinit(rt.threaded.allocator);
+    }
     rt.threaded.deinit();
     // Poison so a use-after-deinit through a stale `Io` trips safety checks in Debug.
     rt.* = undefined;
 }
 
-/// The whole public surface. Takes the address of `rt`, so `rt` must not move afterwards.
+/// The whole public surface. Takes the address of `rt`, so `rt` must not move afterwards. The
+/// first call also builds the fiber scheduler in place (allocating its two blocks).
 pub fn io(rt: *Runtime) Io {
     assert(rt.backend == .threaded);
     assert(@intFromPtr(&rt.threaded) != 0);
+    if (fibers_supported) concurrency.sched_ensure(rt);
+    assert(rt.sched_state != .pending);
     return .{ .userdata = &rt.threaded, .vtable = &rt.vtable };
 }
 
@@ -129,13 +176,29 @@ pub fn baselineIo(rt: *Runtime) Io {
     return baseline;
 }
 
-test "io() and baselineIo() share userdata but not the vtable" {
-    var rt: Runtime = try .init(std.testing.allocator, .{
-        .backend = .threaded,
-        .unimplemented = .forward,
+fn test_options(backend: Backend, unimplemented: Unimplemented) Options {
+    return .{
+        .backend = backend,
+        .unimplemented = unimplemented,
         .environ = .empty,
         .argv0 = .empty,
-    });
+        .fibers_max = 4,
+        .fiber_stack_size = 64 * 1024,
+    };
+}
+
+// The four future-producing slots: native where fibers exist, forwarded elsewhere.
+const future_slots = .{ "async", "concurrent", "await", "cancel" };
+
+fn is_future_slot(comptime name: []const u8) bool {
+    inline for (future_slots) |future_slot| {
+        if (std.mem.eql(u8, name, future_slot)) return true;
+    }
+    return false;
+}
+
+test "io() and baselineIo() share userdata but not the vtable" {
+    var rt: Runtime = try .init(std.testing.allocator, test_options(.threaded, .forward));
     defer rt.deinit();
 
     const native = rt.io();
@@ -145,34 +208,26 @@ test "io() and baselineIo() share userdata but not the vtable" {
     try std.testing.expect(native.userdata != null);
 }
 
-test "forward mode installs every baseline slot" {
-    var rt: Runtime = try .init(std.testing.allocator, .{
-        .backend = .threaded,
-        .unimplemented = .forward,
-        .environ = .empty,
-        .argv0 = .empty,
-    });
+test "forward mode installs every baseline slot except the native future set" {
+    var rt: Runtime = try .init(std.testing.allocator, test_options(.threaded, .forward));
     defer rt.deinit();
 
     const native = rt.io().vtable;
     const baseline = rt.baselineIo().vtable;
     inline for (@typeInfo(Io.VTable).@"struct".fields) |field| {
-        try std.testing.expect(@field(native, field.name) == @field(baseline, field.name));
+        const forwarded = @field(native, field.name) == @field(baseline, field.name);
+        try std.testing.expectEqual(!(fibers_supported and is_future_slot(field.name)), forwarded);
     }
 }
 
-test "fail mode installs every Io.failing slot" {
-    var rt: Runtime = try .init(std.testing.allocator, .{
-        .backend = .threaded,
-        .unimplemented = .fail,
-        .environ = .empty,
-        .argv0 = .empty,
-    });
+test "fail mode installs every Io.failing slot except the native future set" {
+    var rt: Runtime = try .init(std.testing.allocator, test_options(.threaded, .fail));
     defer rt.deinit();
 
     const native = rt.io().vtable;
     inline for (@typeInfo(Io.VTable).@"struct".fields) |field| {
-        try std.testing.expect(@field(native, field.name) == @field(Io.failing.vtable, field.name));
+        const failing = @field(native, field.name) == @field(Io.failing.vtable, field.name);
+        try std.testing.expectEqual(!(fibers_supported and is_future_slot(field.name)), failing);
     }
     // The baseline stays a working Threaded whatever the mode.
     const baseline = rt.baselineIo();
@@ -187,12 +242,7 @@ test "fail mode installs every Io.failing slot" {
 }
 
 test "forwarded slots do real work" {
-    var rt: Runtime = try .init(std.testing.allocator, .{
-        .backend = .threaded,
-        .unimplemented = .forward,
-        .environ = .empty,
-        .argv0 = .empty,
-    });
+    var rt: Runtime = try .init(std.testing.allocator, test_options(.threaded, .forward));
     defer rt.deinit();
 
     const rio = rt.io();
@@ -208,11 +258,36 @@ fn add(a: u32, b: u32) u32 {
     return a + b;
 }
 
+test "the scheduler is built by the first io() and pinned there" {
+    var rt: Runtime = try .init(std.testing.allocator, test_options(.threaded, .forward));
+    defer rt.deinit();
+
+    if (!fibers_supported) {
+        try std.testing.expectEqual(SchedState.unsupported, rt.sched_state);
+        _ = rt.io();
+        try std.testing.expectEqual(SchedState.unsupported, rt.sched_state);
+        return;
+    }
+    // `init` and `baselineIo` leave it unbuilt, so a `Runtime` returned by value can still move.
+    try std.testing.expectEqual(SchedState.pending, rt.sched_state);
+    _ = rt.baselineIo();
+    try std.testing.expectEqual(SchedState.pending, rt.sched_state);
+    try std.testing.expectEqual(@as(usize, 0), rt.sched_pin);
+
+    _ = rt.io();
+    try std.testing.expectEqual(SchedState.ready, rt.sched_state);
+    try std.testing.expectEqual(@intFromPtr(&rt.sched), rt.sched_pin);
+    // A second `io()` neither rebuilds nor moves it.
+    _ = rt.io();
+    try std.testing.expectEqual(@intFromPtr(&rt.sched), rt.sched_pin);
+    try std.testing.expectEqual(@as(u32, 4), @as(u32, @intCast(rt.sched.fibers.len)));
+}
+
 test "unavailable backends are refused, auto resolves" {
     const options_unavailable: [3]Options = .{
-        .{ .backend = .kqueue, .unimplemented = .forward, .environ = .empty, .argv0 = .empty },
-        .{ .backend = .epoll, .unimplemented = .fail, .environ = .empty, .argv0 = .empty },
-        .{ .backend = .uring, .unimplemented = .forward, .environ = .empty, .argv0 = .empty },
+        test_options(.kqueue, .forward),
+        test_options(.epoll, .fail),
+        test_options(.uring, .forward),
     };
     for (options_unavailable) |options| {
         try std.testing.expectError(
@@ -220,12 +295,7 @@ test "unavailable backends are refused, auto resolves" {
             Runtime.init(std.testing.allocator, options),
         );
     }
-    var rt: Runtime = try .init(std.testing.allocator, .{
-        .backend = .auto,
-        .unimplemented = .forward,
-        .environ = .empty,
-        .argv0 = .empty,
-    });
+    var rt: Runtime = try .init(std.testing.allocator, test_options(.auto, .forward));
     defer rt.deinit();
     try std.testing.expectEqual(Backend.threaded, rt.backend);
 }

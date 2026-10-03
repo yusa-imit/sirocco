@@ -24,8 +24,22 @@ Plan `002` (fiber scheduler and futex core).
 - Internal fiber substrate (`src/sched.zig`, not public): `fibers_max` stacks allocated once in
   `init`, a FIFO ready queue, `spawn`/`yield`/`park`/`unpark`, a stack canary checked at fiber
   exit, and a lock-free `unpark_foreign` inbox that wakes a carrier blocked in the baseline
-  futex. aarch64 and x86_64 only (`Sched.supported`); no vtable slot uses it yet.
+  futex. aarch64 and x86_64 only (`Sched.supported`).
+- Native `async`, `await`, `cancel` slots on the fiber scheduler (`src/concurrency.zig`): a task
+  is a fiber that runs lazily, FIFO, once an `await` outside any fiber drives the scheduler;
+  `await` inside a fiber parks. With no free fiber or a failed allocation `async` runs the task
+  inline and returns no future. `cancel` sets a flag and awaits (observable from item 6 on).
+  `Runtime.fibers_supported` tells whether the slots are native (elsewhere they stay forwarded).
+- `Sched.in_fiber`, `Sched.has_free_fiber`; parity tests in `tests/parity/concurrency.zig`.
 - `stdx.assert_always`: an invariant check that stays on in ReleaseFast and ReleaseSmall.
+
+### Changed
+
+- `Runtime.Options` gained required `fibers_max` and `fiber_stack_size` (stacks are allocated at
+  the first `io()`).
+- `concurrent` now always returns `error.ConcurrencyUnavailable` (allowed by
+  `Io.ConcurrentError`; recorded as a divergence in `tests/parity/slots.zig`) while the runtime
+  has a single carrier; before, the forwarded Threaded slot succeeded.
 
 ### Removed
 
@@ -34,6 +48,8 @@ Plan `002` (fiber scheduler and futex core).
 
 ### Fixed
 
+- Fibers now end their stack with a zero return address, so std's stack unwinder (run by the
+  debug allocator on every allocation) stops at the fiber base instead of segfaulting.
 - Fiber switch no longer uses std's inline-asm `Io.fiber.contextSwitch`: LLVM miscompiled it in
   x86_64 ReleaseSmall (the message pointer never reached `rsi`), crashing every `sched` test.
   `src/sched.zig` now has its own naked per-arch switch that saves the callee-saved registers,
