@@ -113,6 +113,21 @@ pub fn build(b: *std.Build) void {
     const bench_step = b.step("bench", "Run benchmarks");
     bench_step.dependOn(&run_bench.step);
 
+    const bench_spawn = b.addExecutable(.{
+        .name = "sirocco-bench-spawn",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("bench/spawn.zig"),
+            .target = target,
+            .optimize = .ReleaseFast,
+            .imports = &.{
+                .{ .name = "sirocco", .module = mod },
+            },
+        }),
+    });
+    const run_bench_spawn = b.addRunArtifact(bench_spawn);
+    const bench_spawn_step = b.step("bench-spawn", "Run the io.async latency benchmark (gate 6)");
+    bench_spawn_step.dependOn(&run_bench_spawn.step);
+
     // Docs
     const docs = b.addInstallDirectory(.{
         .source_dir = mod_tests.getEmittedDocs(),

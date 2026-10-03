@@ -11,6 +11,8 @@ Plan `002` (fiber scheduler and futex core).
 
 ### Added
 
+- `bench/spawn.zig` (`zig build bench-spawn`): `io.async` -> body-entered latency of `rt.io()`
+  against `rt.baselineIo()` at 1 and 1000 in flight (PRD §5 gate 6); first numbers recorded.
 - `sirocco.Runtime` (`src/runtime.zig`): walking skeleton of the `std.Io` implementation. Every
   one of the 109 `Io.VTable` slots is forwarded from an embedded `Io.Threaded`
   (`Options.unimplemented = .forward`) or taken from `Io.failing` (`.fail`); `io()` and
