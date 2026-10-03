@@ -47,8 +47,8 @@ plan may not — context switching is per-arch assembly and aarch64-darwin runs 
       produced, so a half-native vtable would hand a sirocco future to Threaded's `await`.
       `concurrent` returns `error.ConcurrencyUnavailable` (permitted by `Io.ConcurrentError`)
       while the runtime is single-carrier; `cancel` is request-flag + await until item 6 makes
-      the flag observable. Verify: `tests/parity/concurrency.zig`; `bench/spawn.zig` records
-      PRD §5 gate 6 at 1 and 1000 in flight.
+      the flag observable. Verify: `tests/parity/concurrency.zig` (landed); `bench/spawn.zig`
+      records PRD §5 gate 6 at 1 and 1000 in flight (still to do, so this box stays open).
 - [ ] 6. Cancel state: `checkCancel`, `recancel`, `swapCancelProtection`, with per-fiber cancel
       flags and protection depth, and `cancel` from item 5 now unparking its target with
       `error.Canceled`. Verify: cancel-parity tests per PRD §8 — cancel in flight returns
