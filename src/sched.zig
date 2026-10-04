@@ -62,6 +62,11 @@ pub const supported = switch (builtin.cpu.arch) {
     else => false,
 };
 
+/// True on the thread inside `run_loop`, i.e. the carrier. Per thread, so that `in_fiber` answers
+/// false, without reading carrier-owned state, when asked from any other thread (for example a
+/// worker of the forwarded `Io.Threaded` running a group task).
+threadlocal var carrier_active: bool = false;
+
 /// Smallest accepted stack; a fiber body plus std's `Io` call chain needs room in Debug builds.
 pub const stack_size_min: u32 = 16 * 1024;
 
@@ -184,6 +189,7 @@ pub fn deinit(sched: *Sched, gpa: std.mem.Allocator) void {
 pub fn spawn(sched: *Sched, entry: Entry, arg: ?*anyopaque) SpawnError!*Fiber {
     const fiber = sched.free_head orelse return error.FibersExhausted;
     assert(fiber.state == .free);
+    assert(fiber.arg == null);
     sched.free_head = fiber.queue_next;
 
     const top = @intFromPtr(fiber.stack.ptr) + fiber.stack.len;
@@ -205,8 +211,9 @@ pub fn spawn(sched: *Sched, entry: Entry, arg: ?*anyopaque) SpawnError!*Fiber {
 }
 
 /// True when the caller is a fiber running inside `run` (as opposed to the carrier loop or any
-/// code outside `run`). Total: valid in every state.
+/// code outside `run`, on any thread). Total: valid in every state and from any thread.
 pub fn in_fiber(sched: *const Sched) bool {
+    if (!carrier_active) return false;
     if (sched.current) |fiber| {
         assert(fiber.state == .running);
         assert(sched.running);
@@ -300,8 +307,13 @@ pub fn run_until(sched: *Sched, io: Io, stop: *const bool) void {
 fn run_loop(sched: *Sched, io: Io, stop: ?*const bool) void {
     assert(sched.current == null);
     assert(!sched.running);
+    assert(!carrier_active);
     sched.running = true;
-    defer sched.running = false;
+    carrier_active = true;
+    defer {
+        carrier_active = false;
+        sched.running = false;
+    }
 
     while (sched.live_count > 0) {
         if (stop) |flag| {
@@ -549,6 +561,67 @@ fn test_yielder(arg: ?*anyopaque) void {
     slot.log.record(slot.id);
     slot.log.sched.yield();
     slot.log.record(slot.id + 100);
+}
+
+var test_stop: bool = false;
+
+fn test_stopper(arg: ?*anyopaque) void {
+    const slot: *TestSlot = @ptrCast(@alignCast(arg.?));
+    slot.log.record(slot.id);
+    if (slot.id == 1) test_stop = true;
+}
+
+test "run_until stops once the flag is set and leaves the rest for a later run" {
+    if (!supported) return error.SkipZigTest;
+    var sched: Sched = undefined;
+    try sched.init(std.testing.allocator, .{ .fibers_max = 4, .stack_size = 64 * 1024 });
+    defer sched.deinit(std.testing.allocator);
+
+    var log: TestLog = .{ .sched = &sched, .ids = @splat(0), .len = 0, .fiber = null, .flag = 0 };
+    var slots: [4]TestSlot = undefined;
+    for (&slots, 0..) |*slot, id| {
+        slot.* = .{ .log = &log, .id = @intCast(id) };
+        _ = try sched.spawn(test_stopper, slot);
+    }
+    test_stop = false;
+    sched.run_until(std.testing.io, &test_stop);
+    // Fibers 0 and 1 ran (1 raised the flag); 2 and 3 are still queued and alive.
+    try std.testing.expectEqualSlices(u32, &.{ 0, 1 }, log.ids[0..log.len]);
+    try std.testing.expectEqual(@as(u32, 2), sched.live_count);
+    try std.testing.expect(!sched.running);
+    try std.testing.expect(!sched.in_fiber());
+
+    sched.run(std.testing.io);
+    try std.testing.expectEqualSlices(u32, &.{ 0, 1, 2, 3 }, log.ids[0..log.len]);
+    try std.testing.expectEqual(@as(u32, 0), sched.live_count);
+}
+
+test "in_fiber is false on a thread that is not running the scheduler" {
+    if (!supported) return error.SkipZigTest;
+    var sched: Sched = undefined;
+    try sched.init(std.testing.allocator, .{ .fibers_max = 1, .stack_size = 64 * 1024 });
+    defer sched.deinit(std.testing.allocator);
+
+    var log: TestLog = .{ .sched = &sched, .ids = @splat(0), .len = 0, .fiber = null, .flag = 0 };
+    var slot: TestSlot = .{ .log = &log, .id = 7 };
+    _ = try sched.spawn(test_foreign_probe, &slot);
+    sched.run(std.testing.io);
+    try std.testing.expectEqual(@as(u32, 1), log.flag);
+}
+
+fn test_foreign_probe(arg: ?*anyopaque) void {
+    const slot: *TestSlot = @ptrCast(@alignCast(arg.?));
+    const sched = slot.log.sched;
+    // On the carrier, inside the fiber: true. A second thread asks while the fiber is running.
+    if (!sched.in_fiber()) return;
+    var seen_elsewhere: bool = true;
+    const thread = std.Thread.spawn(.{}, probe_elsewhere, .{ sched, &seen_elsewhere }) catch return;
+    thread.join();
+    if (!seen_elsewhere) slot.log.flag = 1;
+}
+
+fn probe_elsewhere(sched: *const Sched, result: *bool) void {
+    result.* = sched.in_fiber();
 }
 
 test "spawn fibers_max fibers, round-robin them, recycle the stacks" {

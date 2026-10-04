@@ -33,10 +33,6 @@ fn swap_outside_task(io: Io) [3]Io.CancelProtection {
     return .{ first, second, third };
 }
 
-fn swap_in_task(io: Io) [3]Io.CancelProtection {
-    return swap_outside_task(io);
-}
-
 test "checkCancel without a request returns normally, in and out of a task" {
     for (modes) |mode| {
         var rt = try fixtures.init_runtime(mode);
@@ -62,7 +58,7 @@ test "swapCancelProtection returns the previous state; a task holds its own" {
         // Inside a task the state is held. (`Io.Threaded` is not compared: it runs a task inline
         // on the caller's thread when no worker is free, and that thread holds no state.)
         const io = rt.io();
-        var future = io.async(swap_in_task, .{io});
+        var future = io.async(swap_outside_task, .{io});
         const inside = future.await(io);
         try std.testing.expectEqual(Io.CancelProtection.unblocked, inside[0]);
         try std.testing.expectEqual(Io.CancelProtection.blocked, inside[1]);
@@ -202,4 +198,47 @@ test "cancel after the task finished delivers the result and nothing else" {
         try std.testing.expect(!later.await(io));
         try std.testing.expect(!early.cancel(io));
     }
+}
+
+const GroupProbe = struct {
+    started: std.atomic.Value(bool) = .init(false),
+    /// Cancelations delivered to the group task (the request, then the re-armed one).
+    delivered: std.atomic.Value(u32) = .init(0),
+};
+
+const spin_max: u32 = 20_000_000;
+
+fn group_task(io: Io, probe: *GroupProbe) void {
+    probe.started.store(true, .release);
+    for (0..2) |_| {
+        for (0..spin_max) |_| {
+            io.checkCancel() catch |err| switch (err) {
+                error.Canceled => {
+                    _ = probe.delivered.fetchAdd(1, .acq_rel);
+                    break;
+                },
+            };
+            std.Thread.yield() catch {};
+        } else return;
+        io.recancel();
+    }
+}
+
+test "group tasks on forwarded worker threads still see cancel, recancel and protection" {
+    // `groupConcurrent` is still `Io.Threaded`'s; the task runs on a worker thread and calls
+    // sirocco's native slots there, which must reach the worker's own cancel state.
+    var rt = try fixtures.init_runtime(.forward);
+    defer rt.deinit();
+
+    const io = rt.io();
+    var probe: GroupProbe = .{};
+    var group: Io.Group = .init;
+    try group.concurrent(io, group_task, .{ io, &probe });
+    for (0..spin_max) |_| {
+        if (probe.started.load(.acquire)) break;
+        std.Thread.yield() catch {};
+    }
+    try std.testing.expect(probe.started.load(.acquire));
+    group.cancel(io);
+    try std.testing.expectEqual(@as(u32, 2), probe.delivered.load(.acquire));
 }

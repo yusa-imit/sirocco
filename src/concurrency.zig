@@ -18,7 +18,8 @@
 //!
 //! `cancel` is "set the request flag, then `await`". The flag lives in the task record and is
 //! observed by `checkCancel` on the task's fiber (`recancel` and `swapCancelProtection` act on the
-//! same record; all three are no-ops or `.unblocked` outside a task, as in `Io.Threaded`). No
+//! same record; outside a task, on the carrier or on a forwarded group worker thread, all three
+//! forward to the embedded `Io.Threaded`, which owns the state of those threads). No
 //! native slot parks cancelably yet (`await`/`cancel` cannot return `error.Canceled`), so a cancel
 //! never unparks its target; item 8's `futexWait` will. A task that never calls `checkCancel`
 //! runs to completion and its result is delivered.
@@ -198,9 +199,10 @@ fn slot_cancel(
     task_finish(rt, task, result, result_alignment);
 }
 
-/// The task running on the calling fiber, or null on the carrier (outside any task). Like
-/// `Io.Threaded`, which has no cancel state for a thread it did not start, code outside a task is
-/// never cancelled and holds no protection.
+/// The task running on the calling fiber, or null when the caller is not on a fiber: the carrier
+/// outside `run`, or any other thread (a worker of the forwarded `Io.Threaded` running a group
+/// task receives `rt.io()` too). Callers forward a null to the baseline, which holds the cancel
+/// state of those threads.
 fn current_task(rt: *Runtime) ?*Task {
     // `.unavailable`: the scheduler never existed, so every task ran inline on the caller.
     if (rt.sched_state != .ready) return null;
@@ -215,7 +217,7 @@ fn current_task(rt: *Runtime) ?*Task {
 
 fn slot_check_cancel(userdata: ?*anyopaque) Io.Cancelable!void {
     const rt = runtime_of(userdata);
-    const task = current_task(rt) orelse return;
+    const task = current_task(rt) orelse return rt.baselineIo().checkCancel();
     switch (task.protection) {
         .blocked => return,
         .unblocked => {},
@@ -231,11 +233,10 @@ fn slot_check_cancel(userdata: ?*anyopaque) Io.Cancelable!void {
 
 fn slot_recancel(userdata: ?*anyopaque) void {
     const rt = runtime_of(userdata);
-    const task = current_task(rt);
-    // Called outside a task, or without a delivered cancelation: both are caller bugs, as in std.
-    assert_always(task != null);
-    assert_always(task.?.cancel == .acknowledged);
-    task.?.cancel = .requested;
+    const task = current_task(rt) orelse return rt.baselineIo().recancel();
+    // Called without a delivered cancelation: a caller bug, as in std.
+    assert_always(task.cancel == .acknowledged);
+    task.cancel = .requested;
 }
 
 fn slot_swap_cancel_protection(
@@ -243,7 +244,7 @@ fn slot_swap_cancel_protection(
     new: Io.CancelProtection,
 ) Io.CancelProtection {
     const rt = runtime_of(userdata);
-    const task = current_task(rt) orelse return .unblocked;
+    const task = current_task(rt) orelse return rt.baselineIo().swapCancelProtection(new);
     const old = task.protection;
     task.protection = new;
     return old;
