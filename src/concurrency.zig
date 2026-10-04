@@ -5,9 +5,10 @@
 //! Model: one carrier thread, many fibers (`Sched`). `async` allocates a task record, copies the
 //! context into it and spawns a fiber that runs `start` and then marks the task done; the fiber
 //! does not run until the carrier does: from `await`/`cancel` called outside any fiber (which
-//! drives `Sched.run` until every fiber has finished) or whenever another fiber parks. Scheduling
-//! is FIFO, so the interleaving of a single-threaded program is deterministic. `await` inside a
-//! fiber records itself as the task's waiter and parks; the finishing task unparks it.
+//! drives `Sched.run_until` the awaited task is done, so later tasks stay pending) or whenever
+//! another fiber parks. Scheduling is FIFO, so the interleaving of a single-threaded program is
+//! deterministic. `await` inside a fiber records itself as the task's waiter and parks; the
+//! finishing task unparks it.
 //!
 //! Fallbacks, all permitted by `Io.VTable.async` ("if it returns `null` ... `result` has been
 //! already populated"): with no free fiber (`fibers_max` alive), a failed task allocation, or a
@@ -15,8 +16,13 @@
 //! `null`. `concurrent` always returns `error.ConcurrencyUnavailable` (`Io.ConcurrentError`: the
 //! implementation does not support concurrency) while there is a single carrier.
 //!
-//! `cancel` is "set the request flag, then `await`": nothing observes `cancel_requested` until
-//! plan 002 item 6, so a cancelled task runs to completion and its result is delivered.
+//! `cancel` is "set the request flag, then `await`". The flag lives in the task record and is
+//! observed by `checkCancel` on the task's fiber (`recancel` and `swapCancelProtection` act on the
+//! same record; outside a task, on the carrier or on a forwarded group worker thread, all three
+//! forward to the embedded `Io.Threaded`, which owns the state of those threads). No
+//! native slot parks cancelably yet (`await`/`cancel` cannot return `error.Canceled`), so a cancel
+//! never unparks its target; item 8's `futexWait` will. A task that never calls `checkCancel`
+//! runs to completion and its result is delivered.
 //!
 //! Allocation: `async` still allocates one task record per started task from the allocator that
 //! `Runtime` gave `Io.Threaded` (as Threaded itself does), freed by `await`/`cancel`; the
@@ -25,7 +31,6 @@
 //! Known limits until item 8 (futex table): `async` is lazy, and forwarded blocking slots
 //! (`futexWait`, `sleep`) block the carrier thread, so a task that only the caller's own flow can
 //! unblock (`io.async(producer)` then `queue.getOne`) deadlocks where Threaded would complete.
-//! `await` outside a fiber drives every live fiber to completion, not only the awaited one.
 //! Under `.forward`, `concurrent` is `ConcurrencyUnavailable` where Threaded would succeed.
 //!
 //! Threads: every slot runs on the carrier thread, the one that calls the first `await` outside a
@@ -55,8 +60,10 @@ const Task = struct {
     alloc_len: usize,
     alloc_alignment: std.mem.Alignment,
     done: bool,
-    /// Set by `cancel`; observed once plan 002 item 6 lands.
-    cancel_requested: bool,
+    /// `cancel` sets `.requested`; the first unprotected `checkCancel` on the task's fiber
+    /// acknowledges it; `recancel` re-arms it.
+    cancel: CancelState,
+    protection: Io.CancelProtection,
 
     fn context(task: *Task) *const anyopaque {
         return @ptrFromInt(@intFromPtr(task) + task.context_offset);
@@ -67,7 +74,9 @@ const Task = struct {
     }
 };
 
-/// Overwrites the four slots of `vtable`. Precondition: `Sched.supported`, otherwise the slots
+const CancelState = enum { none, requested, acknowledged };
+
+/// Overwrites the seven slots of `vtable`. Precondition: `Sched.supported`, otherwise the slots
 /// must stay forwarded to the baseline.
 pub fn install(vtable: *Io.VTable) void {
     assert(Sched.supported);
@@ -76,6 +85,9 @@ pub fn install(vtable: *Io.VTable) void {
     vtable.concurrent = slot_concurrent;
     vtable.await = slot_await;
     vtable.cancel = slot_cancel;
+    vtable.checkCancel = slot_check_cancel;
+    vtable.recancel = slot_recancel;
+    vtable.swapCancelProtection = slot_swap_cancel_protection;
 }
 
 /// Brings `rt.sched` into existence on the first `Runtime.io()`. The `Runtime` is pinned from
@@ -182,9 +194,60 @@ fn slot_cancel(
     const rt = runtime_of(userdata);
     assert(rt.sched_state == .ready);
     const task: *Task = @ptrCast(@alignCast(any_future));
-    assert(!task.cancel_requested); // `cancel` consumes the future: once.
-    task.cancel_requested = true;
+    assert(task.cancel == .none); // `cancel` consumes the future: once.
+    task.cancel = .requested;
     task_finish(rt, task, result, result_alignment);
+}
+
+/// The task running on the calling fiber, or null when the caller is not on a fiber: the carrier
+/// outside `run`, or any other thread (a worker of the forwarded `Io.Threaded` running a group
+/// task receives `rt.io()` too). Callers forward a null to the baseline, which holds the cancel
+/// state of those threads.
+fn current_task(rt: *Runtime) ?*Task {
+    // `.unavailable`: the scheduler never existed, so every task ran inline on the caller.
+    if (rt.sched_state != .ready) return null;
+    if (!rt.sched.in_fiber()) return null;
+    const arg = rt.sched.current_fiber().arg;
+    assert(arg != null); // Every fiber is spawned by `slot_async` with its task as the argument.
+    const task: *Task = @ptrCast(@alignCast(arg.?));
+    assert(task.sched == &rt.sched);
+    assert(!task.done);
+    return task;
+}
+
+fn slot_check_cancel(userdata: ?*anyopaque) Io.Cancelable!void {
+    const rt = runtime_of(userdata);
+    const task = current_task(rt) orelse return rt.baselineIo().checkCancel();
+    switch (task.protection) {
+        .blocked => return,
+        .unblocked => {},
+    }
+    switch (task.cancel) {
+        .none, .acknowledged => {},
+        .requested => {
+            task.cancel = .acknowledged;
+            return error.Canceled;
+        },
+    }
+}
+
+fn slot_recancel(userdata: ?*anyopaque) void {
+    const rt = runtime_of(userdata);
+    const task = current_task(rt) orelse return rt.baselineIo().recancel();
+    // Called without a delivered cancelation: a caller bug, as in std.
+    assert_always(task.cancel == .acknowledged);
+    task.cancel = .requested;
+}
+
+fn slot_swap_cancel_protection(
+    userdata: ?*anyopaque,
+    new: Io.CancelProtection,
+) Io.CancelProtection {
+    const rt = runtime_of(userdata);
+    const task = current_task(rt) orelse return rt.baselineIo().swapCancelProtection(new);
+    const old = task.protection;
+    task.protection = new;
+    return old;
 }
 
 fn task_create(
@@ -215,7 +278,8 @@ fn task_create(
         .alloc_len = alloc_len,
         .alloc_alignment = alignment,
         .done = false,
-        .cancel_requested = false,
+        .cancel = .none,
+        .protection = .unblocked,
     };
     assert(context_alignment.check(@intFromPtr(task.context())));
     assert(result_alignment.check(@intFromPtr(task.result())));
@@ -254,7 +318,7 @@ fn task_finish(
         } else {
             // Outside any fiber the carrier loop is not running (all fibers run inside `run`).
             assert(!rt.sched.running);
-            rt.sched.run(rt.baselineIo());
+            rt.sched.run_until(rt.baselineIo(), &task.done);
         }
     }
     assert_always(task.done);

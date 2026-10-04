@@ -5,9 +5,10 @@
 //! `Io.Threaded`. Scheduling facts that `Io.Threaded` does not share (a started task runs lazily
 //! on a fiber, in FIFO order, exhaustion runs a task inline, `concurrent` is unavailable) are
 //! asserted on `rt.io()` alone, because the contract permits either behaviour. Every test runs
-//! under both `.forward` and `.fail`: the four slots are native, so `Io.failing`'s unreachable
-//! `await`/`cancel` must never be reached. The runtime's allocator is `std.testing.allocator`
-//! (or a `FailingAllocator` over it), so a leaked task record fails the test.
+//! under both `.forward` and `.fail`: the future-producing slots are native, so `Io.failing`'s
+//! unreachable `await`/`cancel` must never be reached. The runtime's allocator is
+//! `std.testing.allocator` (or a `FailingAllocator` over it), so a leaked task record fails the
+//! test.
 
 const std = @import("std");
 const Io = std.Io;
@@ -199,6 +200,28 @@ test "spawned tasks run in spawn order when the first await drives the scheduler
         for (futures[0..3], 0..) |*future, id| {
             try std.testing.expectEqual(@as(u32, @intCast(id)) * 2, future.await(io));
         }
+    }
+}
+
+test "await outside a fiber runs tasks only up to the awaited one" {
+    if (!fibers_supported) return error.SkipZigTest;
+    for (modes) |mode| {
+        var rt = try fixtures.init_runtime(mode);
+        defer rt.deinit();
+
+        const io = rt.io();
+        var trace = Trace.init();
+        var futures: [4]Io.Future(u32) = undefined;
+        for (&futures, 0..) |*future, id| {
+            future.* = io.async(traced_leaf, .{ &trace, @as(u32, @intCast(id)) });
+        }
+        try std.testing.expectEqual(@as(u32, 2), futures[1].await(io));
+        try std.testing.expectEqualSlices(u32, &.{ 0, 1 }, trace.slice());
+        // The rest are still pending; each later await resumes the same FIFO queue.
+        try std.testing.expectEqual(@as(u32, 6), futures[3].await(io));
+        try std.testing.expectEqualSlices(u32, &.{ 0, 1, 2, 3 }, trace.slice());
+        try std.testing.expectEqual(@as(u32, 4), futures[2].await(io));
+        try std.testing.expectEqual(@as(u32, 0), futures[0].await(io));
     }
 }
 

@@ -187,8 +187,16 @@ fn test_options(backend: Backend, unimplemented: Unimplemented) Options {
     };
 }
 
-// The four future-producing slots: native where fibers exist, forwarded elsewhere.
-const future_slots = .{ "async", "concurrent", "await", "cancel" };
+// The slots `concurrency.zig` installs: native where fibers exist, forwarded elsewhere.
+const future_slots = .{
+    "async",
+    "concurrent",
+    "await",
+    "cancel",
+    "checkCancel",
+    "recancel",
+    "swapCancelProtection",
+};
 
 fn is_future_slot(comptime name: []const u8) bool {
     inline for (future_slots) |future_slot| {

@@ -11,6 +11,12 @@ Plan `002` (fiber scheduler and futex core).
 
 ### Added
 
+- Native `checkCancel`, `recancel` and `swapCancelProtection` on fibers: each task record holds
+  its cancel request (`none`/`requested`/`acknowledged`) and protection; `cancel` sets the request
+  and the task's first unprotected `checkCancel` returns `error.Canceled`, once, until
+  `recancel`. Outside a task (the carrier, or a forwarded group worker thread) they forward to the
+  embedded `Io.Threaded`. `Sched.run_until` lets `await` outside a fiber run only up to the
+  awaited task instead of draining every live fiber.
 - `bench/spawn.zig` (`zig build bench-spawn`): `io.async` -> body-entered latency of `rt.io()`
   against `rt.baselineIo()` at 1 and 1000 in flight (PRD §5 gate 6); first numbers recorded.
 - `sirocco.Runtime` (`src/runtime.zig`): walking skeleton of the `std.Io` implementation. Every

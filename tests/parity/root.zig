@@ -7,4 +7,5 @@ test {
     _ = @import("time.zig");
     _ = @import("dir.zig");
     _ = @import("concurrency.zig");
+    _ = @import("cancel.zig");
 }

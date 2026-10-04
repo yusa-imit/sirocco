@@ -50,7 +50,7 @@ plan may not — context switching is per-arch assembly and aarch64-darwin runs 
       the flag observable. Verify: `tests/parity/concurrency.zig` (landed); `bench/spawn.zig`
       records PRD §5 gate 6 at 1 and 1000 in flight (`zig build bench-spawn`; landed: passes at 1,
       fails at 1000 because `async` is lazy, see the PRD §5 table; item 8/9 revisit it).
-- [ ] 6. Cancel state: `checkCancel`, `recancel`, `swapCancelProtection`, with per-fiber cancel
+- [x] 6. Cancel state: `checkCancel`, `recancel`, `swapCancelProtection`, with per-fiber cancel
       flags and protection depth, and `cancel` from item 5 now unparking its target with
       `error.Canceled`. Verify: cancel-parity tests per PRD §8 — cancel in flight returns
       `error.Canceled` on both `Io`s, and neither returns it under `.blocked`.
