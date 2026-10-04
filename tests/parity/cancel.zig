@@ -1,0 +1,205 @@
+//! Cancel-state tests (plan 002 item 6): `checkCancel`, `recancel`, `swapCancelProtection`.
+//!
+//! Facts about "no cancel requested" and "outside any task" are compared against `Io.Threaded`
+//! through `harness.expectSameResult`. Facts that need a cancel to arrive at a known point are
+//! asserted on `rt.io()` alone: sirocco starts a task lazily on a fiber, so `cancel` always lands
+//! before the first instruction of the task, while `Io.Threaded` may already be running it on a
+//! worker (or inline) and the cancel would race. Every test runs under both `.forward` and
+//! `.fail`: the three slots are native, so `Io.failing`'s unreachable stubs must stay unreached.
+
+const std = @import("std");
+const Io = std.Io;
+const Runtime = @import("sirocco").Runtime;
+const fixtures = @import("fixtures.zig");
+const harness = @import("harness.zig");
+
+const modes = [_]Runtime.Unimplemented{ .forward, .fail };
+
+const fibers_supported = Runtime.fibers_supported;
+
+fn check_cancel_plain(io: Io) Io.Cancelable!void {
+    try io.checkCancel();
+}
+
+fn check_cancel_in_task(io: Io) Io.Cancelable!void {
+    var future = io.async(check_cancel_plain, .{io});
+    return future.await(io);
+}
+
+fn swap_outside_task(io: Io) [3]Io.CancelProtection {
+    const first = io.swapCancelProtection(.blocked);
+    const second = io.swapCancelProtection(.unblocked);
+    const third = io.swapCancelProtection(.unblocked);
+    return .{ first, second, third };
+}
+
+fn swap_in_task(io: Io) [3]Io.CancelProtection {
+    return swap_outside_task(io);
+}
+
+test "checkCancel without a request returns normally, in and out of a task" {
+    for (modes) |mode| {
+        var rt = try fixtures.init_runtime(mode);
+        defer rt.deinit();
+
+        try harness.expectSameResult(&rt, check_cancel_plain, .{});
+        try harness.expectSameResult(&rt, check_cancel_in_task, .{});
+    }
+}
+
+test "swapCancelProtection returns the previous state; a task holds its own" {
+    for (modes) |mode| {
+        var rt = try fixtures.init_runtime(mode);
+        defer rt.deinit();
+
+        try harness.expectSameResult(&rt, swap_outside_task, .{});
+        // Outside a task there is no state to hold: every call reports `.unblocked`.
+        const outside = swap_outside_task(rt.io());
+        try std.testing.expectEqual(Io.CancelProtection.unblocked, outside[0]);
+        try std.testing.expectEqual(Io.CancelProtection.unblocked, outside[1]);
+        try std.testing.expectEqual(Io.CancelProtection.unblocked, outside[2]);
+        if (!fibers_supported) continue;
+        // Inside a task the state is held. (`Io.Threaded` is not compared: it runs a task inline
+        // on the caller's thread when no worker is free, and that thread holds no state.)
+        const io = rt.io();
+        var future = io.async(swap_in_task, .{io});
+        const inside = future.await(io);
+        try std.testing.expectEqual(Io.CancelProtection.unblocked, inside[0]);
+        try std.testing.expectEqual(Io.CancelProtection.blocked, inside[1]);
+        try std.testing.expectEqual(Io.CancelProtection.unblocked, inside[2]);
+    }
+}
+
+/// True when `checkCancel` reported the cancelation.
+fn observes_cancel(io: Io) bool {
+    io.checkCancel() catch |err| switch (err) {
+        error.Canceled => return true,
+    };
+    return false;
+}
+
+test "cancel before the task starts is observed at its first check" {
+    if (!fibers_supported) return error.SkipZigTest;
+    for (modes) |mode| {
+        var rt = try fixtures.init_runtime(mode);
+        defer rt.deinit();
+
+        const io = rt.io();
+        var future = io.async(observes_cancel, .{io});
+        try std.testing.expect(future.cancel(io));
+    }
+}
+
+test "a task nobody cancelled does not observe a cancelation" {
+    if (!fibers_supported) return error.SkipZigTest;
+    for (modes) |mode| {
+        var rt = try fixtures.init_runtime(mode);
+        defer rt.deinit();
+
+        const io = rt.io();
+        var future = io.async(observes_cancel, .{io});
+        try std.testing.expect(!future.await(io));
+    }
+}
+
+/// Counts cancelations: the request is delivered once, `recancel` re-arms it.
+fn observes_cancel_twice(io: Io) u32 {
+    var count: u32 = 0;
+    if (observes_cancel(io)) count += 1;
+    // Acknowledged: the request is spent until `recancel`.
+    if (observes_cancel(io)) count += 10;
+    io.recancel();
+    if (observes_cancel(io)) count += 100;
+    return count;
+}
+
+test "a cancelation is delivered once and recancel re-arms it" {
+    if (!fibers_supported) return error.SkipZigTest;
+    for (modes) |mode| {
+        var rt = try fixtures.init_runtime(mode);
+        defer rt.deinit();
+
+        const io = rt.io();
+        var future = io.async(observes_cancel_twice, .{io});
+        try std.testing.expectEqual(@as(u32, 101), future.cancel(io));
+    }
+}
+
+/// Blocked protection hides the request; unblocking reveals it again.
+fn observes_through_protection(io: Io) [3]bool {
+    const old = io.swapCancelProtection(.blocked);
+    const hidden = observes_cancel(io);
+    const restored = io.swapCancelProtection(old);
+    std.debug.assert(restored == .blocked);
+    const revealed = observes_cancel(io);
+    return .{ hidden, revealed, old == .unblocked };
+}
+
+test "blocked protection hides a cancelation until it is lifted" {
+    if (!fibers_supported) return error.SkipZigTest;
+    for (modes) |mode| {
+        var rt = try fixtures.init_runtime(mode);
+        defer rt.deinit();
+
+        const io = rt.io();
+        var future = io.async(observes_through_protection, .{io});
+        const seen = future.cancel(io);
+        try std.testing.expect(!seen[0]);
+        try std.testing.expect(seen[1]);
+        try std.testing.expect(seen[2]);
+    }
+}
+
+test "a cancelation reaches only its own task" {
+    if (!fibers_supported) return error.SkipZigTest;
+    for (modes) |mode| {
+        var rt = try fixtures.init_runtime(mode);
+        defer rt.deinit();
+
+        const io = rt.io();
+        var cancelled = io.async(observes_cancel, .{io});
+        var sibling = io.async(observes_cancel, .{io});
+        try std.testing.expect(cancelled.cancel(io));
+        try std.testing.expect(!sibling.await(io));
+    }
+}
+
+fn leaves_protection_blocked(io: Io) bool {
+    _ = io.swapCancelProtection(.blocked);
+    return observes_cancel(io);
+}
+
+fn reports_fresh_state(io: Io) bool {
+    const old = io.swapCancelProtection(.unblocked);
+    return old == .unblocked and !observes_cancel(io);
+}
+
+test "a recycled fiber starts with no request and no protection" {
+    if (!fibers_supported) return error.SkipZigTest;
+    for (modes) |mode| {
+        // One fiber: the second task necessarily runs on the first task's recycled fiber.
+        var rt = try fixtures.init_runtime_in(std.testing.allocator, mode, 1);
+        defer rt.deinit();
+
+        const io = rt.io();
+        var first = io.async(leaves_protection_blocked, .{io});
+        try std.testing.expect(!first.cancel(io));
+        var second = io.async(reports_fresh_state, .{io});
+        try std.testing.expect(second.await(io));
+    }
+}
+
+test "cancel after the task finished delivers the result and nothing else" {
+    if (!fibers_supported) return error.SkipZigTest;
+    for (modes) |mode| {
+        var rt = try fixtures.init_runtime(mode);
+        defer rt.deinit();
+
+        const io = rt.io();
+        var early = io.async(observes_cancel, .{io});
+        var later = io.async(observes_cancel, .{io});
+        // Awaiting the second drives the scheduler until it is done; the first ran before it.
+        try std.testing.expect(!later.await(io));
+        try std.testing.expect(!early.cancel(io));
+    }
+}

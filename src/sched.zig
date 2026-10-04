@@ -90,6 +90,9 @@ pub const Fiber = struct {
     queue_next: ?*Fiber,
     state: State,
     stack: []u8,
+    /// The `arg` of the `spawn` that made this fiber live; null while free. Lets code running on
+    /// the fiber find its own task record from `current_fiber`.
+    arg: ?*anyopaque,
 
     const State = enum { free, ready, running, parked };
 };
@@ -158,6 +161,7 @@ fn init_checked(
             .queue_next = target.free_head,
             .state = .free,
             .stack = stacks[stack_offset..][0..options.stack_size],
+            .arg = null,
         };
         target.free_head = &fibers[index];
     }
@@ -187,6 +191,7 @@ pub fn spawn(sched: *Sched, entry: Entry, arg: ?*anyopaque) SpawnError!*Fiber {
     const start_address = std.mem.alignBackward(usize, top - @sizeOf(Start), stack_align);
     const start: *Start = @ptrFromInt(start_address);
     start.* = .{ .sched = sched, .fiber = fiber, .entry = entry, .arg = arg };
+    fiber.arg = arg;
     std.mem.writeInt(u64, fiber.stack[0..canary_size], canary_value, .little);
     // x86_64 enters `fiber_main` through a `jmp`, so the word below `Start` plays the return
     // address; zero ends a stack walk (aarch64 zeroes `x30` in `fiber_entry`).
@@ -278,12 +283,30 @@ pub fn unpark_foreign(sched: *Sched, io: Io, fiber: *Fiber) void {
 /// runnable blocks the carrier in the baseline futex until `unpark_foreign` delivers it.
 /// Precondition: not nested, and called from outside any fiber.
 pub fn run(sched: *Sched, io: Io) void {
+    sched.run_loop(io, null);
+    assert(sched.live_count == 0);
+    assert(sched.ready_head == null);
+    assert(sched.parked_count == 0);
+}
+
+/// Like `run`, but returns as soon as `stop.*` is true after a fiber has switched out (or no fiber
+/// is alive), leaving the other fibers alive for a later `run`/`run_until`. `stop` is written
+/// only by fibers on this thread. Same preconditions as `run`.
+pub fn run_until(sched: *Sched, io: Io, stop: *const bool) void {
+    sched.run_loop(io, stop);
+    assert(stop.* or sched.live_count == 0);
+}
+
+fn run_loop(sched: *Sched, io: Io, stop: ?*const bool) void {
     assert(sched.current == null);
     assert(!sched.running);
     sched.running = true;
     defer sched.running = false;
 
     while (sched.live_count > 0) {
+        if (stop) |flag| {
+            if (flag.*) break;
+        }
         const version = @atomicLoad(u32, &sched.inbox_version, .acquire);
         sched.inbox_drain();
         const fiber = sched.pop_ready() orelse {
@@ -297,8 +320,6 @@ pub fn run(sched: *Sched, io: Io) void {
         switch_context(&sched.carrier_context, &fiber.context);
         assert(sched.current == null);
     }
-    assert(sched.ready_head == null);
-    assert(sched.parked_count == 0);
 }
 
 fn push_ready(sched: *Sched, fiber: *Fiber) void {
@@ -462,6 +483,7 @@ fn fiber_main(start: *Start) callconv(.withStackAlign(.c, @alignOf(Start))) nore
     assert_always(canary_intact(fiber.stack));
     assert(fiber.state == .running);
     fiber.state = .free;
+    fiber.arg = null;
     fiber.queue_next = sched.free_head;
     sched.free_head = fiber;
     sched.live_count -= 1;
