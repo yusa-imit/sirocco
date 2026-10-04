@@ -54,7 +54,7 @@ plan may not — context switching is per-arch assembly and aarch64-darwin runs 
       flags and protection depth, and `cancel` from item 5 now unparking its target with
       `error.Canceled`. Verify: cancel-parity tests per PRD §8 — cancel in flight returns
       `error.Canceled` on both `Io`s, and neither returns it under `.blocked`.
-- [ ] 7. Group slots as one set: `groupAsync`, `groupConcurrent`, `groupAwait`, `groupCancel`
+- [x] 7. Group slots as one set: `groupAsync`, `groupConcurrent`, `groupAwait`, `groupCancel`
       (same token-ownership argument as item 5), plus `crashHandler`, which closes P0's 12.
       Verify: `tests/parity/group.zig` (wait-all, cancel-all, error propagation); `slots.zig`
       shows 12 P0 names in `native`.

@@ -1,6 +1,8 @@
-//! sirocco's future-producing `Io` slots: `async`, `concurrent`, `await`, `cancel` (plan 002
-//! item 5), installed by `Runtime` as one set because `await`/`cancel` receive the `*AnyFuture`
-//! that `async` produced, so a half-native vtable would hand a sirocco future to Threaded.
+//! sirocco's concurrency `Io` slots: `async`, `concurrent`, `await`, `cancel` (plan 002 item 5),
+//! the cancel state (item 6) and the group set `groupAsync`/`groupConcurrent`/`groupAwait`/
+//! `groupCancel` plus `crashHandler` (item 7), installed by `Runtime` as one set because
+//! `await`/`cancel` receive the `*AnyFuture` that `async` produced and a group's token is the
+//! record `groupAsync` made, so a half-native vtable would hand a sirocco token to Threaded.
 //!
 //! Model: one carrier thread, many fibers (`Sched`). `async` allocates a task record, copies the
 //! context into it and spawns a fiber that runs `start` and then marks the task done; the fiber
@@ -24,8 +26,25 @@
 //! never unparks its target; item 8's `futexWait` will. A task that never calls `checkCancel`
 //! runs to completion and its result is delivered.
 //!
-//! Allocation: `async` still allocates one task record per started task from the allocator that
-//! `Runtime` gave `Io.Threaded` (as Threaded itself does), freed by `await`/`cancel`; the
+//! Groups: `Io.Group.token` points at a `GroupRec` (live members as an intrusive list, a count,
+//! the one parked awaiter) made by the first `groupAsync` that gets a fiber; each member is a
+//! `Task` whose fiber frees its own record when it ends. Like `async`, a member runs inline when
+//! no fiber, task record or group record is available (then the token stays null, which `Group`
+//! documents as "no resources"), and `groupConcurrent` is `ConcurrencyUnavailable`.
+//! `groupCancel` requests cancelation on every live member and waits; `groupAwait` does the same
+//! when the awaiting task itself has a pending unprotected request, and then reports
+//! `error.Canceled` after the group finished; a request that arrives while the awaiter is parked
+//! is not propagated (no native park is cancelable until item 8). `crashHandler` marks the
+//! calling task's cancelation acknowledged and protected, as Threaded does for its thread, so a
+//! panic handler's cleanup is never interrupted. Preconditions, as std states them: a group is
+//! awaited or canceled once by one fiber that is not one of its members, no member is added once
+//! the last one has finished, and the group stays on one `Io` (a token made by `rt.baselineIo()`
+//! is Threaded's, not a `GroupRec`).
+//!
+//! Allocation: `async` and `groupAsync` still allocate one task record per started task (and the
+//! first member of a group one `GroupRec`) from the allocator that `Runtime` gave `Io.Threaded`
+//! (as Threaded itself does), freed by `await`/`cancel` (members: by their own fiber, groups: by
+//! `groupAwait`/`groupCancel`); the
 //! no-allocation contract is a later item. Fibers and stacks come from `Sched.init`.
 //!
 //! Known limits until item 8 (futex table): `async` is lazy, and forwarded blocking slots
@@ -47,11 +66,17 @@ const Io = std.Io;
 const assert = stdx.assert;
 const assert_always = stdx.assert_always;
 
-/// Per-future record: lives from `async` until `await`/`cancel` frees it, followed in the same
-/// allocation by the copied context and the result storage (each at its own alignment).
+/// Per-task record: lives from `async` until `await`/`cancel` frees it (a group member: until its
+/// own fiber ends), followed in the same allocation by the copied context and the result storage
+/// (each at its own alignment; a member has no result).
 const Task = struct {
     sched: *Sched,
-    start: *const fn (context: *const anyopaque, result: *anyopaque) void,
+    body: Body,
+    /// The group this task is a member of; null for a future's task.
+    group: ?*GroupRec,
+    /// Links in `group`'s list of live members.
+    prev: ?*Task,
+    next: ?*Task,
     /// The single fiber parked in `await`/`cancel`, if any.
     waiter: ?*Sched.Fiber,
     context_offset: usize,
@@ -76,7 +101,31 @@ const Task = struct {
 
 const CancelState = enum { none, requested, acknowledged };
 
-/// Overwrites the seven slots of `vtable`. Precondition: `Sched.supported`, otherwise the slots
+/// What a task's fiber runs: a future's function (result delivered to `await`) or a group
+/// member's (nobody awaits it; the group counts it down).
+const Body = union(enum) {
+    future: *const fn (context: *const anyopaque, result: *anyopaque) void,
+    member: *const fn (context: *const anyopaque) void,
+};
+
+/// What `Io.Group.token` points at while the group has had members: allocated by the first
+/// `groupAsync` that starts a fiber, freed by `groupAwait`/`groupCancel`, which also null the
+/// token. `Io.Group.state` is not used.
+const GroupRec = struct {
+    sched: *Sched,
+    /// Live (not yet finished) members, most recent first; `pending` of them.
+    head: ?*Task,
+    pending: u32,
+    /// `pending == 0`; a field of its own because `Sched.run_until` watches a `*const bool`.
+    idle: bool,
+    /// The single fiber parked in `groupAwait`/`groupCancel`, if any.
+    waiter: ?*Sched.Fiber,
+    /// `groupAwait`/`groupCancel` has requested cancelation: members spawned later by a member
+    /// are born requested.
+    canceling: bool,
+};
+
+/// Overwrites the twelve slots of `vtable`. Precondition: `Sched.supported`, otherwise the slots
 /// must stay forwarded to the baseline.
 pub fn install(vtable: *Io.VTable) void {
     assert(Sched.supported);
@@ -88,6 +137,11 @@ pub fn install(vtable: *Io.VTable) void {
     vtable.checkCancel = slot_check_cancel;
     vtable.recancel = slot_recancel;
     vtable.swapCancelProtection = slot_swap_cancel_protection;
+    vtable.groupAsync = slot_group_async;
+    vtable.groupConcurrent = slot_group_concurrent;
+    vtable.groupAwait = slot_group_await;
+    vtable.groupCancel = slot_group_cancel;
+    vtable.crashHandler = slot_crash_handler;
 }
 
 /// Brings `rt.sched` into existence on the first `Runtime.io()`. The `Runtime` is pinned from
@@ -138,7 +192,8 @@ fn slot_async(
         return run_inline(result, context, start);
     }
     assert(rt.sched_pin == @intFromPtr(&rt.sched));
-    const task = task_create(rt, result.len, result_alignment, context, context_alignment, start);
+    const body: Body = .{ .future = start };
+    const task = task_create(rt, result.len, result_alignment, context, context_alignment, body);
     const task_ok = task orelse return run_inline(result, context, start);
     const fiber = rt.sched.spawn(task_entry, task_ok) catch |err| switch (err) {
         // `has_free_fiber` held on this thread a moment ago and nothing ran in between.
@@ -208,7 +263,8 @@ fn current_task(rt: *Runtime) ?*Task {
     if (rt.sched_state != .ready) return null;
     if (!rt.sched.in_fiber()) return null;
     const arg = rt.sched.current_fiber().arg;
-    assert(arg != null); // Every fiber is spawned by `slot_async` with its task as the argument.
+    // Every fiber is spawned by `slot_async`/`slot_group_async` with its task as the argument.
+    assert(arg != null);
     const task: *Task = @ptrCast(@alignCast(arg.?));
     assert(task.sched == &rt.sched);
     assert(!task.done);
@@ -218,15 +274,20 @@ fn current_task(rt: *Runtime) ?*Task {
 fn slot_check_cancel(userdata: ?*anyopaque) Io.Cancelable!void {
     const rt = runtime_of(userdata);
     const task = current_task(rt) orelse return rt.baselineIo().checkCancel();
+    if (task_acknowledge_cancel(task)) return error.Canceled;
+}
+
+/// True when `task` has an unprotected pending request, which this call acknowledges.
+fn task_acknowledge_cancel(task: *Task) bool {
     switch (task.protection) {
-        .blocked => return,
+        .blocked => return false,
         .unblocked => {},
     }
     switch (task.cancel) {
-        .none, .acknowledged => {},
+        .none, .acknowledged => return false,
         .requested => {
             task.cancel = .acknowledged;
-            return error.Canceled;
+            return true;
         },
     }
 }
@@ -256,7 +317,7 @@ fn task_create(
     result_alignment: std.mem.Alignment,
     context: []const u8,
     context_alignment: std.mem.Alignment,
-    start: *const fn (context: *const anyopaque, result: *anyopaque) void,
+    body: Body,
 ) ?*Task {
     const alignment = result_alignment.max(context_alignment).max(.of(Task));
     const context_offset = context_alignment.forward(@sizeOf(Task));
@@ -270,7 +331,10 @@ fn task_create(
     const task: *Task = @ptrCast(@alignCast(base));
     task.* = .{
         .sched = &rt.sched,
-        .start = start,
+        .body = body,
+        .group = null,
+        .prev = null,
+        .next = null,
         .waiter = null,
         .context_offset = context_offset,
         .result_offset = result_offset,
@@ -287,16 +351,27 @@ fn task_create(
     return task;
 }
 
-/// Fiber body of every task: run the user function, publish completion, wake the waiter.
+/// Fiber body of every task: run the user function, then publish completion (a future wakes its
+/// waiter; a group member leaves its group and frees its own record).
 fn task_entry(arg: ?*anyopaque) void {
     const task: *Task = @ptrCast(@alignCast(arg.?));
     assert(!task.done);
     assert(task.sched.in_fiber());
-    task.start(task.context(), task.result());
-    task.done = true;
-    if (task.waiter) |waiter| {
-        task.waiter = null;
-        task.sched.unpark(waiter);
+    switch (task.body) {
+        .future => |start| {
+            assert(task.group == null);
+            start(task.context(), task.result());
+            task.done = true;
+            if (task.waiter) |waiter| {
+                task.waiter = null;
+                task.sched.unpark(waiter);
+            }
+        },
+        .member => |start| {
+            assert(task.group != null);
+            start(task.context());
+            member_finish(task);
+        },
     }
 }
 
@@ -325,6 +400,176 @@ fn task_finish(
     assert(task.waiter == null);
     assert(result_alignment.check(@intFromPtr(task.result())));
     @memcpy(result, @as([*]const u8, @ptrCast(task.result()))[0..task.result_len]);
+    task_free(rt, task);
+}
+
+fn task_free(rt: *Runtime, task: *Task) void {
+    assert(task.sched == &rt.sched);
+    assert(task.waiter == null);
     const base: [*]u8 = @ptrCast(task);
     rt.threaded.allocator.rawFree(base[0..task.alloc_len], task.alloc_alignment, @returnAddress());
+}
+
+fn slot_group_async(
+    userdata: ?*anyopaque,
+    group: *Io.Group,
+    context: []const u8,
+    context_alignment: std.mem.Alignment,
+    start: *const fn (context: *const anyopaque) void,
+) void {
+    const rt = runtime_of(userdata);
+    if (rt.sched_state != .ready or !rt.sched.has_free_fiber()) return start(context.ptr);
+    assert(rt.sched_pin == @intFromPtr(&rt.sched));
+    const body: Body = .{ .member = start };
+    const task = task_create(rt, 0, .@"1", context, context_alignment, body) orelse {
+        return start(context.ptr);
+    };
+    const rec = group_rec_ensure(rt, group) orelse {
+        task_free(rt, task);
+        return start(context.ptr);
+    };
+    assert(rec.sched == &rt.sched);
+    task.group = rec;
+    task.next = rec.head;
+    if (rec.head) |head| head.prev = task;
+    rec.head = task;
+    rec.pending += 1;
+    rec.idle = false;
+    if (rec.canceling) task.cancel = .requested;
+    const fiber = rt.sched.spawn(task_entry, task) catch |err| switch (err) {
+        // `has_free_fiber` held on this thread a moment ago and nothing ran in between.
+        error.FibersExhausted => unreachable,
+    };
+    assert(fiber.state == .ready);
+    assert(group.token.raw == @as(?*anyopaque, rec));
+}
+
+/// The group's record, created on the first member that gets a fiber; null on out-of-memory.
+fn group_rec_ensure(rt: *Runtime, group: *Io.Group) ?*GroupRec {
+    if (group.token.load(.acquire)) |token| return @ptrCast(@alignCast(token));
+    const rec = rt.threaded.allocator.create(GroupRec) catch |err| switch (err) {
+        error.OutOfMemory => return null,
+    };
+    rec.* = .{
+        .sched = &rt.sched,
+        .head = null,
+        .pending = 0,
+        .idle = true,
+        .waiter = null,
+        .canceling = false,
+    };
+    group.token.store(rec, .release);
+    assert(rec.idle);
+    assert(rec.pending == 0);
+    return rec;
+}
+
+fn slot_group_concurrent(
+    userdata: ?*anyopaque,
+    group: *Io.Group,
+    context: []const u8,
+    context_alignment: std.mem.Alignment,
+    start: *const fn (context: *const anyopaque) void,
+) Io.ConcurrentError!void {
+    const rt = runtime_of(userdata);
+    assert(context.len == 0 or @intFromPtr(context.ptr) != 0);
+    assert(rt.sched_state != .pending);
+    _ = .{ group, context_alignment, start };
+    return error.ConcurrencyUnavailable;
+}
+
+fn slot_group_await(
+    userdata: ?*anyopaque,
+    group: *Io.Group,
+    token: *anyopaque,
+) Io.Cancelable!void {
+    const rt = runtime_of(userdata);
+    const rec: *GroupRec = @ptrCast(@alignCast(token));
+    assert(group.token.raw == token);
+    assert(rec.sched == &rt.sched);
+    // A canceled awaiter cancels its members ("propagate to all members") and reports it once the
+    // group has finished, so no member outlives the call.
+    const canceled = if (current_task(rt)) |task| task_acknowledge_cancel(task) else false;
+    if (canceled) group_request_cancel(rec);
+    group_finish(rt, group, rec);
+    if (canceled) return error.Canceled;
+}
+
+fn slot_group_cancel(userdata: ?*anyopaque, group: *Io.Group, token: *anyopaque) void {
+    const rt = runtime_of(userdata);
+    const rec: *GroupRec = @ptrCast(@alignCast(token));
+    assert(group.token.raw == token);
+    assert(rec.sched == &rt.sched);
+    group_request_cancel(rec);
+    group_finish(rt, group, rec);
+}
+
+fn group_request_cancel(rec: *GroupRec) void {
+    assert((rec.head == null) == (rec.pending == 0));
+    rec.canceling = true;
+    var node = rec.head;
+    for (0..rec.pending) |_| {
+        const member = node.?;
+        if (member.cancel == .none) member.cancel = .requested;
+        node = member.next;
+    }
+    assert(node == null);
+}
+
+/// Waits until every member finished (parking inside a fiber, driving the scheduler outside one),
+/// then releases the record and nulls the token, as `Io.Group.await` asserts.
+fn group_finish(rt: *Runtime, group: *Io.Group, rec: *GroupRec) void {
+    // A member waiting for its own group could never be woken: the count never reaches zero.
+    if (current_task(rt)) |task| assert_always(task.group != rec);
+    if (!rec.idle) {
+        if (rt.sched.in_fiber()) {
+            assert_always(rec.waiter == null); // Awaited once: a second waiter would be lost.
+            rec.waiter = rt.sched.current_fiber();
+            rt.sched.park();
+        } else {
+            assert(!rt.sched.running);
+            rt.sched.run_until(rt.baselineIo(), &rec.idle);
+        }
+    }
+    assert_always(rec.idle);
+    assert(rec.pending == 0);
+    assert(rec.head == null);
+    assert(rec.waiter == null);
+    group.token.store(null, .release);
+    rt.threaded.allocator.destroy(rec);
+}
+
+/// End of a group member's fiber: leave the list, free the record, wake the awaiting fiber when
+/// this was the last member.
+fn member_finish(task: *Task) void {
+    const rec = task.group.?;
+    const rt: *Runtime = @fieldParentPtr("sched", task.sched);
+    assert(rec.pending > 0);
+    assert(!rec.idle);
+    if (task.prev) |prev| prev.next = task.next else rec.head = task.next;
+    if (task.next) |next| next.prev = task.prev;
+    task_free(rt, task);
+    rec.pending -= 1;
+    if (rec.pending > 0) return;
+    rec.idle = true;
+    if (rec.waiter) |waiter| {
+        rec.waiter = null;
+        rec.sched.unpark(waiter);
+    }
+}
+
+/// Marks the calling task canceled and protected, so a panic handler's cleanup cannot block; on
+/// any other thread the baseline owns the state.
+fn slot_crash_handler(userdata: ?*anyopaque) void {
+    const rt = runtime_of(userdata);
+    const task = current_task(rt) orelse {
+        const baseline = rt.baselineIo();
+        return baseline.vtable.crashHandler(baseline.userdata);
+    };
+    // `.acknowledged` is Threaded's `.canceled`: already delivered, so lifting protection later
+    // does not interrupt the cleanup that follows.
+    assert(!task.done);
+    task.cancel = .acknowledged;
+    task.protection = .blocked;
+    assert(task.cancel == .acknowledged);
 }
