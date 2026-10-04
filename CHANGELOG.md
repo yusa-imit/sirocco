@@ -11,6 +11,11 @@ Plan `002` (fiber scheduler and futex core).
 
 ### Added
 
+- Native group slots `groupAsync`, `groupAwait`, `groupCancel` and `groupConcurrent`
+  (`ConcurrencyUnavailable`, like `concurrent`), plus `crashHandler`, closing the P0 set of 12.
+  `Io.Group.token` points at a record holding the live members; `groupCancel` (and a canceled
+  awaiter) requests cancelation on every member, and a member that gets no fiber or record runs
+  inline. Tests: `tests/parity/group.zig`.
 - Native `checkCancel`, `recancel` and `swapCancelProtection` on fibers: each task record holds
   its cancel request (`none`/`requested`/`acknowledged`) and protection; `cancel` sets the request
   and the task's first unprotected `checkCancel` returns `error.Canceled`, once, until

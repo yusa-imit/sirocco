@@ -224,21 +224,22 @@ fn group_task(io: Io, probe: *GroupProbe) void {
     }
 }
 
-test "group tasks on forwarded worker threads still see cancel, recancel and protection" {
-    // `groupConcurrent` is still `Io.Threaded`'s; the task runs on a worker thread and calls
-    // sirocco's native slots there, which must reach the worker's own cancel state.
+test "group tasks on baseline worker threads still see cancel, recancel and protection" {
+    // The group is spawned through the baseline `Io.Threaded`, so its task runs on a worker thread
+    // and calls sirocco's native slots there, which must reach the worker's own cancel state.
     var rt = try fixtures.init_runtime(.forward);
     defer rt.deinit();
 
     const io = rt.io();
+    const baseline = rt.baselineIo();
     var probe: GroupProbe = .{};
     var group: Io.Group = .init;
-    try group.concurrent(io, group_task, .{ io, &probe });
+    try group.concurrent(baseline, group_task, .{ io, &probe });
     for (0..spin_max) |_| {
         if (probe.started.load(.acquire)) break;
         std.Thread.yield() catch {};
     }
     try std.testing.expect(probe.started.load(.acquire));
-    group.cancel(io);
+    group.cancel(baseline);
     try std.testing.expectEqual(@as(u32, 2), probe.delivered.load(.acquire));
 }

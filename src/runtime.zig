@@ -4,10 +4,11 @@
 //! slot from the embedded `Io.Threaded` and `.fail` copies every slot from `Io.failing`; sirocco's
 //! native slots are then written over that base, one group per plan-002 item, so a test that
 //! leans on the fallback can be run under `.fail` to fail loudly. Native today: the
-//! future-producing set `async`/`concurrent`/`await`/`cancel` (`src/concurrency.zig`, on the
-//! fibers of `src/sched.zig`), installed in both modes. Where `fibers_supported` is false
-//! (Windows, 32-bit and other architectures) the set is not installed and stays forwarded, so
-//! `.auto` and `.threaded` keep working on every target.
+//! concurrency set (`async`/`concurrent`/`await`/`cancel`, the three cancel-state slots,
+//! `groupAsync`/`groupConcurrent`/`groupAwait`/`groupCancel` and `crashHandler`;
+//! `src/concurrency.zig`, on the fibers of `src/sched.zig`), installed in both modes. Where
+//! `fibers_supported` is false (Windows, 32-bit and other architectures) the set is not installed
+//! and stays forwarded, so `.auto` and `.threaded` keep working on every target.
 //!
 //! Invariants: the vtable has exactly 109 slots (`slots_count`, a comptime guard against a std
 //! bump); no field of `Runtime` holds a pointer into `Runtime` — `io()` and `baselineIo()` are
@@ -196,6 +197,11 @@ const future_slots = .{
     "checkCancel",
     "recancel",
     "swapCancelProtection",
+    "groupAsync",
+    "groupConcurrent",
+    "groupAwait",
+    "groupCancel",
+    "crashHandler",
 };
 
 fn is_future_slot(comptime name: []const u8) bool {
