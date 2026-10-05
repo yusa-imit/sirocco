@@ -27,7 +27,8 @@ pub const Divergence = struct {
 
 /// Slots implemented on sirocco's own fibers (where `Runtime.fibers_supported`; elsewhere they
 /// are forwarded, and `tests/parity/concurrency.zig` checks that too). Parity tests:
-/// `tests/parity/concurrency.zig`.
+/// `tests/parity/concurrency.zig`, `cancel.zig`, `group.zig`; the futex trio: `futex.zig` and
+/// `futex_sync.zig` (std's `Mutex`/`Condition`/`Event` on top of it).
 pub const native: []const []const u8 = &.{
     "async",
     "await",
@@ -39,13 +40,13 @@ pub const native: []const []const u8 = &.{
     "groupAwait",
     "groupCancel",
     "crashHandler",
+    "futexWait",
+    "futexWaitUncancelable",
+    "futexWake",
 };
 
 /// Slots still forwarded to the embedded `Io.Threaded`.
 pub const delegated: []const []const u8 = &.{
-    "futexWait",
-    "futexWaitUncancelable",
-    "futexWake",
     "operate",
     "batchAwaitAsync",
     "batchAwaitConcurrent",
@@ -227,7 +228,7 @@ test "the shipped table accounts for all 109 slots" {
 
 test "removing a name from the table is reported" {
     const problem = comptime audit(native, delegated[1..], divergent) orelse "";
-    try std.testing.expect(contains(problem, "futexWait"));
+    try std.testing.expect(contains(problem, "`operate`"));
     try std.testing.expect(contains(problem, "no list"));
 }
 
@@ -237,15 +238,15 @@ test "an empty table is reported" {
 }
 
 test "a name in two lists is reported" {
-    const doubled = native ++ &[_][]const u8{"futexWait"};
+    const doubled = native ++ &[_][]const u8{"operate"};
     const problem = comptime audit(doubled, delegated, divergent) orelse "";
-    try std.testing.expect(contains(problem, "`futexWait`"));
+    try std.testing.expect(contains(problem, "`operate`"));
     try std.testing.expect(contains(problem, "more than once"));
 }
 
 test "a name repeated inside one list is reported" {
-    const problem = comptime audit(native, delegated ++ &[_][]const u8{"futexWait"}, divergent);
-    try std.testing.expect(contains(problem orelse "", "`futexWait`"));
+    const problem = comptime audit(native, delegated ++ &[_][]const u8{"operate"}, divergent);
+    try std.testing.expect(contains(problem orelse "", "`operate`"));
 }
 
 test "delegated slots are the baseline's own function, native ones are not" {
@@ -286,7 +287,7 @@ test "a divergence must cite its contract, and a cited one moves the slot out of
     const uncited = comptime audit(
         native,
         delegated[1..],
-        divergent ++ &[_]Divergence{.{ .name = "futexWait", .contract = "" }},
+        divergent ++ &[_]Divergence{.{ .name = "operate", .contract = "" }},
     ) orelse "";
     try std.testing.expect(contains(uncited, "cites no contract"));
 
@@ -294,7 +295,7 @@ test "a divergence must cite its contract, and a cited one moves the slot out of
         native,
         delegated[1..],
         divergent ++ &[_]Divergence{
-            .{ .name = "futexWait", .contract = "Io.VTable.futexWait doc comment" },
+            .{ .name = "operate", .contract = "Io.VTable.operate doc comment" },
         },
     );
     try std.testing.expect(cited == null);

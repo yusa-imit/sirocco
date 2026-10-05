@@ -11,6 +11,13 @@ Plan `002` (fiber scheduler and futex core).
 
 ### Added
 
+- Native `futexWait`, `futexWaitUncancelable` and `futexWake` on fibers (`src/futex.zig`): an
+  address-keyed FIFO wait table bounded by `fibers_max` (the wait record lives in each fiber, no
+  allocation), timeouts read through the baseline clock and expired by a `Sched` timer hook,
+  `futexWait` as a cancelation point that a cancel unparks, and a spinlock so `futexWake` from any
+  thread is safe (off-carrier wakes go through `Sched.unpark_foreign`). std's `Mutex`, `Condition`,
+  `Event`, `Semaphore` and `Queue` now block fibers instead of the carrier. The context-switch
+  assembly moved from `src/sched.zig` to `src/fiber_switch.zig`. Tests: `tests/parity/futex*.zig`.
 - Native group slots `groupAsync`, `groupAwait`, `groupCancel` and `groupConcurrent`
   (`ConcurrencyUnavailable`, like `concurrent`), plus `crashHandler`, closing the P0 set of 12.
   `Io.Group.token` points at a record holding the live members; `groupCancel` (and a canceled
