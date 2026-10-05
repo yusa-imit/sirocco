@@ -21,10 +21,10 @@
 //! `cancel` is "set the request flag, then `await`". The flag lives in the task record and is
 //! observed by `checkCancel` on the task's fiber (`recancel` and `swapCancelProtection` act on the
 //! same record; outside a task, on the carrier or on a forwarded group worker thread, all three
-//! forward to the embedded `Io.Threaded`, which owns the state of those threads). No
-//! native slot parks cancelably yet (`await`/`cancel` cannot return `error.Canceled`), so a cancel
-//! never unparks its target; item 8's `futexWait` will. A task that never calls `checkCancel`
-//! runs to completion and its result is delivered.
+//! forward to the embedded `Io.Threaded`, which owns the state of those threads). The only
+//! cancelable park is `futexWait` (`src/futex.zig`): a cancel unparks a task parked there and the
+//! wait returns `error.Canceled`. `await`/`cancel` cannot return `error.Canceled`. A task that
+//! never reaches a cancelation point runs to completion and its result is delivered.
 //!
 //! Groups: `Io.Group.token` points at a `GroupRec` (live members as an intrusive list, a count,
 //! the one parked awaiter) made by the first `groupAsync` that gets a fiber; each member is a
@@ -34,7 +34,7 @@
 //! `groupCancel` requests cancelation on every live member and waits; `groupAwait` does the same
 //! when the awaiting task itself has a pending unprotected request, and then reports
 //! `error.Canceled` after the group finished; a request that arrives while the awaiter is parked
-//! is not propagated (no native park is cancelable until item 8). `crashHandler` marks the
+//! is not propagated (the park in `groupAwait` is not a cancelable one). `crashHandler` marks the
 //! calling task's cancelation acknowledged and protected, as Threaded does for its thread, so a
 //! panic handler's cleanup is never interrupted. Preconditions, as std states them: a group is
 //! awaited or canceled once by one fiber that is not one of its members, no member is added once
@@ -47,10 +47,11 @@
 //! `groupAwait`/`groupCancel`); the
 //! no-allocation contract is a later item. Fibers and stacks come from `Sched.init`.
 //!
-//! Known limits until item 8 (futex table): `async` is lazy, and forwarded blocking slots
-//! (`futexWait`, `sleep`) block the carrier thread, so a task that only the caller's own flow can
-//! unblock (`io.async(producer)` then `queue.getOne`) deadlocks where Threaded would complete.
-//! Under `.forward`, `concurrent` is `ConcurrencyUnavailable` where Threaded would succeed.
+//! Known limits: `async` is lazy, and the forwarded blocking slots (`sleep`, I/O) block the
+//! carrier thread; a futex wait does not (`src/futex.zig` parks the fiber), so
+//! `io.async(producer)` followed by `queue.getOne` completes. Called from outside a fiber, a
+//! futex wait still blocks the carrier. Under `.forward`, `concurrent` is `ConcurrencyUnavailable`
+//! where Threaded would succeed.
 //!
 //! Threads: every slot runs on the carrier thread, the one that calls the first `await` outside a
 //! fiber. The `Io` contract calls these slots thread-safe; this implementation is not yet, and a
@@ -61,6 +62,7 @@ const std = @import("std");
 const stdx = @import("stdx.zig");
 const Sched = @import("sched.zig");
 const Runtime = @import("runtime.zig");
+const futex = @import("futex.zig");
 
 const Io = std.Io;
 const assert = stdx.assert;
@@ -69,7 +71,7 @@ const assert_always = stdx.assert_always;
 /// Per-task record: lives from `async` until `await`/`cancel` frees it (a group member: until its
 /// own fiber ends), followed in the same allocation by the copied context and the result storage
 /// (each at its own alignment; a member has no result).
-const Task = struct {
+pub const Task = struct {
     sched: *Sched,
     body: Body,
     /// The group this task is a member of; null for a future's task.
@@ -79,6 +81,8 @@ const Task = struct {
     next: ?*Task,
     /// The single fiber parked in `await`/`cancel`, if any.
     waiter: ?*Sched.Fiber,
+    /// The task's fiber while it is parked in a cancelable `futexWait`; a cancel unparks it.
+    waiting: ?*Sched.Fiber,
     context_offset: usize,
     result_offset: usize,
     result_len: usize,
@@ -165,13 +169,14 @@ pub fn sched_ensure(rt: *Runtime) void {
                     return;
                 },
             };
+            rt.sched.timers = futex.timers(&rt.waits);
             rt.sched_pin = @intFromPtr(&rt.sched);
             rt.sched_state = .ready;
         },
     }
 }
 
-fn runtime_of(userdata: ?*anyopaque) *Runtime {
+pub fn runtime_of(userdata: ?*anyopaque) *Runtime {
     assert(userdata != null);
     const threaded: *Io.Threaded = @ptrCast(@alignCast(userdata.?));
     const rt: *Runtime = @fieldParentPtr("threaded", threaded);
@@ -250,7 +255,7 @@ fn slot_cancel(
     assert(rt.sched_state == .ready);
     const task: *Task = @ptrCast(@alignCast(any_future));
     assert(task.cancel == .none); // `cancel` consumes the future: once.
-    task.cancel = .requested;
+    task_request_cancel(task);
     task_finish(rt, task, result, result_alignment);
 }
 
@@ -258,7 +263,7 @@ fn slot_cancel(
 /// outside `run`, or any other thread (a worker of the forwarded `Io.Threaded` running a group
 /// task receives `rt.io()` too). Callers forward a null to the baseline, which holds the cancel
 /// state of those threads.
-fn current_task(rt: *Runtime) ?*Task {
+pub fn current_task(rt: *Runtime) ?*Task {
     // `.unavailable`: the scheduler never existed, so every task ran inline on the caller.
     if (rt.sched_state != .ready) return null;
     if (!rt.sched.in_fiber()) return null;
@@ -278,7 +283,7 @@ fn slot_check_cancel(userdata: ?*anyopaque) Io.Cancelable!void {
 }
 
 /// True when `task` has an unprotected pending request, which this call acknowledges.
-fn task_acknowledge_cancel(task: *Task) bool {
+pub fn task_acknowledge_cancel(task: *Task) bool {
     switch (task.protection) {
         .blocked => return false,
         .unblocked => {},
@@ -290,6 +295,29 @@ fn task_acknowledge_cancel(task: *Task) bool {
             return true;
         },
     }
+}
+
+/// Sets the request flag and, when the task's fiber is parked in a cancelable `futexWait`,
+/// unparks it so the wait can return `error.Canceled`.
+fn task_request_cancel(task: *Task) void {
+    assert(task.cancel == .none);
+    assert(task.waiting == null or !task.done); // A finished task is no longer parked.
+    task.cancel = .requested;
+    const fiber = task.waiting orelse return;
+    const rt: *Runtime = @fieldParentPtr("sched", task.sched);
+    futex.cancel_wait(&rt.waits, task.sched, fiber);
+}
+
+/// `futex.zig` brackets a cancelable park with `fiber` and then null: while armed, a request
+/// unparks the fiber. Protection cannot change while the task is parked, so a protected task is
+/// simply never armed.
+pub fn task_cancel_wake(task: *Task, fiber: ?*Sched.Fiber) void {
+    assert(!task.done);
+    assert(fiber == null or task.waiting == null);
+    task.waiting = switch (task.protection) {
+        .blocked => null,
+        .unblocked => fiber,
+    };
 }
 
 fn slot_recancel(userdata: ?*anyopaque) void {
@@ -336,6 +364,7 @@ fn task_create(
         .prev = null,
         .next = null,
         .waiter = null,
+        .waiting = null,
         .context_offset = context_offset,
         .result_offset = result_offset,
         .result_len = result_len,
@@ -510,7 +539,7 @@ fn group_request_cancel(rec: *GroupRec) void {
     var node = rec.head;
     for (0..rec.pending) |_| {
         const member = node.?;
-        if (member.cancel == .none) member.cancel = .requested;
+        if (member.cancel == .none) task_request_cancel(member);
         node = member.next;
     }
     assert(node == null);

@@ -58,7 +58,7 @@ plan may not — context switching is per-arch assembly and aarch64-darwin runs 
       (same token-ownership argument as item 5), plus `crashHandler`, which closes P0's 12.
       Verify: `tests/parity/group.zig` (wait-all, cancel-all, error propagation); `slots.zig`
       shows 12 P0 names in `native`.
-- [ ] 8. `src/futex.zig`: address-keyed wait table with `futexWait`, `futexWaitUncancelable`,
+- [x] 8. `src/futex.zig`: address-keyed wait table with `futexWait`, `futexWaitUncancelable`,
       `futexWake`, bounded by `fibers_max` waiters. `Timeout.deadline`/`.duration` read the
       clock through the still-forwarded `now` slot — a stated temporary until P2's timer wheel
       lands. Why it must be in this plan: `Io.Mutex`/`Condition`/`Event`/`Semaphore`/`RwLock`/

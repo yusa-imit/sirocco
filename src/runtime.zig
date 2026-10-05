@@ -6,7 +6,8 @@
 //! leans on the fallback can be run under `.fail` to fail loudly. Native today: the
 //! concurrency set (`async`/`concurrent`/`await`/`cancel`, the three cancel-state slots,
 //! `groupAsync`/`groupConcurrent`/`groupAwait`/`groupCancel` and `crashHandler`;
-//! `src/concurrency.zig`, on the fibers of `src/sched.zig`), installed in both modes. Where
+//! `src/concurrency.zig`, on the fibers of `src/sched.zig`) and the futex trio (`futexWait`,
+//! `futexWaitUncancelable`, `futexWake`; `src/futex.zig`), installed in both modes. Where
 //! `fibers_supported` is false (Windows, 32-bit and other architectures) the set is not installed
 //! and stays forwarded, so `.auto` and `.threaded` keep working on every target.
 //!
@@ -36,6 +37,7 @@ const Io = std.Io;
 const stdx = @import("stdx.zig");
 const Sched = @import("sched.zig");
 const concurrency = @import("concurrency.zig");
+const futex = @import("futex.zig");
 
 const assert = stdx.assert;
 
@@ -51,6 +53,8 @@ backend: Backend,
 unimplemented: Unimplemented,
 /// Fiber scheduler; valid only while `sched_state == .ready`, built in place by the first `io()`.
 sched: Sched,
+/// The futex wait table (`src/futex.zig`); its records live in the scheduler's fibers.
+waits: futex.Table,
 sched_state: SchedState,
 /// `@intFromPtr(&sched)` when it was built, else 0; asserts the `Runtime` has not moved.
 sched_pin: usize,
@@ -132,13 +136,17 @@ pub fn init(gpa: std.mem.Allocator, options: Options) InitError!Runtime {
         .forward => threaded.io().vtable.*,
         .fail => Io.failing.vtable.*,
     };
-    if (fibers_supported) concurrency.install(&base);
+    if (fibers_supported) {
+        concurrency.install(&base);
+        futex.install(&base);
+    }
     return .{
         .threaded = threaded,
         .vtable = base,
         .backend = backend,
         .unimplemented = options.unimplemented,
         .sched = undefined,
+        .waits = .init(options.fibers_max),
         .sched_state = if (fibers_supported) .pending else .unsupported,
         .sched_pin = 0,
         .fibers_max = options.fibers_max,
@@ -202,6 +210,9 @@ const future_slots = .{
     "groupAwait",
     "groupCancel",
     "crashHandler",
+    "futexWait",
+    "futexWaitUncancelable",
+    "futexWake",
 };
 
 fn is_future_slot(comptime name: []const u8) bool {

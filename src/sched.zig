@@ -2,10 +2,11 @@
 //!
 //! Purpose: cooperative fibers multiplexed onto one carrier thread (the thread that calls
 //! `run`). A fiber is a stack plus a saved `Io.fiber.Context`; switching is
-//! `switch_context` (naked per-arch assembly, aarch64 and x86_64 here).
+//! `switch_context` (naked per-arch assembly in `src/fiber_switch.zig`, aarch64 and x86_64).
 //! `Sched` installs no vtable slot itself: `src/concurrency.zig` builds `async`/`await`/`cancel`
-//! on `spawn`, `park`, `unpark` and `run` (plan 002 item 5); groups and the futex table follow
-//! (items 7-8).
+//! and groups on `spawn`, `park`, `unpark` and `run`, `src/futex.zig` the futex slots on the
+//! per-fiber `Wait` record and the `timers` hook, which `run` polls so a timed wait expires
+//! even when every fiber is parked.
 //!
 //! Invariants: `fibers_max` stacks are allocated in `init` and nowhere else; a fiber is exactly
 //! one of free / ready / running / parked, and `live_count` equals the fibers not free. The first
@@ -31,6 +32,7 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const stdx = @import("stdx.zig");
+const switch_context = @import("fiber_switch.zig").switch_context;
 
 const Io = std.Io;
 const assert = stdx.assert;
@@ -53,6 +55,8 @@ running: bool,
 inbox: ?*Fiber,
 /// Futex word bumped after every inbox push; the carrier waits on it when it has nothing to run.
 inbox_version: u32,
+/// Polled by `run_loop` before every dispatch; null until `src/futex.zig` installs it.
+timers: ?Timers,
 
 /// True when `Io.fiber` has context-switch assembly sirocco's entry trampolines also cover.
 /// Windows is excluded: the switch assembly assumes the SysV/AAPCS64 argument registers and
@@ -90,6 +94,38 @@ pub const SpawnError = error{
 
 pub const Entry = *const fn (arg: ?*anyopaque) void;
 
+/// Time source of the parked-with-deadline fibers, owned by the code that parks them.
+pub const Timers = struct {
+    ctx: *anyopaque,
+    /// Unparks every fiber whose deadline has passed (reading the clock through `io`) and returns
+    /// the earliest remaining deadline in `Clock.awake` nanoseconds, or null when none is pending.
+    expire: *const fn (ctx: *anyopaque, sched: *Sched, io: Io) ?i96,
+};
+
+/// How a fiber's address wait ended; `futex.zig` owns the transitions.
+pub const WaitOutcome = enum { idle, waiting, woken, timed_out, canceled };
+
+/// A fiber's place in the futex table: a fiber waits on at most one address, so the record lives
+/// in the fiber and the table can neither allocate nor overflow past `fibers_max`.
+pub const Wait = struct {
+    addr: usize,
+    prev: ?*Fiber,
+    next: ?*Fiber,
+    /// `Clock.awake` nanoseconds; meaningful only when `timed`.
+    deadline_ns: i96,
+    timed: bool,
+    outcome: WaitOutcome,
+
+    pub const none: Wait = .{
+        .addr = 0,
+        .prev = null,
+        .next = null,
+        .deadline_ns = 0,
+        .timed = false,
+        .outcome = .idle,
+    };
+};
+
 pub const Fiber = struct {
     context: Io.fiber.Context,
     queue_next: ?*Fiber,
@@ -98,6 +134,7 @@ pub const Fiber = struct {
     /// The `arg` of the `spawn` that made this fiber live; null while free. Lets code running on
     /// the fiber find its own task record from `current_fiber`.
     arg: ?*anyopaque,
+    wait: Wait,
 
     const State = enum { free, ready, running, parked };
 };
@@ -156,6 +193,7 @@ fn init_checked(
         .running = false,
         .inbox = null,
         .inbox_version = 0,
+        .timers = null,
     };
     // Reverse order so the first `spawn` takes fiber 0 and the free list stays address-ordered.
     for (0..fibers.len) |offset| {
@@ -167,6 +205,7 @@ fn init_checked(
             .state = .free,
             .stack = stacks[stack_offset..][0..options.stack_size],
             .arg = null,
+            .wait = .none,
         };
         target.free_head = &fibers[index];
     }
@@ -321,10 +360,11 @@ fn run_loop(sched: *Sched, io: Io, stop: ?*const bool) void {
         }
         const version = @atomicLoad(u32, &sched.inbox_version, .acquire);
         sched.inbox_drain();
+        const deadline_ns = if (sched.timers) |t| t.expire(t.ctx, sched, io) else null;
         const fiber = sched.pop_ready() orelse {
-            // Every live fiber is parked on something that only another thread can deliver.
+            // Every live fiber is parked on a timer or on something another thread must deliver.
             assert(sched.parked_count == sched.live_count);
-            io.futexWaitUncancelable(u32, &sched.inbox_version, version);
+            sched.idle_wait(io, version, deadline_ns);
             continue;
         };
         fiber.state = .running;
@@ -332,6 +372,20 @@ fn run_loop(sched: *Sched, io: Io, stop: ?*const bool) void {
         switch_context(&sched.carrier_context, &fiber.context);
         assert(sched.current == null);
     }
+}
+
+/// Blocks the carrier until `inbox_version` moves from `version` or, when given, `deadline_ns`
+/// (`Clock.awake`) passes. Returning early is fine: `run_loop` re-checks everything.
+fn idle_wait(sched: *Sched, io: Io, version: u32, deadline_ns: ?i96) void {
+    const at = deadline_ns orelse {
+        return io.futexWaitUncancelable(u32, &sched.inbox_version, version);
+    };
+    const raw: Io.Timestamp = .fromNanoseconds(at);
+    const timeout: Io.Timeout = .{ .deadline = .{ .raw = raw, .clock = .awake } };
+    io.futexWaitTimeout(u32, &sched.inbox_version, version, timeout) catch |err| switch (err) {
+        // The carrier is no `Io` task, so nothing can cancel it; looping again is harmless anyway.
+        error.Canceled => {},
+    };
 }
 
 fn push_ready(sched: *Sched, fiber: *Fiber) void {
@@ -386,99 +440,6 @@ fn switch_to_carrier(sched: *Sched, fiber: *Fiber) void {
     assert_always(canary_intact(fiber.stack));
     sched.current = null;
     switch_context(&fiber.context, &sched.carrier_context);
-}
-
-// Naked on purpose. std's `Io.fiber.contextSwitch` is inline asm that LLVM miscompiles in
-// ReleaseSmall on x86_64 (the message pointer never reaches `rsi`, so the asm reads the wrong
-// context) and that clobbers the frame registers on aarch64. Here the switch is a whole function:
-// it pushes the callee-saved registers on the old stack, stores `sp`/`fp`/resume `pc` in `old`,
-// loads them from `new` and jumps. Resuming `old` later pops the registers and returns to the
-// caller of `switch_context`. It declares no Zig parameters (the self-hosted x86_64 backend
-// rejects unused arguments of a naked function); the C-convention pointer type in
-// `switch_context` carries `old` in rdi/x0 and `new` in rsi/x1. A fresh fiber's `Context` is
-// jumped to, never returned into.
-fn switch_context_asm() callconv(.naked) void {
-    switch (builtin.cpu.arch) {
-        .x86_64 => asm volatile (
-            \\ pushq %%rbx
-            \\ pushq %%r12
-            \\ pushq %%r13
-            \\ pushq %%r14
-            \\ pushq %%r15
-            \\ leaq 0f(%%rip), %%rax
-            \\ movq %%rsp, 0(%%rdi)
-            \\ movq %%rbp, 8(%%rdi)
-            \\ movq %%rax, 16(%%rdi)
-            \\ movq 0(%%rsi), %%rsp
-            \\ movq 8(%%rsi), %%rbp
-            \\ jmpq *16(%%rsi)
-            \\0:
-            \\ popq %%r15
-            \\ popq %%r14
-            \\ popq %%r13
-            \\ popq %%r12
-            \\ popq %%rbx
-            \\ retq
-        ),
-        .aarch64 => asm volatile (
-            \\ sub sp, sp, #160
-            \\ stp x19, x20, [sp, #0]
-            \\ stp x21, x22, [sp, #16]
-            \\ stp x23, x24, [sp, #32]
-            \\ stp x25, x26, [sp, #48]
-            \\ stp x27, x28, [sp, #64]
-            \\ stp d8, d9, [sp, #80]
-            \\ stp d10, d11, [sp, #96]
-            \\ stp d12, d13, [sp, #112]
-            \\ stp d14, d15, [sp, #128]
-            \\ str x30, [sp, #144]
-            \\ mov x2, sp
-            \\ adr x3, 0f
-            \\ stp x2, x29, [x0]
-            \\ str x3, [x0, #16]
-            \\ ldp x2, x29, [x1]
-            \\ ldr x3, [x1, #16]
-            \\ mov sp, x2
-            \\ br x3
-            \\0:
-            \\ ldp x19, x20, [sp, #0]
-            \\ ldp x21, x22, [sp, #16]
-            \\ ldp x23, x24, [sp, #32]
-            \\ ldp x25, x26, [sp, #48]
-            \\ ldp x27, x28, [sp, #64]
-            \\ ldp d8, d9, [sp, #80]
-            \\ ldp d10, d11, [sp, #96]
-            \\ ldp d12, d13, [sp, #112]
-            \\ ldp d14, d15, [sp, #128]
-            \\ ldr x30, [sp, #144]
-            \\ add sp, sp, #160
-            \\ ret
-        ),
-        else => unreachable, // `supported` is false and `init` refused.
-    }
-}
-
-// The assembly above hard-codes this layout (offsets 0, 8, 16).
-comptime {
-    if (supported) {
-        const names = switch (builtin.cpu.arch) {
-            .x86_64 => .{ "rsp", "rbp", "rip" },
-            else => .{ "sp", "fp", "pc" },
-        };
-        assert(@sizeOf(Io.fiber.Context) == 24);
-        assert(@offsetOf(Io.fiber.Context, names[0]) == 0);
-        assert(@offsetOf(Io.fiber.Context, names[1]) == 8);
-        assert(@offsetOf(Io.fiber.Context, names[2]) == 16);
-    }
-}
-
-// Zig refuses a direct call to a naked function; calling it through a C-convention pointer gives
-// the compiler an ordinary call, whose caller-saved registers it already treats as clobbered.
-// `never_inline` keeps LLVM from splicing the asm body into a caller that has no clobber list.
-fn switch_context(old: *Io.fiber.Context, new: *Io.fiber.Context) void {
-    const switch_c: *const fn (*Io.fiber.Context, *Io.fiber.Context) callconv(.c) void =
-        @ptrCast(&switch_context_asm);
-    @call(.never_inline, switch_c, .{ old, new });
 }
 
 fn canary_intact(stack: []const u8) bool {

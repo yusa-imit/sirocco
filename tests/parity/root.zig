@@ -9,4 +9,8 @@ test {
     _ = @import("concurrency.zig");
     _ = @import("cancel.zig");
     _ = @import("group.zig");
+    _ = @import("scene.zig");
+    _ = @import("futex.zig");
+    _ = @import("futex_model.zig");
+    _ = @import("futex_sync.zig");
 }
