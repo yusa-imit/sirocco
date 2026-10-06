@@ -343,7 +343,7 @@ fn forward_wait(
 ) Io.Cancelable!void {
     const baseline = rt.baselineIo();
     assert(@atomicLoad(u32, &rt.waits.forwarded, .monotonic) < std.math.maxInt(u32));
-    assert(!rt.sched.in_fiber() or rt.sched_state != .ready);
+    if (rt.sched.in_fiber()) assert(rt.sched_state != .ready);
     _ = @atomicRmw(u32, &rt.waits.forwarded, .Add, 1, .seq_cst);
     defer _ = @atomicRmw(u32, &rt.waits.forwarded, .Sub, 1, .seq_cst);
 
@@ -370,7 +370,7 @@ fn slot_futex_wait_uncancelable(userdata: ?*anyopaque, ptr: *const u32, expected
 fn forward_wait_uncancelable(rt: *Runtime, ptr: *const u32, expected: u32) void {
     const baseline = rt.baselineIo();
     assert(@atomicLoad(u32, &rt.waits.forwarded, .monotonic) < std.math.maxInt(u32));
-    assert(!rt.sched.in_fiber() or rt.sched_state != .ready);
+    if (rt.sched.in_fiber()) assert(rt.sched_state != .ready);
     _ = @atomicRmw(u32, &rt.waits.forwarded, .Add, 1, .seq_cst);
     defer _ = @atomicRmw(u32, &rt.waits.forwarded, .Sub, 1, .seq_cst);
 
