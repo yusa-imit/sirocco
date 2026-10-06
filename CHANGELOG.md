@@ -7,7 +7,13 @@ exemption recorded in `citadel/protocol/VERSIONING.md`.
 
 ## [Unreleased]
 
-Plan `002` (fiber scheduler and futex core).
+## [0.3.0] - 2026-10-06
+
+Plan `002` (fiber scheduler and futex core). An internal milestone: the runtime has a single
+carrier thread, so any forwarded blocking slot (file, dir, net, `sleep`) stalls every fiber, and
+`groupAwait` does not yet propagate a cancel that arrives while it is parked. It is not ready for
+silica or zoltraak; plan 003 removes the limitation. PRD §5 gate 6 passes at 1 task in flight and
+fails at 1000 (tasks start lazily).
 
 ### Added
 
