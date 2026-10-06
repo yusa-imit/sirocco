@@ -213,8 +213,8 @@ fn run_inline(
     context: []const u8,
     start: *const fn (context: *const anyopaque, result: *anyopaque) void,
 ) ?*Io.AnyFuture {
-    assert(result.len == 0 or @intFromPtr(result.ptr) != 0);
-    assert(context.len == 0 or @intFromPtr(context.ptr) != 0);
+    if (result.len != 0) assert(@intFromPtr(result.ptr) != 0);
+    if (context.len != 0) assert(@intFromPtr(context.ptr) != 0);
     start(context.ptr, result.ptr);
     return null;
 }
@@ -228,7 +228,7 @@ fn slot_concurrent(
     start: *const fn (context: *const anyopaque, result: *anyopaque) void,
 ) Io.ConcurrentError!*Io.AnyFuture {
     const rt = runtime_of(userdata);
-    assert(context.len == 0 or @intFromPtr(context.ptr) != 0);
+    if (context.len != 0) assert(@intFromPtr(context.ptr) != 0);
     assert(rt.sched_state != .pending);
     _ = .{ result_len, result_alignment, context_alignment, start };
     return error.ConcurrencyUnavailable;
@@ -301,7 +301,7 @@ pub fn task_acknowledge_cancel(task: *Task) bool {
 /// unparks it so the wait can return `error.Canceled`.
 fn task_request_cancel(task: *Task) void {
     assert(task.cancel == .none);
-    assert(task.waiting == null or !task.done); // A finished task is no longer parked.
+    if (task.waiting != null) assert(!task.done); // A finished task is no longer parked.
     task.cancel = .requested;
     const fiber = task.waiting orelse return;
     const rt: *Runtime = @fieldParentPtr("sched", task.sched);
@@ -313,7 +313,7 @@ fn task_request_cancel(task: *Task) void {
 /// simply never armed.
 pub fn task_cancel_wake(task: *Task, fiber: ?*Sched.Fiber) void {
     assert(!task.done);
-    assert(fiber == null or task.waiting == null);
+    if (fiber != null) assert(task.waiting == null);
     task.waiting = switch (task.protection) {
         .blocked => null,
         .unblocked => fiber,
@@ -501,7 +501,7 @@ fn slot_group_concurrent(
     start: *const fn (context: *const anyopaque) void,
 ) Io.ConcurrentError!void {
     const rt = runtime_of(userdata);
-    assert(context.len == 0 or @intFromPtr(context.ptr) != 0);
+    if (context.len != 0) assert(@intFromPtr(context.ptr) != 0);
     assert(rt.sched_state != .pending);
     _ = .{ group, context_alignment, start };
     return error.ConcurrencyUnavailable;

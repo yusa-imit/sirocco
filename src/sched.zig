@@ -340,7 +340,7 @@ pub fn run(sched: *Sched, io: Io) void {
 /// only by fibers on this thread. Same preconditions as `run`.
 pub fn run_until(sched: *Sched, io: Io, stop: *const bool) void {
     sched.run_loop(io, stop);
-    assert(stop.* or sched.live_count == 0);
+    if (!stop.*) assert(sched.live_count == 0);
 }
 
 fn run_loop(sched: *Sched, io: Io, stop: ?*const bool) void {
