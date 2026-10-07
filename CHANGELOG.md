@@ -7,6 +7,12 @@ exemption recorded in `citadel/protocol/VERSIONING.md`.
 
 ## [Unreleased]
 
+### Fixed
+
+- `groupAwait` honors a cancel that arrives while it is parked: the awaiter is woken, cancels every
+  member, waits for them all and returns `error.Canceled`; a protected awaiter keeps waiting
+  (plan `003` item 1).
+
 ## [0.3.0] - 2026-10-06
 
 Plan `002` (fiber scheduler and futex core). An internal milestone: the runtime has a single

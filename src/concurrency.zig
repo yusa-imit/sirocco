@@ -34,7 +34,8 @@
 //! `groupCancel` requests cancelation on every live member and waits; `groupAwait` does the same
 //! when the awaiting task itself has a pending unprotected request, and then reports
 //! `error.Canceled` after the group finished; a request that arrives while the awaiter is parked
-//! is not propagated (the park in `groupAwait` is not a cancelable one). `crashHandler` marks the
+//! unparks it, and it cancels the members and keeps waiting for them all before reporting (a
+//! protected awaiter ignores the request). `crashHandler` marks the
 //! calling task's cancelation acknowledged and protected, as Threaded does for its thread, so a
 //! panic handler's cleanup is never interrupted. Preconditions, as std states them: a group is
 //! awaited or canceled once by one fiber that is not one of its members, no member is added once
@@ -83,6 +84,8 @@ pub const Task = struct {
     waiter: ?*Sched.Fiber,
     /// The task's fiber while it is parked in a cancelable `futexWait`; a cancel unparks it.
     waiting: ?*Sched.Fiber,
+    /// The group this task's fiber is parked on in a cancelable `groupAwait`; a cancel unparks it.
+    awaiting: ?*GroupRec,
     context_offset: usize,
     result_offset: usize,
     result_len: usize,
@@ -297,12 +300,25 @@ pub fn task_acknowledge_cancel(task: *Task) bool {
     }
 }
 
-/// Sets the request flag and, when the task's fiber is parked in a cancelable `futexWait`,
-/// unparks it so the wait can return `error.Canceled`.
+/// Sets the request flag and, when the task's fiber is parked in a cancelable `futexWait` or
+/// `groupAwait`, unparks it so the wait can return `error.Canceled` (the awaiter then cancels the
+/// members itself).
 fn task_request_cancel(task: *Task) void {
     assert(task.cancel == .none);
     if (task.waiting != null) assert(!task.done); // A finished task is no longer parked.
+    if (task.awaiting != null) assert(!task.done);
     task.cancel = .requested;
+    if (task.awaiting) |rec| {
+        // Protection cannot change while the task is parked, and `group_park` arms `awaiting`
+        // only for an unprotected awaiter. The wake is one-shot: a finished group already woke it.
+        assert(task.waiting == null);
+        assert(task.protection == .unblocked);
+        if (rec.waiter) |waiter| {
+            rec.waiter = null;
+            task.sched.unpark(waiter);
+        }
+        return;
+    }
     const fiber = task.waiting orelse return;
     const rt: *Runtime = @fieldParentPtr("sched", task.sched);
     futex.cancel_wait(&rt.waits, task.sched, fiber);
@@ -365,6 +381,7 @@ fn task_create(
         .next = null,
         .waiter = null,
         .waiting = null,
+        .awaiting = null,
         .context_offset = context_offset,
         .result_offset = result_offset,
         .result_len = result_len,
@@ -520,8 +537,8 @@ fn slot_group_await(
     // group has finished, so no member outlives the call.
     const canceled = if (current_task(rt)) |task| task_acknowledge_cancel(task) else false;
     if (canceled) group_request_cancel(rec);
-    group_finish(rt, group, rec);
-    if (canceled) return error.Canceled;
+    const canceled_parked = group_finish(rt, group, rec, .cancelable);
+    if (canceled or canceled_parked) return error.Canceled;
 }
 
 fn slot_group_cancel(userdata: ?*anyopaque, group: *Io.Group, token: *anyopaque) void {
@@ -530,7 +547,7 @@ fn slot_group_cancel(userdata: ?*anyopaque, group: *Io.Group, token: *anyopaque)
     assert(group.token.raw == token);
     assert(rec.sched == &rt.sched);
     group_request_cancel(rec);
-    group_finish(rt, group, rec);
+    _ = group_finish(rt, group, rec, .uncancelable);
 }
 
 fn group_request_cancel(rec: *GroupRec) void {
@@ -545,16 +562,24 @@ fn group_request_cancel(rec: *GroupRec) void {
     assert(node == null);
 }
 
+/// A group awaiter parks at most twice: once until a cancel or the last member, and once more for
+/// the last member after a cancel (a second request cannot arrive: the first is delivered).
+const parks_max = 2;
+
+/// Whether the park in `group_finish` is a cancelation point.
+const GroupWait = enum { cancelable, uncancelable };
+
 /// Waits until every member finished (parking inside a fiber, driving the scheduler outside one),
-/// then releases the record and nulls the token, as `Io.Group.await` asserts.
-fn group_finish(rt: *Runtime, group: *Io.Group, rec: *GroupRec) void {
+/// then releases the record and nulls the token, as `Io.Group.await` asserts. Returns true when a
+/// cancel that arrived during a `.cancelable` park was acknowledged; the members were canceled and
+/// all of them finished before it returns.
+fn group_finish(rt: *Runtime, group: *Io.Group, rec: *GroupRec, wait: GroupWait) bool {
     // A member waiting for its own group could never be woken: the count never reaches zero.
     if (current_task(rt)) |task| assert_always(task.group != rec);
+    var canceled = false;
     if (!rec.idle) {
         if (rt.sched.in_fiber()) {
-            assert_always(rec.waiter == null); // Awaited once: a second waiter would be lost.
-            rec.waiter = rt.sched.current_fiber();
-            rt.sched.park();
+            canceled = group_park(rt, rec, wait);
         } else {
             assert(!rt.sched.running);
             rt.sched.run_until(rt.baselineIo(), &rec.idle);
@@ -564,8 +589,44 @@ fn group_finish(rt: *Runtime, group: *Io.Group, rec: *GroupRec) void {
     assert(rec.pending == 0);
     assert(rec.head == null);
     assert(rec.waiter == null);
+    if (wait == .uncancelable) assert(!canceled);
     group.token.store(null, .release);
     rt.threaded.allocator.destroy(rec);
+    return canceled;
+}
+
+/// Parks the calling fiber until the group is idle. A cancel wakes a `.cancelable` park once; the
+/// woken fiber then cancels the members itself (in its own context, so nested groups need no
+/// recursion) and parks again for the last member. A request that races the last member's finish
+/// finds the group idle and stays pending for the awaiter's next cancelation point.
+fn group_park(rt: *Runtime, rec: *GroupRec, wait: GroupWait) bool {
+    const task = current_task(rt).?;
+    assert_always(rec.waiter == null); // Awaited once: a second waiter would be lost.
+    assert(task.awaiting == null);
+    defer task.awaiting = null;
+
+    switch (wait) {
+        .uncancelable => {},
+        .cancelable => switch (task.protection) {
+            .blocked => {},
+            .unblocked => task.awaiting = rec,
+        },
+    }
+    var canceled = false;
+    for (0..parks_max) |_| {
+        rec.waiter = rt.sched.current_fiber();
+        rt.sched.park();
+        if (rec.idle) break;
+        // Woken by a cancel (a finished group wakes only with `idle` set).
+        assert(task.awaiting != null);
+        assert(!canceled);
+        canceled = task_acknowledge_cancel(task);
+        assert_always(canceled);
+        group_request_cancel(rec);
+        task.awaiting = null; // A second request cannot arrive: the flag is already delivered.
+    }
+    assert(rec.idle);
+    return canceled;
 }
 
 /// End of a group member's fiber: leave the list, free the record, wake the awaiting fiber when
