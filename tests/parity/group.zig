@@ -13,6 +13,7 @@ const Io = std.Io;
 const Runtime = @import("sirocco").Runtime;
 const fixtures = @import("fixtures.zig");
 const harness = @import("harness.zig");
+const scene = @import("scene.zig");
 
 const modes = [_]Runtime.Unimplemented{ .forward, .fail };
 
@@ -297,4 +298,120 @@ test "crashHandler outside any task does nothing, as on Io.Threaded" {
         baseline.vtable.crashHandler(baseline.userdata);
         try io.checkCancel();
     }
+}
+
+// ---- a cancel that arrives while the awaiter is parked ----------------------------------------
+
+const Park = struct {
+    word: u32 = 0,
+    members_parked: u32 = 0,
+    members_canceled: u32 = 0,
+    awaiter_parked: u32 = 0,
+};
+
+fn parked_member(io: Io, park: *Park) void {
+    park.members_parked += 1;
+    io.futexWait(u32, &park.word, 0) catch |err| switch (err) {
+        error.Canceled => park.members_canceled += 1,
+    };
+}
+
+fn parked_awaiter(io: Io, park: *Park, protection: Io.CancelProtection) Io.Cancelable!void {
+    var group: Io.Group = .init;
+    for (0..3) |_| group.async(io, parked_member, .{ io, park });
+    _ = io.swapCancelProtection(protection);
+    park.awaiter_parked += 1;
+    try group.await(io);
+    // Only reachable when the awaiter was protected: the members were woken by hand.
+    park.awaiter_parked += 10;
+}
+
+fn cancel_awaiter(
+    io: Io,
+    target: *Io.Future(Io.Cancelable!void),
+    park: *Park,
+    wake: bool,
+) Io.Cancelable!void {
+    for (0..4) |_| scene.yield(io); // Members and the awaiter reach their parks first.
+    std.debug.assert(park.members_parked == 3);
+    if (!wake) return target.cancel(io);
+    // `.blocked` keeps the awaiter waiting: the members finish only once the waker runs, which
+    // is after `cancel` has requested and parked.
+    var waker = io.async(wake_members, .{ io, park });
+    const result = target.cancel(io);
+    waker.await(io);
+    return result;
+}
+
+fn wake_members(io: Io, park: *Park) void {
+    scene.yield(io);
+    @atomicStore(u32, &park.word, 1, .release);
+    io.futexWake(u32, &park.word, 3);
+}
+
+test "a cancel that arrives while groupAwait is parked cancels every member" {
+    try scene.run_modes(12, struct {
+        fn scenario(rt: *Runtime) anyerror!void {
+            const io = rt.io();
+            var park: Park = .{};
+            var awaiter = io.async(parked_awaiter, .{ io, &park, Io.CancelProtection.unblocked });
+            var killer = io.async(cancel_awaiter, .{ io, &awaiter, &park, false });
+            try std.testing.expectError(error.Canceled, killer.await(io));
+
+            try std.testing.expectEqual(@as(u32, 3), park.members_parked);
+            try std.testing.expectEqual(@as(u32, 3), park.members_canceled);
+            try std.testing.expectEqual(@as(u32, 1), park.awaiter_parked);
+        }
+    }.scenario);
+}
+
+test "blocked protection keeps groupAwait waiting through a cancel" {
+    try scene.run_modes(12, struct {
+        fn scenario(rt: *Runtime) anyerror!void {
+            const io = rt.io();
+            var park: Park = .{};
+            var awaiter = io.async(parked_awaiter, .{ io, &park, Io.CancelProtection.blocked });
+            var killer = io.async(cancel_awaiter, .{ io, &awaiter, &park, true });
+            try killer.await(io);
+
+            try std.testing.expectEqual(@as(u32, 3), park.members_parked);
+            try std.testing.expectEqual(@as(u32, 0), park.members_canceled);
+            try std.testing.expectEqual(@as(u32, 11), park.awaiter_parked);
+        }
+    }.scenario);
+}
+
+fn racing_awaiter(io: Io, park: *Park) Io.Cancelable!bool {
+    var group: Io.Group = .init;
+    for (0..3) |_| group.async(io, parked_member, .{ io, park });
+    park.awaiter_parked += 1;
+    try group.await(io);
+    // The request raced the last member: the group finished, the request stays pending.
+    return if (io.checkCancel()) |_| false else |_| true;
+}
+
+fn wake_then_cancel(
+    io: Io,
+    target: *Io.Future(Io.Cancelable!bool),
+    park: *Park,
+) Io.Cancelable!bool {
+    for (0..4) |_| scene.yield(io);
+    @atomicStore(u32, &park.word, 1, .release);
+    io.futexWake(u32, &park.word, 3);
+    return target.cancel(io);
+}
+
+test "a cancel racing the last member leaves the request pending after groupAwait" {
+    try scene.run_modes(12, struct {
+        fn scenario(rt: *Runtime) anyerror!void {
+            const io = rt.io();
+            var park: Park = .{};
+            var awaiter = io.async(racing_awaiter, .{ io, &park });
+            var killer = io.async(wake_then_cancel, .{ io, &awaiter, &park });
+            try std.testing.expectEqual(true, try killer.await(io));
+
+            try std.testing.expectEqual(@as(u32, 3), park.members_parked);
+            try std.testing.expectEqual(@as(u32, 0), park.members_canceled);
+        }
+    }.scenario);
 }

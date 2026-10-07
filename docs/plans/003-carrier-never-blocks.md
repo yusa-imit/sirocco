@@ -19,13 +19,14 @@ carrier owns one poller; item 7's ADR records that choice for the human to appro
 
 ## Scope
 
-- [ ] 1. `groupAwait` propagates a cancel that arrives while it is already parked: the awaiter is
+- [x] 1. `groupAwait` propagates a cancel that arrives while it is already parked: the awaiter is
       unparked, cancels every member, waits for them all, then returns `error.Canceled`; under
       `.blocked` it keeps waiting. Why first: `Io.Group.await` documents this ("cancelation
       requests propagate to all members"), so the gap is a shipped contract bug, and bugs go
-      before features. Verify: `tests/parity/group.zig` — members parked on an `Io.Event`, the
-      awaiter parked, then `cancel`; both `Io`s return `Canceled` and agree on the member count,
-      plus the `.blocked` case.
+      before features. Verify: `tests/parity/group.zig` — members parked on a futex, the
+      awaiter parked, then `cancel`: `Canceled` after all members were canceled, plus the
+      `.blocked` case and the cancel racing the last member (asserted on `rt.io()` alone, as
+      the other cancel-timing facts: the baseline has no fiber to park).
 - [ ] 2. Eager task start: `async` switches into the new fiber at once and re-queues the caller
       (off-fiber, it runs until the task first parks or ends). `Io.async` permits running the
       task before returning. Why: lazy start is the measured cause of gate 6 failing at 1000
