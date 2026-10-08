@@ -21,13 +21,13 @@
 //! Threads: everything except `unpark_foreign` runs on the carrier thread. `unpark_foreign` may be
 //! called from any thread: it pushes onto a lock-free inbox and bumps a futex word, and the
 //! carrier, when its ready queue drains, blocks in the baseline `futexWaitUncancelable` on that
-//! word, so no OS-specific backend file is needed yet. The waker's thread must be joined before
-//! `deinit`: `unpark_foreign` touches the futex word after the carrier may have finished.
+//! word. The waker's thread must be joined before `deinit`: `unpark_foreign` touches the futex
+//! word after the carrier may have finished.
 //!
 //! Sketch: `spawn` touches one `Fiber` record and the top cache line of one stack; a switch
 //! saves and restores 3 words plus the callee-saved registers (rbx, r12-r15 / x19-x28, d8-d15,
-//! x30), pushed on the old stack; zero
-//! syscalls on the ready path, one futex wait per idle period.
+//! x30), pushed on the old stack; zero syscalls on the ready path, one futex wait per idle period.
+//! Eager start (`spawn_first`) puts the new fiber at the queue front and runs it before returning.
 
 const std = @import("std");
 const builtin = @import("builtin");
@@ -57,6 +57,8 @@ inbox: ?*Fiber,
 inbox_version: u32,
 /// Polled by `run_loop` before every dispatch; null until `src/futex.zig` installs it.
 timers: ?Timers,
+/// Fiber `spawn_first` runs from outside `run`; `run_loop` returns once it switches out.
+first: ?*Fiber,
 
 /// True when `Io.fiber` has context-switch assembly sirocco's entry trampolines also cover.
 /// Windows is excluded: the switch assembly assumes the SysV/AAPCS64 argument registers and
@@ -194,6 +196,7 @@ fn init_checked(
         .inbox = null,
         .inbox_version = 0,
         .timers = null,
+        .first = null,
     };
     // Reverse order so the first `spawn` takes fiber 0 and the free list stays address-ordered.
     for (0..fibers.len) |offset| {
@@ -223,9 +226,40 @@ pub fn deinit(sched: *Sched, gpa: std.mem.Allocator) void {
     sched.* = undefined;
 }
 
-/// Makes `entry(arg)` runnable on a free fiber; it first runs inside `run`. Precondition: not
-/// called from inside `run`'s switch window on another thread (carrier-thread only).
+/// Makes `entry(arg)` runnable on a free fiber; it first runs inside `run`. Precondition: called
+/// on the carrier thread only.
 pub fn spawn(sched: *Sched, entry: Entry, arg: ?*anyopaque) SpawnError!*Fiber {
+    return sched.spawn_placed(entry, arg, .back);
+}
+
+/// `spawn`, then runs the new fiber at once. From a fiber the caller yields (it resumes behind
+/// every ready fiber) once the new one first parks, yields or ends; from outside `run` the carrier
+/// loop runs until it does (`io` drives the loop). Called by the carrier inside `run_loop` (for
+/// example from a timers hook) it is a plain `spawn`; other threads breach `spawn`'s contract.
+/// No fiber is returned: the new one may be gone, and reused, by then.
+pub fn spawn_first(sched: *Sched, io: Io, entry: Entry, arg: ?*anyopaque) SpawnError!void {
+    if (!sched.has_free_fiber()) return error.FibersExhausted;
+    if (sched.running and !sched.in_fiber()) {
+        _ = try sched.spawn(entry, arg);
+        return;
+    }
+    const fiber = sched.spawn_placed(entry, arg, .front) catch |err| switch (err) {
+        error.FibersExhausted => unreachable, // `has_free_fiber` held and nothing ran since.
+    };
+    assert(sched.ready_head == fiber);
+    if (sched.in_fiber()) {
+        sched.yield();
+    } else {
+        assert(sched.first == null);
+        assert(sched.current == null);
+        sched.first = fiber;
+        sched.run_loop(io, null);
+        assert(sched.first == null);
+    }
+}
+const Placement = enum { back, front };
+
+fn spawn_placed(sched: *Sched, entry: Entry, arg: ?*anyopaque, place: Placement) SpawnError!*Fiber {
     const fiber = sched.free_head orelse return error.FibersExhausted;
     assert(fiber.state == .free);
     assert(fiber.arg == null);
@@ -244,7 +278,7 @@ pub fn spawn(sched: *Sched, entry: Entry, arg: ?*anyopaque) SpawnError!*Fiber {
     fiber.context = initial_context(start_address);
 
     sched.live_count += 1;
-    sched.push_ready(fiber);
+    if (place == .front) sched.push_front(fiber) else sched.push_ready(fiber);
     assert(fiber.state == .ready);
     return fiber;
 }
@@ -371,6 +405,10 @@ fn run_loop(sched: *Sched, io: Io, stop: ?*const bool) void {
         sched.current = fiber;
         switch_context(&sched.carrier_context, &fiber.context);
         assert(sched.current == null);
+        if (sched.first == fiber) {
+            sched.first = null;
+            break;
+        }
     }
 }
 
@@ -399,6 +437,14 @@ fn push_ready(sched: *Sched, fiber: *Fiber) void {
         sched.ready_head = fiber;
     }
     sched.ready_tail = fiber;
+}
+
+fn push_front(sched: *Sched, fiber: *Fiber) void {
+    assert((sched.ready_head == null) == (sched.ready_tail == null));
+    fiber.state = .ready;
+    fiber.queue_next = sched.ready_head;
+    sched.ready_head = fiber;
+    if (sched.ready_tail == null) sched.ready_tail = fiber;
 }
 
 fn pop_ready(sched: *Sched) ?*Fiber {

@@ -2,13 +2,13 @@
 //! `concurrent`, `await`, `cancel`.
 //!
 //! Value-returning calls run through `harness.expectSameResult` against the embedded
-//! `Io.Threaded`. Scheduling facts that `Io.Threaded` does not share (a started task runs lazily
-//! on a fiber, in FIFO order, exhaustion runs a task inline, `concurrent` is unavailable) are
-//! asserted on `rt.io()` alone, because the contract permits either behaviour. Every test runs
-//! under both `.forward` and `.fail`: the future-producing slots are native, so `Io.failing`'s
-//! unreachable `await`/`cancel` must never be reached. The runtime's allocator is
-//! `std.testing.allocator` (or a `FailingAllocator` over it), so a leaked task record fails the
-//! test.
+//! `Io.Threaded`. Scheduling facts that `Io.Threaded` does not share (a started task runs at once
+//! on a fiber until it first parks, then in FIFO order; exhaustion runs a task inline;
+//! `concurrent` is unavailable) are asserted on `rt.io()` alone, because the contract permits
+//! either behaviour. Every test runs under both `.forward` and `.fail`: the future-producing
+//! slots are native, so `Io.failing`'s unreachable `await`/`cancel` must never be reached. The
+//! runtime's allocator is `std.testing.allocator` (or a `FailingAllocator` over it), so a leaked
+//! task record fails the test.
 
 const std = @import("std");
 const Io = std.Io;
@@ -152,7 +152,7 @@ fn traced_leaf(trace: *Trace, id: u32) u32 {
 fn traced_parent(io: Io, trace: *Trace) u32 {
     trace.push(1);
     var child = io.async(traced_leaf, .{ trace, 10 });
-    trace.push(2); // The child is lazy: it runs only once this fiber parks in `await`.
+    trace.push(2); // The child is eager: it already ran inside `async`.
     const value = child.await(io);
     trace.push(3);
     return value;
@@ -164,24 +164,26 @@ fn run_traced_parent(mode: Runtime.Unimplemented, trace: *Trace) !u32 {
 
     const io = rt.io();
     var future = io.async(traced_parent, .{ io, trace });
-    // Nothing runs until the first `await` drives the scheduler.
-    try std.testing.expectEqual(@as(u32, 0), trace.len);
-    return future.await(io);
+    // The parent yields inside its own `async`, which ends the outer eager run early.
+    try std.testing.expectEqualSlices(u32, &.{1}, trace.slice());
+    const value = future.await(io);
+    try std.testing.expectEqualSlices(u32, &.{ 1, 10, 2, 3 }, trace.slice());
+    return value;
 }
 
-test "interleaving is deterministic: lazy start, park in await, FIFO resume" {
+test "interleaving is deterministic: eager start, child runs before the parent resumes" {
     if (!fibers_supported) return error.SkipZigTest;
     for (modes) |mode| {
         var first = Trace.init();
         var second = Trace.init();
         try std.testing.expectEqual(@as(u32, 20), try run_traced_parent(mode, &first));
         try std.testing.expectEqual(@as(u32, 20), try run_traced_parent(mode, &second));
-        try std.testing.expectEqualSlices(u32, &.{ 1, 2, 10, 3 }, first.slice());
+        try std.testing.expectEqualSlices(u32, &.{ 1, 10, 2, 3 }, first.slice());
         try std.testing.expectEqualSlices(u32, first.slice(), second.slice());
     }
 }
 
-test "spawned tasks run in spawn order when the first await drives the scheduler" {
+test "spawned tasks run to completion at the call, in spawn order" {
     if (!fibers_supported) return error.SkipZigTest;
     for (modes) |mode| {
         var rt = try fixtures.init_runtime(mode);
@@ -192,18 +194,31 @@ test "spawned tasks run in spawn order when the first await drives the scheduler
         var futures: [4]Io.Future(u32) = undefined;
         for (&futures, 0..) |*future, id| {
             future.* = io.async(traced_leaf, .{ &trace, @as(u32, @intCast(id)) });
+            // The body has run by the time `async` returns.
+            try std.testing.expectEqual(@as(u32, @intCast(id)) + 1, trace.len);
         }
-        try std.testing.expectEqual(@as(u32, 0), trace.len);
-        // Awaiting the last future still runs every earlier task first.
-        try std.testing.expectEqual(@as(u32, 6), futures[3].await(io));
         try std.testing.expectEqualSlices(u32, &.{ 0, 1, 2, 3 }, trace.slice());
-        for (futures[0..3], 0..) |*future, id| {
+        for (&futures, 0..) |*future, id| {
             try std.testing.expectEqual(@as(u32, @intCast(id)) * 2, future.await(io));
         }
     }
 }
 
-test "await outside a fiber runs tasks only up to the awaited one" {
+const Parker = struct {
+    trace: *Trace,
+    flag: u32,
+};
+
+fn parked_task(io: Io, parker: *Parker, id: u32) u32 {
+    parker.trace.push(100 + id);
+    while (@atomicLoad(u32, &parker.flag, .acquire) == 0) {
+        io.futexWaitUncancelable(u32, &parker.flag, 0);
+    }
+    parker.trace.push(200 + id);
+    return id;
+}
+
+test "async returns when the task first parks; a later await resumes it" {
     if (!fibers_supported) return error.SkipZigTest;
     for (modes) |mode| {
         var rt = try fixtures.init_runtime(mode);
@@ -211,17 +226,42 @@ test "await outside a fiber runs tasks only up to the awaited one" {
 
         const io = rt.io();
         var trace = Trace.init();
-        var futures: [4]Io.Future(u32) = undefined;
-        for (&futures, 0..) |*future, id| {
-            future.* = io.async(traced_leaf, .{ &trace, @as(u32, @intCast(id)) });
-        }
-        try std.testing.expectEqual(@as(u32, 2), futures[1].await(io));
-        try std.testing.expectEqualSlices(u32, &.{ 0, 1 }, trace.slice());
-        // The rest are still pending; each later await resumes the same FIFO queue.
-        try std.testing.expectEqual(@as(u32, 6), futures[3].await(io));
-        try std.testing.expectEqualSlices(u32, &.{ 0, 1, 2, 3 }, trace.slice());
-        try std.testing.expectEqual(@as(u32, 4), futures[2].await(io));
-        try std.testing.expectEqual(@as(u32, 0), futures[0].await(io));
+        var parker: Parker = .{ .trace = &trace, .flag = 0 };
+        var first = io.async(parked_task, .{ io, &parker, 0 });
+        var second = io.async(parked_task, .{ io, &parker, 1 });
+        // Both ran up to their park inside `async`, off-fiber, and no further.
+        try std.testing.expectEqualSlices(u32, &.{ 100, 101 }, trace.slice());
+        @atomicStore(u32, &parker.flag, 1, .release);
+        io.futexWake(u32, &parker.flag, 2);
+        try std.testing.expectEqual(@as(u32, 0), first.await(io));
+        try std.testing.expectEqual(@as(u32, 1), second.await(io));
+        try std.testing.expectEqualSlices(u32, &.{ 100, 101, 200, 201 }, trace.slice());
+    }
+}
+
+fn parked_parent(io: Io, parker: *Parker) u32 {
+    parker.trace.push(1);
+    var child = io.async(parked_task, .{ io, parker, 0 });
+    parker.trace.push(2); // The child parked inside `async`; the parent resumes at once.
+    @atomicStore(u32, &parker.flag, 1, .release);
+    io.futexWake(u32, &parker.flag, 1);
+    const value = child.await(io);
+    parker.trace.push(3);
+    return value;
+}
+
+test "inside a fiber, async switches to the child and resumes the parent when it parks" {
+    if (!fibers_supported) return error.SkipZigTest;
+    for (modes) |mode| {
+        var rt = try fixtures.init_runtime(mode);
+        defer rt.deinit();
+
+        const io = rt.io();
+        var trace = Trace.init();
+        var parker: Parker = .{ .trace = &trace, .flag = 0 };
+        var future = io.async(parked_parent, .{ io, &parker });
+        try std.testing.expectEqual(@as(u32, 0), future.await(io));
+        try std.testing.expectEqualSlices(u32, &.{ 1, 100, 2, 200, 3 }, trace.slice());
     }
 }
 
@@ -233,20 +273,30 @@ test "exhaustion runs the overflow inline, at the call, and returns no future" {
 
         const io = rt.io();
         var trace = Trace.init();
-        var futures: [5]Io.Future(u32) = undefined;
-        for (&futures, 0..) |*future, id| {
-            future.* = io.async(traced_leaf, .{ &trace, @as(u32, @intCast(id)) });
+        var parker: Parker = .{ .trace = &trace, .flag = 0 };
+        var holders: [2]Io.Future(u32) = undefined;
+        for (&holders, 0..) |*future, id| {
+            future.* = io.async(parked_task, .{ io, &parker, @as(u32, @intCast(id)) });
         }
-        // Tasks 0 and 1 hold the two fibers; 2, 3 and 4 already ran inside `async`.
-        try std.testing.expect(futures[0].any_future != null);
-        try std.testing.expect(futures[1].any_future != null);
-        for (futures[2..]) |future| try std.testing.expect(future.any_future == null);
-        try std.testing.expectEqualSlices(u32, &.{ 2, 3, 4 }, trace.slice());
+        // Tasks 0 and 1 park holding both fibers; 2, 3 and 4 run inside `async`.
+        try std.testing.expect(holders[0].any_future != null);
+        try std.testing.expect(holders[1].any_future != null);
+        var overflow: [3]Io.Future(u32) = undefined;
+        for (&overflow, 0..) |*future, id| {
+            future.* = io.async(traced_leaf, .{ &trace, @as(u32, @intCast(id)) + 2 });
+            try std.testing.expect(future.any_future == null);
+        }
+        try std.testing.expectEqualSlices(u32, &.{ 100, 101, 2, 3, 4 }, trace.slice());
 
-        for (&futures, 0..) |*future, id| {
-            try std.testing.expectEqual(@as(u32, @intCast(id)) * 2, future.await(io));
+        @atomicStore(u32, &parker.flag, 1, .release);
+        io.futexWake(u32, &parker.flag, 2);
+        for (&overflow, 0..) |*future, id| {
+            try std.testing.expectEqual((@as(u32, @intCast(id)) + 2) * 2, future.await(io));
         }
-        try std.testing.expectEqualSlices(u32, &.{ 2, 3, 4, 0, 1 }, trace.slice());
+        for (&holders, 0..) |*future, id| {
+            try std.testing.expectEqual(@as(u32, @intCast(id)), future.await(io));
+        }
+        try std.testing.expectEqualSlices(u32, &.{ 100, 101, 2, 3, 4, 200, 201 }, trace.slice());
     }
 }
 
@@ -298,7 +348,7 @@ test "cancel from inside a fiber parks until the child finishes" {
         var trace = Trace.init();
         var future = io.async(cancelling_parent, .{ io, &trace });
         try std.testing.expectEqual(@as(u32, 9), future.await(io));
-        try std.testing.expectEqualSlices(u32, &.{ 1, 4 }, trace.slice());
+        try std.testing.expectEqualSlices(u32, &.{ 4, 1 }, trace.slice());
     }
 }
 
@@ -377,7 +427,7 @@ test "seeded model: random task trees awaited in random order match a trivial re
     const tasks_max = 48;
     const rounds_max = 4;
     for (modes) |mode| {
-        // Fewer fibers than tasks, so every round mixes lazy and inline tasks.
+        // Fewer fibers than tasks, so every round mixes fiber and inline tasks.
         var rt = try fixtures.init_runtime_in(std.testing.allocator, mode, 16);
         defer rt.deinit();
 

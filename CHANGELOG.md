@@ -7,6 +7,12 @@ exemption recorded in `citadel/protocol/VERSIONING.md`.
 
 ## [Unreleased]
 
+### Changed
+
+- `async` starts the task at once: the body runs inside the call until it first parks, yields or ends
+  (a caller on a fiber yields; off-fiber the carrier loop runs it). Gate 6 now passes at 1000 in
+  flight (plan `003` item 2).
+
 ### Fixed
 
 - `groupAwait` honors a cancel that arrives while it is parked: the awaiter is woken, cancels every

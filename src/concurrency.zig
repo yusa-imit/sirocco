@@ -5,11 +5,12 @@
 //! record `groupAsync` made, so a half-native vtable would hand a sirocco token to Threaded.
 //!
 //! Model: one carrier thread, many fibers (`Sched`). `async` allocates a task record, copies the
-//! context into it and spawns a fiber that runs `start` and then marks the task done; the fiber
-//! does not run until the carrier does: from `await`/`cancel` called outside any fiber (which
-//! drives `Sched.run_until` the awaited task is done, so later tasks stay pending) or whenever
-//! another fiber parks. Scheduling is FIFO, so the interleaving of a single-threaded program is
-//! deterministic. `await` inside a fiber records itself as the task's waiter and parks; the
+//! context into it and spawns a fiber that runs `start` and then marks the task done. The fiber
+//! runs at once (`Sched.spawn_first`): a caller on a fiber yields to it, a caller outside any
+//! fiber drives the carrier loop until the task first parks, yields or ends; `await`/`cancel`
+//! outside a fiber drive `Sched.run_until` the awaited task is done. Scheduling is FIFO after
+//! that, so the interleaving of a single-threaded program is deterministic (`groupAsync` members
+//! still start lazily). `await` inside a fiber records itself as the task's waiter and parks; the
 //! finishing task unparks it.
 //!
 //! Fallbacks, all permitted by `Io.VTable.async` ("if it returns `null` ... `result` has been
@@ -48,16 +49,16 @@
 //! `groupAwait`/`groupCancel`); the
 //! no-allocation contract is a later item. Fibers and stacks come from `Sched.init`.
 //!
-//! Known limits: `async` is lazy, and the forwarded blocking slots (`sleep`, I/O) block the
-//! carrier thread; a futex wait does not (`src/futex.zig` parks the fiber), so
-//! `io.async(producer)` followed by `queue.getOne` completes. Called from outside a fiber, a
-//! futex wait still blocks the carrier. Under `.forward`, `concurrent` is `ConcurrencyUnavailable`
-//! where Threaded would succeed.
+//! Known limits: the forwarded blocking slots (`sleep`, I/O) block the carrier thread, now
+//! inside the `async` call that started the task, not at `await`; a futex wait does not
+//! (`src/futex.zig` parks the fiber), so `io.async(producer)` followed by `queue.getOne`
+//! completes. Called from outside a fiber, a futex wait still blocks the carrier. Under
+//! `.forward`, `concurrent` is `ConcurrencyUnavailable` where Threaded would succeed.
 //!
-//! Threads: every slot runs on the carrier thread, the one that calls the first `await` outside a
-//! fiber. The `Io` contract calls these slots thread-safe; this implementation is not yet, and a
-//! second thread using the same `Io` is a contract breach. Every future must be awaited or
-//! cancelled exactly once before `Runtime.deinit`.
+//! Threads: every slot runs on the carrier thread, the one that first calls `async` or `await`
+//! outside a fiber. The `Io` contract calls these slots thread-safe; this implementation is not
+//! yet, and a second thread using the same `Io` is a contract breach. Every future must be
+//! awaited or cancelled exactly once before `Runtime.deinit`.
 
 const std = @import("std");
 const stdx = @import("stdx.zig");
@@ -203,11 +204,11 @@ fn slot_async(
     const body: Body = .{ .future = start };
     const task = task_create(rt, result.len, result_alignment, context, context_alignment, body);
     const task_ok = task orelse return run_inline(result, context, start);
-    const fiber = rt.sched.spawn(task_entry, task_ok) catch |err| switch (err) {
+    // Eager start: the body runs now, until it first parks or ends (`Io.async` permits it).
+    rt.sched.spawn_first(rt.baselineIo(), task_entry, task_ok) catch |err| switch (err) {
         // `has_free_fiber` held on this thread a moment ago and nothing ran in between.
         error.FibersExhausted => unreachable,
     };
-    assert(fiber.state == .ready);
     return @ptrCast(task_ok);
 }
 

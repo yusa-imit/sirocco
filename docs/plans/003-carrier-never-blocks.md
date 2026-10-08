@@ -27,7 +27,7 @@ carrier owns one poller; item 7's ADR records that choice for the human to appro
       awaiter parked, then `cancel`: `Canceled` after all members were canceled, plus the
       `.blocked` case and the cancel racing the last member (asserted on `rt.io()` alone, as
       the other cancel-timing facts: the baseline has no fiber to park).
-- [ ] 2. Eager task start: `async` switches into the new fiber at once and re-queues the caller
+- [x] 2. Eager task start: `async` switches into the new fiber at once and re-queues the caller
       (off-fiber, it runs until the task first parks or ends). `Io.async` permits running the
       task before returning. Why: lazy start is the measured cause of gate 6 failing at 1000
       (86056 ns vs 599 ns). Verify: a `concurrency.zig` test that the body has run when `async`

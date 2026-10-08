@@ -2,10 +2,11 @@
 //!
 //! Facts about "no cancel requested" and "outside any task" are compared against `Io.Threaded`
 //! through `harness.expectSameResult`. Facts that need a cancel to arrive at a known point are
-//! asserted on `rt.io()` alone: sirocco starts a task lazily on a fiber, so `cancel` always lands
-//! before the first instruction of the task, while `Io.Threaded` may already be running it on a
-//! worker (or inline) and the cancel would race. Every test runs under both `.forward` and
-//! `.fail`: the three slots are native, so `Io.failing`'s unreachable stubs must stay unreached.
+//! asserted on `rt.io()` alone: sirocco runs a task at once, so those tasks park on a gate first
+//! and the test opens it only after `cancel` queued the request, while `Io.Threaded` may already
+//! be running the task on a worker (or inline) and the cancel would race. Every test runs under
+//! both `.forward` and `.fail`: the three slots are native, so `Io.failing`'s unreachable stubs
+//! must stay unreached.
 
 const std = @import("std");
 const Io = std.Io;
@@ -66,12 +67,28 @@ test "swapCancelProtection returns the previous state; a task holds its own" {
     }
 }
 
+/// Holds a task before its first cancelation point: `async` runs the task up to this wait, the
+/// test opens the gate, and the task proceeds only when the scheduler next runs it.
+fn gate_wait(io: Io, gate: *u32) void {
+    while (@atomicLoad(u32, gate, .acquire) == 0) io.futexWaitUncancelable(u32, gate, 0);
+}
+
+fn gate_open(io: Io, gate: *u32) void {
+    @atomicStore(u32, gate, 1, .release);
+    io.futexWake(u32, gate, 16);
+}
+
 /// True when `checkCancel` reported the cancelation.
 fn observes_cancel(io: Io) bool {
     io.checkCancel() catch |err| switch (err) {
         error.Canceled => return true,
     };
     return false;
+}
+
+fn gated_observes_cancel(io: Io, gate: *u32) bool {
+    gate_wait(io, gate);
+    return observes_cancel(io);
 }
 
 test "cancel before the task starts is observed at its first check" {
@@ -81,7 +98,9 @@ test "cancel before the task starts is observed at its first check" {
         defer rt.deinit();
 
         const io = rt.io();
-        var future = io.async(observes_cancel, .{io});
+        var gate: u32 = 0;
+        var future = io.async(gated_observes_cancel, .{ io, &gate });
+        gate_open(io, &gate);
         try std.testing.expect(future.cancel(io));
     }
 }
@@ -99,7 +118,8 @@ test "a task nobody cancelled does not observe a cancelation" {
 }
 
 /// Counts cancelations: the request is delivered once, `recancel` re-arms it.
-fn observes_cancel_twice(io: Io) u32 {
+fn observes_cancel_twice(io: Io, gate: *u32) u32 {
+    gate_wait(io, gate);
     var count: u32 = 0;
     if (observes_cancel(io)) count += 1;
     // Acknowledged: the request is spent until `recancel`.
@@ -116,13 +136,16 @@ test "a cancelation is delivered once and recancel re-arms it" {
         defer rt.deinit();
 
         const io = rt.io();
-        var future = io.async(observes_cancel_twice, .{io});
+        var gate: u32 = 0;
+        var future = io.async(observes_cancel_twice, .{ io, &gate });
+        gate_open(io, &gate);
         try std.testing.expectEqual(@as(u32, 101), future.cancel(io));
     }
 }
 
 /// Blocked protection hides the request; unblocking reveals it again.
-fn observes_through_protection(io: Io) [3]bool {
+fn observes_through_protection(io: Io, gate: *u32) [3]bool {
+    gate_wait(io, gate);
     const old = io.swapCancelProtection(.blocked);
     const hidden = observes_cancel(io);
     const restored = io.swapCancelProtection(old);
@@ -138,7 +161,9 @@ test "blocked protection hides a cancelation until it is lifted" {
         defer rt.deinit();
 
         const io = rt.io();
-        var future = io.async(observes_through_protection, .{io});
+        var gate: u32 = 0;
+        var future = io.async(observes_through_protection, .{ io, &gate });
+        gate_open(io, &gate);
         const seen = future.cancel(io);
         try std.testing.expect(!seen[0]);
         try std.testing.expect(seen[1]);
@@ -153,8 +178,10 @@ test "a cancelation reaches only its own task" {
         defer rt.deinit();
 
         const io = rt.io();
-        var cancelled = io.async(observes_cancel, .{io});
-        var sibling = io.async(observes_cancel, .{io});
+        var gate: u32 = 0;
+        var cancelled = io.async(gated_observes_cancel, .{ io, &gate });
+        var sibling = io.async(gated_observes_cancel, .{ io, &gate });
+        gate_open(io, &gate);
         try std.testing.expect(cancelled.cancel(io));
         try std.testing.expect(!sibling.await(io));
     }
