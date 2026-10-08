@@ -133,6 +133,14 @@ test "a member returning error.Canceled is swallowed at the group boundary" {
 }
 
 fn await_group_in_task(io: Io, counter: *std.atomic.Value(u32)) Io.Cancelable!u32 {
+    return gated_await_group(io, counter, null);
+}
+
+/// With a gate, the task waits on it first so a cancel can land before its `groupAwait`.
+fn gated_await_group(io: Io, counter: *std.atomic.Value(u32), gate: ?*u32) Io.Cancelable!u32 {
+    if (gate) |word| {
+        while (@atomicLoad(u32, word, .acquire) == 0) io.futexWaitUncancelable(u32, word, 0);
+    }
     var group: Io.Group = .init;
     for (0..3) |_| group.async(io, bump, .{counter});
     try group.await(io);
@@ -160,9 +168,12 @@ test "a canceled awaiter cancels its members and gets error.Canceled" {
 
         const io = rt.io();
         var counter: std.atomic.Value(u32) = .init(0);
-        var future = io.async(await_group_in_task, .{ io, &counter });
-        // The task has not started: the request lands at its first cancelation point, which is
-        // the `groupAwait`; its members are canceled but still run to their own check.
+        var gate: u32 = 0;
+        var future = io.async(gated_await_group, .{ io, &counter, &gate });
+        @atomicStore(u32, &gate, 1, .release);
+        io.futexWake(u32, &gate, 1);
+        // The task has not passed the gate: the request lands at its first cancelation point,
+        // which is the `groupAwait`; its members are canceled but still run to their own check.
         try std.testing.expectError(error.Canceled, future.cancel(io));
         try std.testing.expectEqual(@as(u32, 3), counter.load(.monotonic));
     }

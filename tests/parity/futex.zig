@@ -201,7 +201,7 @@ fn scenario_saturated_fan(rt: *Runtime) anyerror!void {
         waiter.* = io.async(fan_waiter, .{ io, &s, @as(u8, @intCast(id)) });
     }
     var driver = io.async(fan_driver_wake_all, .{ io, &s });
-    try expectEqual(@as(u32, 5), rt.sched.live_count); // 4 waiters + the driver = fibers_max
+    try expectEqual(@as(u32, 4), rt.sched.live_count); // 4 parked waiters = fibers_max
     driver.await(io);
     for (&waiters) |*waiter| try waiter.await(io);
 
@@ -212,7 +212,7 @@ fn scenario_saturated_fan(rt: *Runtime) anyerror!void {
 }
 
 test "futex: fibers_max parked waiters on one word all wake from one wake(max)" {
-    try run_modes(5, scenario_saturated_fan);
+    try run_modes(4, scenario_saturated_fan);
 }
 
 fn pair_waiter(io: Io, s: *Scene, index: usize) Cancelable!void {
@@ -499,7 +499,19 @@ test "futex: a cancel that arrives while the waiter is parked unparks it with er
     }.scenario);
 }
 
+/// Holds a task at its start: `async` runs it up to this wait, the test opens the gate once
+/// `cancel` has queued its request, and the task proceeds the next time the scheduler runs it.
+fn gate_wait(io: Io, s: *Scene) void {
+    while (s.words[1].load(.acquire) == 0) io.futexWaitUncancelable(u32, s.word(1), 0);
+}
+
+fn gate_open(io: Io, s: *Scene) void {
+    s.words[1].store(1, .release);
+    io.futexWake(u32, s.word(1), 1);
+}
+
 fn mismatch_cancelable(io: Io, s: *Scene) Cancelable!void {
+    gate_wait(io, s);
     s.words[0].store(7, .release);
     s.parked += 1;
     try io.futexWait(u32, s.word(0), 5);
@@ -508,12 +520,13 @@ fn mismatch_cancelable(io: Io, s: *Scene) Cancelable!void {
 
 test "futex: a cancel pending at entry is observed even when the wait would not block" {
     // `futexWait` is a cancelation point (`futexWaitUncancelable`: "does not introduce a
-    // cancelation point"). The task is lazy, so `cancel` lands before its first instruction.
+    // cancelation point"). The task waits on a gate first, so `cancel` lands before the wait.
     try run_modes(8, struct {
         fn scenario(rt: *Runtime) anyerror!void {
             const io = rt.io();
             var s: Scene = .{};
             var task = io.async(mismatch_cancelable, .{ io, &s });
+            gate_open(io, &s);
             try std.testing.expectError(error.Canceled, task.cancel(io));
             try expectEqual(@as(u32, 0), s.finished);
         }
@@ -521,6 +534,7 @@ test "futex: a cancel pending at entry is observed even when the wait would not 
 }
 
 fn protected_waiter(io: Io, s: *Scene) bool {
+    gate_wait(io, s);
     const old = io.swapCancelProtection(.blocked);
     s.words[0].store(7, .release);
     io.futexWait(u32, s.word(0), 5) catch return false; // blocked: must not be canceled
@@ -535,6 +549,7 @@ test "futex: blocked cancel protection makes the wait ignore a pending cancel" {
             const io = rt.io();
             var s: Scene = .{};
             var task = io.async(protected_waiter, .{ io, &s });
+            gate_open(io, &s);
             // The request was kept, not dropped: it shows once protection is lifted.
             try std.testing.expect(task.cancel(io));
             try expectEqual(@as(u32, 1), s.finished);
