@@ -6,8 +6,9 @@
 //! leans on the fallback can be run under `.fail` to fail loudly. Native today: the
 //! concurrency set (`async`/`concurrent`/`await`/`cancel`, the three cancel-state slots,
 //! `groupAsync`/`groupConcurrent`/`groupAwait`/`groupCancel` and `crashHandler`;
-//! `src/concurrency.zig`, on the fibers of `src/sched.zig`) and the futex trio (`futexWait`,
-//! `futexWaitUncancelable`, `futexWake`; `src/futex.zig`), installed in both modes. Where
+//! `src/concurrency.zig`, on the fibers of `src/sched.zig`), the futex trio (`futexWait`,
+//! `futexWaitUncancelable`, `futexWake`; `src/futex.zig`) and `sleep` (`src/sleep.zig`, on the
+//! scheduler's timing wheel), installed in both modes. Where
 //! `fibers_supported` is false (Windows, 32-bit and other architectures) the set is not installed
 //! and stays forwarded, so `.auto` and `.threaded` keep working on every target.
 //!
@@ -38,6 +39,7 @@ const stdx = @import("stdx.zig");
 const Sched = @import("sched.zig");
 const concurrency = @import("concurrency.zig");
 const futex = @import("futex.zig");
+const sleep = @import("sleep.zig");
 
 const assert = stdx.assert;
 
@@ -139,6 +141,7 @@ pub fn init(gpa: std.mem.Allocator, options: Options) InitError!Runtime {
     if (fibers_supported) {
         concurrency.install(&base);
         futex.install(&base);
+        sleep.install(&base);
     }
     return .{
         .threaded = threaded,
@@ -196,7 +199,8 @@ fn test_options(backend: Backend, unimplemented: Unimplemented) Options {
     };
 }
 
-// The slots `concurrency.zig` installs: native where fibers exist, forwarded elsewhere.
+// The slots `concurrency.zig`, `futex.zig` and `sleep.zig` install: native where fibers exist,
+// forwarded elsewhere.
 const future_slots = .{
     "async",
     "concurrent",
@@ -213,6 +217,7 @@ const future_slots = .{
     "futexWait",
     "futexWaitUncancelable",
     "futexWake",
+    "sleep",
 };
 
 fn is_future_slot(comptime name: []const u8) bool {

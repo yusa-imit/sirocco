@@ -28,7 +28,7 @@ pub const Divergence = struct {
 /// Slots implemented on sirocco's own fibers (where `Runtime.fibers_supported`; elsewhere they
 /// are forwarded, and `tests/parity/concurrency.zig` checks that too). Parity tests:
 /// `tests/parity/concurrency.zig`, `cancel.zig`, `group.zig`; the futex trio: `futex.zig` and
-/// `futex_sync.zig` (std's `Mutex`/`Condition`/`Event` on top of it).
+/// `futex_sync.zig` (std's `Mutex`/`Condition`/`Event` on top of it); `sleep`: `time.zig`.
 pub const native: []const []const u8 = &.{
     "async",
     "await",
@@ -43,6 +43,7 @@ pub const native: []const []const u8 = &.{
     "futexWait",
     "futexWaitUncancelable",
     "futexWake",
+    "sleep",
 };
 
 /// Slots still forwarded to the embedded `Io.Threaded`.
@@ -122,7 +123,6 @@ pub const delegated: []const []const u8 = &.{
     "progressParentFile",
     "now",
     "clockResolution",
-    "sleep",
     "random",
     "randomSecure",
     "netListenIp",

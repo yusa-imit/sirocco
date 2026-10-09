@@ -16,9 +16,12 @@
 //! only spurious return: a woken, timed-out or canceled fiber leaves the table before it runs.
 //!
 //! Timeouts: `.duration` and `.deadline` are read through the baseline `Io.Threaded`'s `now`
-//! slot (the native table has none of its own) and kept as a `Clock.awake` deadline in the fiber's
-//! wait record. `Sched.run` polls `expire` through `Sched.Timers`; when every fiber is parked it
-//! sleeps in the baseline futex until the earliest deadline.
+//! slot (the native table has none of its own) and armed as a `Clock.awake` deadline on the
+//! scheduler's wheel (`Sched.wheel`, node = fiber index). `Sched.run` fires the wheel and calls
+//! `Table.timeout` through `Sched.Expiry` for each futex waiter that is due; when every fiber is
+//! parked it sleeps in the baseline futex until the earliest deadline. A wake that beats the
+//! deadline leaves the node linked until the fiber runs again and clears it; if the node fires
+//! first, `timeout` finds the waiter already out of the table and does nothing.
 //!
 //! Cancelation: `futexWait` is a cancelation point. A request that is pending (and not blocked by
 //! `swapCancelProtection`) when the call starts is delivered before anything else, even if the
@@ -46,15 +49,14 @@ const stdx = @import("stdx.zig");
 const Sched = @import("sched.zig");
 const Runtime = @import("runtime.zig");
 const concurrency = @import("concurrency.zig");
+const sleep = @import("sleep.zig");
 
 const Io = std.Io;
 const Fiber = Sched.Fiber;
 const assert = stdx.assert;
 const assert_always = stdx.assert_always;
 
-/// When a wait gives up: never, at an absolute `Clock.awake` time, or already (nothing to wait
-/// for).
-pub const Limit = union(enum) { forever, at: i96, expired };
+const Limit = sleep.Limit;
 
 /// Result of `Table.enqueue`: the fiber must park only on `.queued`.
 pub const Enqueue = enum { queued, mismatch, full };
@@ -69,9 +71,8 @@ pub const Table = struct {
     lock: u32,
     head: ?*Fiber,
     tail: ?*Fiber,
-    /// Fibers in the list, and the ones among them with a deadline.
+    /// Fibers in the list.
     waiting: u32,
-    timed: u32,
     waiters_max: u32,
     forwarded: u32,
 
@@ -83,7 +84,6 @@ pub const Table = struct {
             .head = null,
             .tail = null,
             .waiting = 0,
-            .timed = 0,
             .waiters_max = waiters_max,
             .forwarded = 0,
         };
@@ -109,16 +109,8 @@ pub const Table = struct {
         table.acquire();
         defer table.release();
 
-        assert(table.timed <= table.waiting);
+        assert(table.waiting <= table.waiters_max);
         return table.waiting;
-    }
-
-    fn timed_count(table: *Table) u32 {
-        table.acquire();
-        defer table.release();
-
-        assert(table.timed <= table.waiting);
-        return table.timed;
     }
 
     /// If `ptr.* == expected` still holds under the lock, appends `fiber` (idle, about to park)
@@ -128,10 +120,9 @@ pub const Table = struct {
         fiber: *Fiber,
         ptr: *const u32,
         expected: u32,
-        limit: Limit,
     ) Enqueue {
         assert(fiber.wait.outcome == .idle);
-        assert(limit != .expired);
+        assert(!fiber.wait.sleeping);
         table.acquire();
         defer table.release();
 
@@ -142,17 +133,12 @@ pub const Table = struct {
             .addr = @intFromPtr(ptr),
             .prev = table.tail,
             .next = null,
-            .deadline_ns = switch (limit) {
-                .at => |deadline_ns| deadline_ns,
-                .forever, .expired => 0,
-            },
-            .timed = limit == .at,
+            .sleeping = false,
             .outcome = .waiting,
         };
         if (table.tail) |tail| tail.wait.next = fiber else table.head = fiber;
         table.tail = fiber;
         table.waiting += 1;
-        if (fiber.wait.timed) table.timed += 1;
         assert((table.head == null) == (table.tail == null));
         return .queued;
     }
@@ -166,7 +152,6 @@ pub const Table = struct {
         wait.prev = null;
         wait.next = null;
         table.waiting -= 1;
-        if (wait.timed) table.timed -= 1;
         assert((table.head == null) == (table.waiting == 0));
     }
 
@@ -218,45 +203,32 @@ pub const Table = struct {
         return woken;
     }
 
-    /// Unparks every fiber whose deadline is at or before `now_ns`; returns the earliest deadline
-    /// still pending, or null.
-    pub fn expire(table: *Table, sched: *Sched, now_ns: i96) ?i96 {
+    /// The wheel node of `fiber` fired: if it still waits, takes it out of the table and makes it
+    /// runnable with outcome `.timed_out`. A no-op when a wake or cancel ended the wait first.
+    /// Precondition: carrier thread, `fiber` parked.
+    pub fn timeout(table: *Table, sched: *Sched, fiber: *Fiber) void {
+        assert(fiber.state == .parked);
         table.acquire();
         defer table.release();
 
-        assert(table.timed <= table.waiting);
-        var next_deadline_ns: ?i96 = null;
-        var node = table.head;
-        for (0..table.waiters_max) |_| {
-            const fiber = node orelse break;
-            node = fiber.wait.next;
-            if (!fiber.wait.timed) continue;
-            if (fiber.wait.deadline_ns <= now_ns) {
-                table.remove(fiber);
-                fiber.wait.outcome = .timed_out;
-                sched.unpark(fiber);
-                continue;
-            }
-            const earlier = if (next_deadline_ns) |d| @min(d, fiber.wait.deadline_ns) else {
-                next_deadline_ns = fiber.wait.deadline_ns;
-                continue;
-            };
-            next_deadline_ns = earlier;
-        }
-        assert(node == null);
-        assert((table.timed == 0) == (next_deadline_ns == null));
-        return next_deadline_ns;
+        assert(table.waiting <= table.waiters_max);
+        if (fiber.wait.outcome != .waiting) return;
+        table.remove(fiber);
+        fiber.wait.outcome = .timed_out;
+        sched.unpark(fiber);
     }
 };
 
-/// A cancelation request reached `fiber` while it was parked in `futexWait`: take it out of the
-/// table and make it runnable. A no-op when it was already woken or timed out this turn (it has
-/// not run yet; the request stays pending for its next cancelation point).
+/// A cancelation request reached `fiber` while it was parked in `futexWait` (or `sleep`, which
+/// `sleep.cancel` handles): take it out of the table and make it runnable. A no-op when it was
+/// already woken or timed out this turn (it has not run yet; the request stays pending for its
+/// next cancelation point).
 pub fn cancel_wait(table: *Table, sched: *Sched, fiber: *Fiber) void {
     table.acquire();
     defer table.release();
 
     assert(table.waiting <= table.waiters_max);
+    if (fiber.wait.sleeping) return sleep.cancel(sched, fiber);
     if (fiber.wait.outcome != .waiting) return;
     assert(fiber.state == .parked);
     table.remove(fiber);
@@ -273,24 +245,14 @@ pub fn install(vtable: *Io.VTable) void {
     vtable.futexWake = slot_futex_wake;
 }
 
-/// The hook `Sched.run` polls: `table` is `Runtime.waits`.
-pub fn timers(table: *Table) Sched.Timers {
-    return .{ .ctx = table, .expire = expire_hook };
+/// The handler `Sched.run` calls for a due futex waiter: `table` is `Runtime.waits`.
+pub fn expiry(table: *Table) Sched.Expiry {
+    return .{ .ctx = table, .futex_timeout = timeout_hook };
 }
 
-fn expire_hook(ctx: *anyopaque, sched: *Sched, io: Io) ?i96 {
+fn timeout_hook(ctx: *anyopaque, sched: *Sched, fiber: *Fiber) void {
     const table: *Table = @ptrCast(@alignCast(ctx));
-    if (table.timed_count() == 0) return null;
-    return table.expire(sched, Io.Clock.awake.now(io).nanoseconds);
-}
-
-fn limit_of(rt: *Runtime, timeout: Io.Timeout) Limit {
-    const io = rt.baselineIo();
-    const remaining = timeout.toDurationFromNow(io) orelse return .forever;
-    const remaining_ns = remaining.raw.nanoseconds;
-    if (remaining_ns <= 0) return .expired;
-    const now_ns = Io.Clock.awake.now(io).nanoseconds;
-    return .{ .at = now_ns +| remaining_ns };
+    table.timeout(sched, fiber);
 }
 
 fn word_is(ptr: *const u32, expected: u32) bool {
@@ -310,18 +272,21 @@ fn slot_futex_wait(
     assert(rt.sched.in_fiber());
     if (concurrency.task_acknowledge_cancel(task)) return error.Canceled;
     if (!word_is(ptr, expected)) return;
-    const limit = limit_of(rt, timeout);
+    const limit = sleep.limit_of(rt, timeout);
     if (limit == .expired) return;
 
     const fiber = rt.sched.current_fiber();
     // A full table degrades to a spurious return, as the module header explains.
-    switch (rt.waits.enqueue(fiber, ptr, expected, limit)) {
+    switch (rt.waits.enqueue(fiber, ptr, expected)) {
         .queued => {},
         .mismatch, .full => return,
     }
+    // Armed after the enqueue: a wake from another thread in between is cleared below.
+    sleep.arm(&rt.sched, fiber, limit);
     concurrency.task_cancel_wake(task, fiber);
     rt.sched.park();
     concurrency.task_cancel_wake(task, null);
+    sleep.disarm(&rt.sched, fiber);
     const outcome = fiber.wait.outcome;
     fiber.wait = .none;
     switch (outcome) {
@@ -357,7 +322,7 @@ fn slot_futex_wait_uncancelable(userdata: ?*anyopaque, ptr: *const u32, expected
     }
     if (!word_is(ptr, expected)) return;
     const fiber = rt.sched.current_fiber();
-    switch (rt.waits.enqueue(fiber, ptr, expected, .forever)) {
+    switch (rt.waits.enqueue(fiber, ptr, expected)) {
         .queued => {},
         .mismatch, .full => return,
     }
@@ -421,19 +386,18 @@ test "enqueue refuses past waiters_max and leaves the table intact" {
             .wait = .none,
         };
     }
-    try std.testing.expectEqual(Enqueue.queued, table.enqueue(&fibers[0], &word, 0, .forever));
-    try std.testing.expectEqual(Enqueue.queued, table.enqueue(&fibers[1], &word, 0, .{ .at = 50 }));
-    try std.testing.expectEqual(Enqueue.full, table.enqueue(&fibers[2], &word, 0, .forever));
-    try std.testing.expectEqual(Enqueue.mismatch, table.enqueue(&fibers[2], &word, 1, .forever));
+    try std.testing.expectEqual(Enqueue.queued, table.enqueue(&fibers[0], &word, 0));
+    try std.testing.expectEqual(Enqueue.queued, table.enqueue(&fibers[1], &word, 0));
+    try std.testing.expectEqual(Enqueue.full, table.enqueue(&fibers[2], &word, 0));
+    try std.testing.expectEqual(Enqueue.mismatch, table.enqueue(&fibers[2], &word, 1));
     try std.testing.expectEqual(@as(u32, 2), table.waiting_count());
-    try std.testing.expectEqual(@as(u32, 1), table.timed_count());
     try std.testing.expectEqual(Sched.WaitOutcome.idle, fibers[2].wait.outcome);
     try std.testing.expectEqual(@as(?*Fiber, &fibers[0]), table.head);
     try std.testing.expectEqual(@as(?*Fiber, &fibers[1]), table.tail);
 
     // Removing the head frees a slot and keeps the arrival order of the rest.
     table.remove(&fibers[0]);
-    try std.testing.expectEqual(Enqueue.queued, table.enqueue(&fibers[2], &word, 0, .forever));
+    try std.testing.expectEqual(Enqueue.queued, table.enqueue(&fibers[2], &word, 0));
     try std.testing.expectEqual(@as(?*Fiber, &fibers[1]), table.head);
     try std.testing.expectEqual(@as(?*Fiber, &fibers[2]), table.tail);
 }
