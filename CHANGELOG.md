@@ -7,6 +7,12 @@ exemption recorded in `citadel/protocol/VERSIONING.md`.
 
 ## [Unreleased]
 
+### Added
+
+- `src/timer.zig`: a hierarchical timing wheel (131 us tick, bounded node array, no allocation
+  after `init`, clock passed in) that native `sleep` and futex timeouts will use (plan `003`
+  item 3). Internal; not yet wired into the scheduler.
+
 ### Changed
 
 - `async` starts the task at once: the body runs inside the call until it first parks, yields or ends

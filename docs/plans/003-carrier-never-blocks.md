@@ -32,8 +32,9 @@ carrier owns one poller; item 7's ADR records that choice for the human to appro
       task before returning. Why: lazy start is the measured cause of gate 6 failing at 1000
       (86056 ns vs 599 ns). Verify: a `concurrency.zig` test that the body has run when `async`
       returns; `zig build bench-spawn -Doptimize=ReleaseFast` passes at 1 and 1000, rows in PRD §5.
-- [ ] 3. `src/timer.zig`: a timing wheel whose nodes live in `Sched.Fiber` (bounded by
-      `fibers_max`, no allocation, no `timers_max` option), with `insert`/`remove`/
+- [x] 3. `src/timer.zig`: a timing wheel whose nodes are a bounded array, one per fiber
+      index, allocated once in `init` (bounded by `fibers_max`, no allocation after, no `timers_max`
+      option), with `insert`/`remove`/
       `expire(now_ns)`/`next_deadline`, tick <= 250 µs so a 1 ms sleep cannot round past gate 7.
       The wheel never reads a clock; `now_ns` is passed in (determinism). Verify: seeded model
       test (10k random insert/remove/expire ops) against a sorted-array reference compares the
