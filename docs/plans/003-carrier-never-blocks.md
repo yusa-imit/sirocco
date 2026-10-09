@@ -39,7 +39,7 @@ carrier owns one poller; item 7's ADR records that choice for the human to appro
       The wheel never reads a clock; `now_ns` is passed in (determinism). Verify: seeded model
       test (10k random insert/remove/expire ops) against a sorted-array reference compares the
       expiry trace; the allocation counter stays flat after init.
-- [ ] 4. Native `sleep` on the wheel for `.duration`/`.deadline` on `real`/`awake`/`boot`, a
+- [x] 4. Native `sleep` on the wheel for `.duration`/`.deadline` on `real`/`awake`/`boot`, a
       cancelation point a cancel unparks; CPU-time clocks and off-fiber callers forward (a wall
       wheel cannot measure CPU time). Move futex timeouts onto the wheel and delete the
       `Sched.timers` hook plan 002 item 8 called temporary. Verify: `tests/parity/time.zig` sleep

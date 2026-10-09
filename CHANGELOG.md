@@ -10,11 +10,16 @@ exemption recorded in `citadel/protocol/VERSIONING.md`.
 ### Added
 
 - `src/timer.zig`: a hierarchical timing wheel (131 us tick, bounded node array, no allocation
-  after `init`, clock passed in) that native `sleep` and futex timeouts will use (plan `003`
-  item 3). Internal; not yet wired into the scheduler.
+  after `init`, clock passed in) that native `sleep` and futex timeouts run on (plan `003`
+  item 3). Internal.
 
 ### Changed
 
+- `sleep` is native: a fiber in `rt.io().sleep` parks on the scheduler's timing wheel instead of
+  blocking the carrier thread, so other fibers keep running; a cancel wakes it with
+  `error.Canceled`. CPU-time clocks and calls from outside a fiber still forward to `Io.Threaded`.
+  Futex timeouts moved onto the same wheel and the temporary `Sched.timers` hook is gone (plan
+  `003` item 4).
 - `async` starts the task at once: the body runs inside the call until it first parks, yields or ends
   (a caller on a fiber yields; off-fiber the carrier loop runs it). Gate 6 now passes at 1000 in
   flight (plan `003` item 2).

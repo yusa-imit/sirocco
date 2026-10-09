@@ -49,10 +49,11 @@
 //! `groupAwait`/`groupCancel`); the
 //! no-allocation contract is a later item. Fibers and stacks come from `Sched.init`.
 //!
-//! Known limits: the forwarded blocking slots (`sleep`, I/O) block the carrier thread, now
-//! inside the `async` call that started the task, not at `await`; a futex wait does not
-//! (`src/futex.zig` parks the fiber), so `io.async(producer)` followed by `queue.getOne`
-//! completes. Called from outside a fiber, a futex wait still blocks the carrier. Under
+//! Known limits: the forwarded blocking slots (I/O, and `sleep` on a CPU clock) block the
+//! carrier thread, now inside the `async` call that started the task, not at `await`; a futex
+//! wait or a wall-clock `sleep` does not (`src/futex.zig` and `src/sleep.zig` park the fiber), so
+//! `io.async(producer)` followed by `queue.getOne` completes. Called from outside a fiber, a
+//! futex wait or sleep still blocks the carrier. Under
 //! `.forward`, `concurrent` is `ConcurrencyUnavailable` where Threaded would succeed.
 //!
 //! Threads: every slot runs on the carrier thread, the one that first calls `async` or `await`
@@ -166,6 +167,7 @@ pub fn sched_ensure(rt: *Runtime) void {
             const options: Sched.Options = .{
                 .fibers_max = rt.fibers_max,
                 .stack_size = rt.fiber_stack_size,
+                .now_ns = std.math.lossyCast(u64, Io.Clock.awake.now(rt.baselineIo()).nanoseconds),
             };
             rt.sched.init(rt.threaded.allocator, options) catch |err| switch (err) {
                 error.OutOfMemory, error.FibersUnsupported => {
@@ -173,7 +175,7 @@ pub fn sched_ensure(rt: *Runtime) void {
                     return;
                 },
             };
-            rt.sched.timers = futex.timers(&rt.waits);
+            rt.sched.expiry = futex.expiry(&rt.waits);
             rt.sched_pin = @intFromPtr(&rt.sched);
             rt.sched_state = .ready;
         },

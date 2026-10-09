@@ -359,14 +359,14 @@ test "no allocation beyond the runtime's, and nothing leaks, after await or canc
     defer rt.deinit();
 
     const io = rt.io();
-    // `io()` initialises the scheduler: fiber table and stack arena.
-    try std.testing.expectEqual(@as(usize, 2), failing.alloc_index);
+    // `io()` initialises the scheduler: fiber table, stack arena and the timing wheel's nodes.
+    try std.testing.expectEqual(@as(usize, 3), failing.alloc_index);
     const live_after_init = failing.allocated_bytes - failing.freed_bytes;
     var trace = Trace.init();
     var awaited = io.async(traced_leaf, .{ &trace, 1 });
     var cancelled = io.async(traced_leaf, .{ &trace, 2 });
     // One task record each (async still allocates per call, as Threaded does).
-    try std.testing.expectEqual(@as(usize, 4), failing.alloc_index);
+    try std.testing.expectEqual(@as(usize, 5), failing.alloc_index);
     _ = awaited.await(io);
     _ = cancelled.cancel(io);
     try std.testing.expectEqual(live_after_init, failing.allocated_bytes - failing.freed_bytes);
@@ -374,8 +374,8 @@ test "no allocation beyond the runtime's, and nothing leaks, after await or canc
 
 test "a failed task allocation runs the task inline" {
     if (!fibers_supported) return error.SkipZigTest;
-    // Scheduler init takes allocations 0 and 1; the first task record is allocation 2.
-    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 2 });
+    // Scheduler init takes allocations 0 to 2; the first task record is allocation 3.
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 3 });
     var rt = try fixtures.init_runtime_in(failing.allocator(), .forward, 4);
     defer rt.deinit();
 

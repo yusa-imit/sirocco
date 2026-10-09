@@ -5,8 +5,9 @@
 //! `switch_context` (naked per-arch assembly in `src/fiber_switch.zig`, aarch64 and x86_64).
 //! `Sched` installs no vtable slot itself: `src/concurrency.zig` builds `async`/`await`/`cancel`
 //! and groups on `spawn`, `park`, `unpark` and `run`, `src/futex.zig` the futex slots on the
-//! per-fiber `Wait` record and the `timers` hook, which `run` polls so a timed wait expires
-//! even when every fiber is parked.
+//! per-fiber `Wait` record. The scheduler owns a timing wheel (`src/timer.zig`, one node per
+//! fiber index) that `run` fires before every dispatch, so a timed wait expires even when every
+//! fiber is parked, and `src/sleep.zig` builds `sleep` on the same wheel.
 //!
 //! Invariants: `fibers_max` stacks are allocated in `init` and nowhere else; a fiber is exactly
 //! one of free / ready / running / parked, and `live_count` equals the fibers not free. The first
@@ -15,8 +16,9 @@
 //! neighbouring stack, and there are no guard pages yet. The `Sched` must not move after `init`
 //! (fibers hold a pointer to it), so `init` fills the caller's storage in place.
 //!
-//! Allocation: `init` allocates two blocks (fiber table, stack arena) from `gpa`; `Sched` stores
-//! no allocator, so nothing allocates afterwards, and `deinit` takes the same `gpa` back.
+//! Allocation: `init` allocates three blocks (fiber table, stack arena, wheel nodes) from `gpa`;
+//! `Sched` stores no allocator, so nothing allocates afterwards, and `deinit` takes the same `gpa`
+//! back.
 //!
 //! Threads: everything except `unpark_foreign` runs on the carrier thread. `unpark_foreign` may be
 //! called from any thread: it pushes onto a lock-free inbox and bumps a futex word, and the
@@ -33,6 +35,8 @@ const std = @import("std");
 const builtin = @import("builtin");
 const stdx = @import("stdx.zig");
 const switch_context = @import("fiber_switch.zig").switch_context;
+const Wheel = @import("timer.zig");
+const sleep = @import("sleep.zig");
 
 const Io = std.Io;
 const assert = stdx.assert;
@@ -55,8 +59,10 @@ running: bool,
 inbox: ?*Fiber,
 /// Futex word bumped after every inbox push; the carrier waits on it when it has nothing to run.
 inbox_version: u32,
-/// Polled by `run_loop` before every dispatch; null until `src/futex.zig` installs it.
-timers: ?Timers,
+/// Handler for futex waiters whose deadline passed; null until `src/futex.zig` installs it.
+expiry: ?Expiry,
+/// Deadlines of timed waits, keyed by fiber index; a fiber has at most one node.
+wheel: Wheel,
 /// Fiber `spawn_first` runs from outside `run`; `run_loop` returns once it switches out.
 first: ?*Fiber,
 
@@ -81,6 +87,8 @@ pub const Options = struct {
     fibers_max: u32,
     /// Bytes per stack, a multiple of 16 and at least `stack_size_min`.
     stack_size: u32,
+    /// `Clock.awake` reading at creation, the wheel's starting time.
+    now_ns: u64,
 };
 
 pub const InitError = error{
@@ -96,34 +104,36 @@ pub const SpawnError = error{
 
 pub const Entry = *const fn (arg: ?*anyopaque) void;
 
-/// Time source of the parked-with-deadline fibers, owned by the code that parks them.
-pub const Timers = struct {
+/// What `run_loop` calls for a fiber whose wheel node fired while it waits on a futex address;
+/// a sleeping fiber needs no handler (the scheduler unparks it itself). Only the code owning the
+/// address table can unlink the waiter from it.
+pub const Expiry = struct {
     ctx: *anyopaque,
-    /// Unparks every fiber whose deadline has passed (reading the clock through `io`) and returns
-    /// the earliest remaining deadline in `Clock.awake` nanoseconds, or null when none is pending.
-    expire: *const fn (ctx: *anyopaque, sched: *Sched, io: Io) ?i96,
+    /// Runs on the carrier with the fiber parked. Must leave the fiber unparked-and-ready with
+    /// outcome `.timed_out`, or untouched when a wake or cancel ended its wait first.
+    futex_timeout: *const fn (ctx: *anyopaque, sched: *Sched, fiber: *Fiber) void,
 };
 
 /// How a fiber's address wait ended; `futex.zig` owns the transitions.
 pub const WaitOutcome = enum { idle, waiting, woken, timed_out, canceled };
 
 /// A fiber's place in the futex table: a fiber waits on at most one address, so the record lives
-/// in the fiber and the table can neither allocate nor overflow past `fibers_max`.
+/// in the fiber and the table can neither allocate nor overflow past `fibers_max`. A sleeping
+/// fiber is in no table: it has `sleeping` set and outcome `.waiting`. Deadlines live in the
+/// scheduler's wheel, not here.
 pub const Wait = struct {
     addr: usize,
     prev: ?*Fiber,
     next: ?*Fiber,
-    /// `Clock.awake` nanoseconds; meaningful only when `timed`.
-    deadline_ns: i96,
-    timed: bool,
+    /// Carrier-only; true while parked in `sleep`.
+    sleeping: bool,
     outcome: WaitOutcome,
 
     pub const none: Wait = .{
         .addr = 0,
         .prev = null,
         .next = null,
-        .deadline_ns = 0,
-        .timed = false,
+        .sleeping = false,
         .outcome = .idle,
     };
 };
@@ -181,6 +191,10 @@ fn init_checked(
     const stacks = try gpa.alignedAlloc(u8, .@"16", arena_size);
     errdefer gpa.free(stacks);
 
+    var wheel: Wheel = undefined; // Filled by `Wheel.init` on the next line, before any read.
+    try wheel.init(gpa, .{ .nodes_max = options.fibers_max, .now_ns = options.now_ns });
+    errdefer wheel.deinit(gpa);
+
     target.* = .{
         .fibers = fibers,
         .stacks = stacks,
@@ -195,7 +209,8 @@ fn init_checked(
         .running = false,
         .inbox = null,
         .inbox_version = 0,
-        .timers = null,
+        .expiry = null,
+        .wheel = wheel,
         .first = null,
     };
     // Reverse order so the first `spawn` takes fiber 0 and the free list stays address-ordered.
@@ -221,6 +236,7 @@ pub fn deinit(sched: *Sched, gpa: std.mem.Allocator) void {
     assert(sched.live_count == 0);
     assert(sched.current == null);
     assert(!sched.running);
+    sched.wheel.deinit(gpa);
     gpa.free(sched.stacks);
     gpa.free(sched.fibers);
     sched.* = undefined;
@@ -394,7 +410,7 @@ fn run_loop(sched: *Sched, io: Io, stop: ?*const bool) void {
         }
         const version = @atomicLoad(u32, &sched.inbox_version, .acquire);
         sched.inbox_drain();
-        const deadline_ns = if (sched.timers) |t| t.expire(t.ctx, sched, io) else null;
+        const deadline_ns = sleep.fire(sched, io);
         const fiber = sched.pop_ready() orelse {
             // Every live fiber is parked on a timer or on something another thread must deliver.
             assert(sched.parked_count == sched.live_count);
@@ -578,10 +594,14 @@ fn test_stopper(arg: ?*anyopaque) void {
     if (slot.id == 1) test_stop = true;
 }
 
+fn test_options(fibers_max: u32, stack_size: u32) Options {
+    return .{ .fibers_max = fibers_max, .stack_size = stack_size, .now_ns = 0 };
+}
+
 test "run_until stops once the flag is set and leaves the rest for a later run" {
     if (!supported) return error.SkipZigTest;
     var sched: Sched = undefined;
-    try sched.init(std.testing.allocator, .{ .fibers_max = 4, .stack_size = 64 * 1024 });
+    try sched.init(std.testing.allocator, test_options(4, 64 * 1024));
     defer sched.deinit(std.testing.allocator);
 
     var log: TestLog = .{ .sched = &sched, .ids = @splat(0), .len = 0, .fiber = null, .flag = 0 };
@@ -606,7 +626,7 @@ test "run_until stops once the flag is set and leaves the rest for a later run" 
 test "in_fiber is false on a thread that is not running the scheduler" {
     if (!supported) return error.SkipZigTest;
     var sched: Sched = undefined;
-    try sched.init(std.testing.allocator, .{ .fibers_max = 1, .stack_size = 64 * 1024 });
+    try sched.init(std.testing.allocator, test_options(1, 64 * 1024));
     defer sched.deinit(std.testing.allocator);
 
     var log: TestLog = .{ .sched = &sched, .ids = @splat(0), .len = 0, .fiber = null, .flag = 0 };
@@ -635,7 +655,7 @@ test "spawn fibers_max fibers, round-robin them, recycle the stacks" {
     if (!supported) return error.SkipZigTest;
     const fibers_max = 8;
     var sched: Sched = undefined;
-    try sched.init(std.testing.allocator, .{ .fibers_max = fibers_max, .stack_size = 64 * 1024 });
+    try sched.init(std.testing.allocator, test_options(fibers_max, 64 * 1024));
     defer sched.deinit(std.testing.allocator);
 
     var log: TestLog = .{ .sched = &sched, .ids = @splat(0), .len = 0, .fiber = null, .flag = 0 };
@@ -664,10 +684,10 @@ test "init allocates, spawn and run do not" {
     var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{});
     const gpa = failing.allocator();
     var sched: Sched = undefined;
-    try sched.init(gpa, .{ .fibers_max = 4, .stack_size = 32 * 1024 });
+    try sched.init(gpa, test_options(4, 32 * 1024));
     defer sched.deinit(gpa);
-    // Fiber table and stack arena; nothing else.
-    try std.testing.expectEqual(@as(usize, 2), failing.alloc_index);
+    // Fiber table, stack arena and wheel nodes; nothing else.
+    try std.testing.expectEqual(@as(usize, 3), failing.alloc_index);
 
     var log: TestLog = .{ .sched = &sched, .ids = @splat(0), .len = 0, .fiber = null, .flag = 0 };
     var slots: [4]TestSlot = undefined;
@@ -676,13 +696,13 @@ test "init allocates, spawn and run do not" {
         _ = try sched.spawn(test_yielder, slot);
     }
     sched.run(std.testing.io);
-    try std.testing.expectEqual(@as(usize, 2), failing.alloc_index);
+    try std.testing.expectEqual(@as(usize, 3), failing.alloc_index);
     try std.testing.expectEqual(@as(u32, 8), log.len);
 }
 
-test "init reports allocation failure at either block and frees the first" {
+test "init reports allocation failure at every block and frees the earlier ones" {
     if (!supported) return error.SkipZigTest;
-    for (0..2) |fail_index| {
+    for (0..3) |fail_index| {
         var failing = std.testing.FailingAllocator.init(
             std.testing.allocator,
             .{ .fail_index = fail_index },
@@ -690,7 +710,7 @@ test "init reports allocation failure at either block and frees the first" {
         var sched: Sched = undefined;
         try std.testing.expectError(
             error.OutOfMemory,
-            sched.init(failing.allocator(), .{ .fibers_max = 2, .stack_size = 16 * 1024 }),
+            sched.init(failing.allocator(), test_options(2, 16 * 1024)),
         );
     }
 }
@@ -713,7 +733,7 @@ fn test_waker(arg: ?*anyopaque) void {
 test "park suspends a fiber until another fiber unparks it" {
     if (!supported) return error.SkipZigTest;
     var sched: Sched = undefined;
-    try sched.init(std.testing.allocator, .{ .fibers_max = 2, .stack_size = 32 * 1024 });
+    try sched.init(std.testing.allocator, test_options(2, 32 * 1024));
     defer sched.deinit(std.testing.allocator);
 
     var log: TestLog = .{ .sched = &sched, .ids = @splat(0), .len = 0, .fiber = null, .flag = 0 };
@@ -745,7 +765,7 @@ fn test_foreign_waker(log: *TestLog, io: Io) void {
 test "unpark_foreign wakes a carrier blocked on an empty ready queue" {
     if (!supported) return error.SkipZigTest;
     var sched: Sched = undefined;
-    try sched.init(std.testing.allocator, .{ .fibers_max = 1, .stack_size = 32 * 1024 });
+    try sched.init(std.testing.allocator, test_options(1, 32 * 1024));
     defer sched.deinit(std.testing.allocator);
 
     var log: TestLog = .{ .sched = &sched, .ids = @splat(0), .len = 0, .fiber = null, .flag = 0 };
@@ -766,7 +786,7 @@ fn test_in_fiber_probe(arg: ?*anyopaque) void {
 test "in_fiber and has_free_fiber track the carrier and the fiber budget" {
     if (!supported) return error.SkipZigTest;
     var sched: Sched = undefined;
-    try sched.init(std.testing.allocator, .{ .fibers_max = 1, .stack_size = 32 * 1024 });
+    try sched.init(std.testing.allocator, test_options(1, 32 * 1024));
     defer sched.deinit(std.testing.allocator);
 
     var log: TestLog = .{ .sched = &sched, .ids = @splat(0), .len = 0, .fiber = null, .flag = 0 };
@@ -794,7 +814,7 @@ test "canary detects a clobbered stack base" {
 test "init reports FibersUnsupported before allocating" {
     var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{});
     var sched: Sched = undefined;
-    const options: Options = .{ .fibers_max = 1, .stack_size = stack_size_min };
+    const options: Options = test_options(1, stack_size_min);
     try std.testing.expectError(
         error.FibersUnsupported,
         sched.init_checked(failing.allocator(), options, false),
