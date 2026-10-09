@@ -192,3 +192,45 @@ test "sleep: a deadline in the past returns at once" {
         }
     }.scenario);
 }
+
+fn forever_sleeper(io: Io, t: *Trace) Io.Cancelable!void {
+    t.len += 1;
+    try io.vtable.sleep(io.userdata, .none);
+    t.finished += 1;
+}
+
+test "sleep: a .none sleep lasts until it is canceled" {
+    try scene.run_modes(4, struct {
+        fn scenario(rt: *Runtime) anyerror!void {
+            const io = rt.io();
+            var t: Trace = .{};
+            var sleeper = io.async(forever_sleeper, .{ io, &t });
+            var killer = io.async(cancel_it, .{ io, &sleeper });
+            try std.testing.expectError(error.Canceled, killer.await(io));
+            try expectEqual(@as(u32, 1), t.len);
+            try expectEqual(@as(u32, 0), t.finished);
+        }
+    }.scenario);
+}
+
+fn deadline_sleeper(io: Io, t: *Trace) Io.Cancelable!void {
+    const at: Io.Timestamp = .fromNanoseconds(clock_now() + 30 * ms);
+    try io.vtable.sleep(io.userdata, .{ .deadline = .{ .raw = at, .clock = .awake } });
+    t.elapsed_ns = clock_now();
+    t.finished += 1;
+}
+
+test "sleep: an absolute deadline sleeps until it, not less" {
+    try scene.run_modes(4, struct {
+        fn scenario(rt: *Runtime) anyerror!void {
+            const io = rt.io();
+            var t: Trace = .{};
+            const start = clock_now();
+            var task = io.async(deadline_sleeper, .{ io, &t });
+            try task.await(io);
+            try expectEqual(@as(u32, 1), t.finished);
+            try std.testing.expect(t.elapsed_ns - start >= 30 * ms);
+            try std.testing.expect(t.elapsed_ns - start < 400 * ms);
+        }
+    }.scenario);
+}

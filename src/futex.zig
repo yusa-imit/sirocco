@@ -226,11 +226,12 @@ pub const Table = struct {
 /// already woken or timed out this turn (it has not run yet; the request stays pending for its
 /// next cancelation point).
 pub fn cancel_wait(table: *Table, sched: *Sched, fiber: *Fiber) void {
+    if (fiber.wait.sleeping) return sleep.cancel(sched, fiber);
+
     table.acquire();
     defer table.release();
 
     assert(table.waiting <= table.waiters_max);
-    if (fiber.wait.sleeping) return sleep.cancel(sched, fiber);
     if (fiber.wait.outcome != .waiting) return;
     assert(fiber.state == .parked);
     table.remove(fiber);

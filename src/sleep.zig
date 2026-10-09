@@ -39,7 +39,7 @@ pub const Limit = union(enum) { forever, at: i96, expired };
 /// Overwrites the `sleep` slot of `vtable`. Precondition: `Sched.supported`.
 pub fn install(vtable: *Io.VTable) void {
     assert(Sched.supported);
-    assert(@sizeOf(Io.VTable) > 0);
+    assert(vtable.sleep != slot_sleep);
     vtable.sleep = slot_sleep;
 }
 
@@ -90,6 +90,7 @@ pub fn limit_of(rt: *Runtime, timeout: Io.Timeout) Limit {
 /// and returns the earliest one still pending (`Clock.awake` nanoseconds), or null. Reads no
 /// clock while no fiber has a deadline. Precondition: carrier thread, outside any fiber.
 pub fn fire(sched: *Sched, io: Io) ?i96 {
+    assert(sched.current == null);
     if (sched.wheel.count() == 0) return null;
     const now_ns = Io.Clock.awake.now(io).nanoseconds;
     _ = sched.wheel.expire(std.math.lossyCast(u64, now_ns));
@@ -109,7 +110,7 @@ pub fn fire(sched: *Sched, io: Io) ?i96 {
         fiber.wait.sleeping = false;
         fiber.wait.outcome = .timed_out;
         sched.unpark(fiber);
-    }
+    } else assert_always(false); // More due nodes than fibers: the wheel is corrupt.
     const next_ns = sched.wheel.next_deadline() orelse return null;
     return @intCast(next_ns);
 }

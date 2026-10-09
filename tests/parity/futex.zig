@@ -712,3 +712,29 @@ test "futex: a wake that beats the deadline survives the wheel node firing befor
         }
     }.scenario);
 }
+
+fn cancel_then_spin_past_deadline(
+    io: Io,
+    target: *Io.Future(Cancelable!void),
+    s: *Scene,
+) Cancelable!void {
+    // `cancel` waits for the target, so spin first: the request is the last thing this fiber does.
+    const until_ns = clock_now() + 20 * ms;
+    while (clock_now() < until_ns) std.atomic.spinLoopHint();
+    s.seen[0] += 1;
+    return target.cancel(io);
+}
+
+test "futex: a cancel that beats the deadline survives the wheel node firing first" {
+    try run_modes(4, struct {
+        fn scenario(rt: *Runtime) anyerror!void {
+            const io = rt.io();
+            var s: Scene = .{};
+            var waiter = io.async(timed_waiter_woken, .{ io, &s });
+            var killer = io.async(cancel_then_spin_past_deadline, .{ io, &waiter, &s });
+            try std.testing.expectError(error.Canceled, killer.await(io));
+            try expectEqual(@as(u32, 1), s.parked);
+            try expectEqual(@as(u32, 0), s.finished);
+        }
+    }.scenario);
+}
