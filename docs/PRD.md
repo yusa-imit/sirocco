@@ -262,6 +262,7 @@ Loop.init < 1ms)은 측정된 적이 없고 그중 둘은 더 이상 출하하�
 | 2026-10-06 | threaded + fibers | Apple arm64, macOS, ReleaseFast | 6 @ 1000 | sirocco 86056 ns mean vs `Io.Threaded` 599 ns: **fail** (unchanged by items 6-8; v0.3.0 ships with this gate failing at 1000, plan 003 revisits it) |
 | 2026-10-08 | threaded + fibers | Apple arm64, macOS, ReleaseFast | 6 @ 1 | sirocco 44 ns mean vs `Io.Threaded` 1796 ns: pass |
 | 2026-10-08 | threaded + fibers | Apple arm64, macOS, ReleaseFast | 6 @ 1000 | sirocco 28 ns mean vs `Io.Threaded` 615 ns: pass (eager start, plan 003 item 2) |
+| 2026-10-10 | threaded + fibers | Apple arm64, macOS, ReleaseFast | 7 | sirocco p50 311 us, p99 400 us late vs `Io.Threaded` p50 7.32 ms, p99 8.04 ms: pass (native sleep on the wheel, plan 003 item 4; the Threaded figure was not investigated, it is stable across runs) |
 
 v1에서 명시적으로 타겟하지 않음: HTTP req/s(std가 파서를 소유), TLS 핸드셰이크 속도(std가
 암호화를 소유), `zig build bench`로 kingdom CI 머신에서 재현 불가능한 수치.

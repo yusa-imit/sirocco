@@ -128,6 +128,21 @@ pub fn build(b: *std.Build) void {
     const bench_spawn_step = b.step("bench-spawn", "Run the io.async latency benchmark (gate 6)");
     bench_spawn_step.dependOn(&run_bench_spawn.step);
 
+    const bench_timer = b.addExecutable(.{
+        .name = "sirocco-bench-timer",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("bench/timer.zig"),
+            .target = target,
+            .optimize = .ReleaseFast,
+            .imports = &.{
+                .{ .name = "sirocco", .module = mod },
+            },
+        }),
+    });
+    const run_bench_timer = b.addRunArtifact(bench_timer);
+    const bench_timer_step = b.step("bench-timer", "Run the timer wake-error benchmark (gate 7)");
+    bench_timer_step.dependOn(&run_bench_timer.step);
+
     // Docs
     const docs = b.addInstallDirectory(.{
         .source_dir = mod_tests.getEmittedDocs(),

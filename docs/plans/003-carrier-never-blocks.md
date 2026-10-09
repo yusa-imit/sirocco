@@ -45,7 +45,7 @@ carrier owns one poller; item 7's ADR records that choice for the human to appro
       `Sched.timers` hook plan 002 item 8 called temporary. Verify: `tests/parity/time.zig` sleep
       ordering and cancel parity (in flight -> `Canceled` on both, `.blocked` -> neither); 16
       fibers sleeping 50 ms finish in < 400 ms (a stall takes 800 ms); `futex*.zig` stay green.
-- [ ] 5. `bench/timer.zig` + `zig build bench-timer`: 1 ms sleep wake error p50/p99 on `rt.io()`
+- [x] 5. `bench/timer.zig` + `zig build bench-timer`: 1 ms sleep wake error p50/p99 on `rt.io()`
       vs `rt.baselineIo()`. Verify: PRD §5 gate 7 row recorded (p99 < 2 ms and <= Threaded); a
       failing row is fixed in this item if the tick is the cause, else recorded with the cause.
 - [ ] 6. Parity harness in-fiber mode: `expectSameResultInFiber` runs the `rt.io()` side inside an
