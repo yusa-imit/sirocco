@@ -681,3 +681,34 @@ test "futex: a wake from outside any fiber releases a fiber parked on the table"
 }
 
 fn wake_nothing() void {}
+
+fn timed_waiter_woken(io: Io, s: *Scene) Cancelable!void {
+    s.parked += 1;
+    try io.futexWaitTimeout(u32, s.word(0), 0, timeout_duration(5 * ms));
+    s.finished += 1;
+}
+
+fn wake_then_spin_past_deadline(io: Io, s: *Scene) void {
+    io.futexWake(u32, s.word(0), 1);
+    const until_ns = clock_now() + 20 * ms;
+    while (clock_now() < until_ns) std.atomic.spinLoopHint();
+    s.seen[0] += 1;
+}
+
+test "futex: a wake that beats the deadline survives the wheel node firing before the fiber runs" {
+    // The waker keeps the carrier busy past the waiter's deadline, so when the scheduler next
+    // fires the wheel the waiter is already ready (woken) with its node still linked.
+    try run_modes(4, struct {
+        fn scenario(rt: *Runtime) anyerror!void {
+            const io = rt.io();
+            var s: Scene = .{};
+            var waiter = io.async(timed_waiter_woken, .{ io, &s });
+            var waker = io.async(wake_then_spin_past_deadline, .{ io, &s });
+            waker.await(io);
+            try waiter.await(io);
+            try expectEqual(@as(u32, 1), s.parked);
+            try expectEqual(@as(u32, 1), s.finished);
+            try expectEqual(@as(u32, 1), s.seen[0]);
+        }
+    }.scenario);
+}

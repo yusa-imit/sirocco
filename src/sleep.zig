@@ -96,13 +96,15 @@ pub fn fire(sched: *Sched, io: Io) ?i96 {
     for (0..sched.fibers.len) |_| {
         const index = sched.wheel.pop_due() orelse break;
         const fiber = &sched.fibers[index];
-        assert(fiber.state == .parked);
         if (!fiber.wait.sleeping) {
-            // The handler re-checks under the table lock: a wake may have ended the wait already.
+            // A wake that beat the deadline leaves the node linked and the fiber possibly ready,
+            // so the handler re-checks under the table lock before it touches the fiber.
             const expiry = sched.expiry.?;
             expiry.futex_timeout(expiry.ctx, sched, fiber);
             continue;
         }
+        // Only the wheel and `cancel` end a sleep, and `cancel` unlinks the node.
+        assert(fiber.state == .parked);
         assert(fiber.wait.outcome == .waiting);
         fiber.wait.sleeping = false;
         fiber.wait.outcome = .timed_out;

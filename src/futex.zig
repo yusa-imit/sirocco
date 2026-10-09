@@ -205,14 +205,16 @@ pub const Table = struct {
 
     /// The wheel node of `fiber` fired: if it still waits, takes it out of the table and makes it
     /// runnable with outcome `.timed_out`. A no-op when a wake or cancel ended the wait first.
-    /// Precondition: carrier thread, `fiber` parked.
+    /// Precondition: carrier thread.
     pub fn timeout(table: *Table, sched: *Sched, fiber: *Fiber) void {
-        assert(fiber.state == .parked);
         table.acquire();
         defer table.release();
 
         assert(table.waiting <= table.waiters_max);
+        // A wake or cancel that came first set another outcome and made the fiber ready (or it
+        // still runs toward its park); its node stays linked until it runs again.
         if (fiber.wait.outcome != .waiting) return;
+        assert(fiber.state == .parked);
         table.remove(fiber);
         fiber.wait.outcome = .timed_out;
         sched.unpark(fiber);
