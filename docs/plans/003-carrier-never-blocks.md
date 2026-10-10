@@ -48,7 +48,7 @@ carrier owns one poller; item 7's ADR records that choice for the human to appro
 - [x] 5. `bench/timer.zig` + `zig build bench-timer`: 1 ms sleep wake error p50/p99 on `rt.io()`
       vs `rt.baselineIo()`. Verify: PRD §5 gate 7 row recorded (p99 < 2 ms and <= Threaded); a
       failing row is fixed in this item if the tick is the cause, else recorded with the cause.
-- [ ] 6. Parity harness in-fiber mode: `expectSameResultInFiber` runs the `rt.io()` side inside an
+- [x] 6. Parity harness in-fiber mode: `expectSameResultInFiber` runs the `rt.io()` side inside an
       `async` task. Why before 7-8: every parity call today runs off-fiber, where offload never
       engages, so item 8 would otherwise be verified by nothing. Verify: `zig build test` runs
       the `dir.zig`, `time.zig` and `futex.zig` tables in both modes.
