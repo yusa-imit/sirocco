@@ -175,6 +175,16 @@ pub fn sched_ensure(rt: *Runtime) void {
                     return;
                 },
             };
+            rt.offload.init(rt.threaded.allocator, rt.baselineIo(), &rt.sched, .{
+                .threads_count = rt.offload_threads,
+                .queued_max = rt.fibers_max,
+            }) catch |err| switch (err) {
+                error.OutOfMemory, error.ThreadSpawnFailed => {
+                    rt.sched.deinit(rt.threaded.allocator);
+                    rt.sched_state = .unavailable;
+                    return;
+                },
+            };
             rt.sched.expiry = futex.expiry(&rt.waits);
             rt.sched_pin = @intFromPtr(&rt.sched);
             rt.sched_state = .ready;

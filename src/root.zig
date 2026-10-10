@@ -18,4 +18,5 @@ test {
     // Internal substrate: tested here, deliberately not public (ADR 0001: the surface is `Io`).
     _ = @import("sched.zig");
     _ = @import("timer.zig");
+    _ = @import("offload.zig");
 }

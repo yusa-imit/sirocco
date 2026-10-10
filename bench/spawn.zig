@@ -80,6 +80,7 @@ pub fn main(init: std.process.Init) !void {
         .argv0 = .empty,
         .fibers_max = in_flight_max,
         .fiber_stack_size = 64 * 1024,
+        .offload_threads = 1,
     });
     defer rt.deinit();
 

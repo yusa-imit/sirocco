@@ -9,12 +9,17 @@ exemption recorded in `citadel/protocol/VERSIONING.md`.
 
 ### Added
 
+- `src/offload.zig`: a bounded worker-thread pool that runs a blocking call for a parked fiber
+  and wakes it through `Sched.unpark_foreign` (plan `003` item 7, ADR 0002). `Runtime.Options`
+  gains the required field `offload_threads`; the pool is built with the scheduler at the first
+  `io()`. No slot uses it yet (item 8). Internal.
 - `src/timer.zig`: a hierarchical timing wheel (131 us tick, bounded node array, no allocation
   after `init`, clock passed in) that native `sleep` and futex timeouts run on (plan `003`
   item 3). Internal.
 
 ### Changed
 
+- **Breaking (0.x MINOR):** `Runtime.Options` gains the required field `offload_threads`.
 - `sleep` is native: a fiber in `rt.io().sleep` parks on the scheduler's timing wheel instead of
   blocking the carrier thread, so other fibers keep running; a cancel wakes it with
   `error.Canceled`. CPU-time clocks and calls from outside a fiber still forward to `Io.Threaded`.
