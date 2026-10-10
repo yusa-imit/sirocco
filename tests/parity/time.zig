@@ -26,6 +26,7 @@ test "clockResolution agrees with the baseline for every clock" {
     inline for (@typeInfo(Io.Clock).@"enum".fields) |field| {
         const clock: Io.Clock = @enumFromInt(field.value);
         try harness.expectSameResult(&rt, resolution, .{clock});
+        try harness.expectSameResultInFiber(&rt, resolution, .{clock});
     }
 }
 
@@ -46,6 +47,7 @@ test "sleep is sirocco's own slot, and the baseline's agrees on a short real sle
         !Runtime.fibers_supported);
     inline for (.{ Io.Clock.awake, Io.Clock.real, Io.Clock.boot }) |clock| {
         try harness.expectSameResult(&rt, sleep_ms, .{ 1, clock });
+        try harness.expectSameResultInFiber(&rt, sleep_ms, .{ 1, clock });
     }
 }
 

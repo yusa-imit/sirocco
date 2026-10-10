@@ -11,6 +11,9 @@
 //! handle (`dirOpenFile`, `netConnectIp`) needs its own setup/projection helper before it can be
 //! compared; payloads containing pointers are refused at compile time for the same reason.
 //!
+//! `expectSameResultInFiber` runs the native side inside an `async` task instead, so the fiber
+//! paths of a slot (parking, offload) are compared too.
+//!
 //! The harness compares outcomes only. It keeps no state, allocates nothing, and reports every
 //! mismatch as `error.TestExpectedEqual`, the error `std.testing` uses for a failed comparison.
 
@@ -25,6 +28,26 @@ const assert = std.debug.assert;
 /// remaining arguments (each call gets its own copy, so `call` may not rely on shared mutation);
 /// `rt` has been initialised and has not moved since its first `io()`.
 pub fn expectSameResult(rt: *Runtime, comptime call: anytype, args: anytype) !void {
+    return expect_same_result(rt, call, args, .off_fiber);
+}
+
+/// Like `expectSameResult`, but the `rt.io()` side runs inside an `async` task, so a slot that
+/// parks the fiber (sleep, futex) or hands work off the carrier (offload, plan 003 items 7-8) is
+/// exercised on its fiber path; off-fiber those paths never engage. The baseline still runs
+/// off-fiber, as `Io.Threaded` has no fibers. Same preconditions; `call` also needs one free
+/// fiber, else the task runs inline and the call degrades to `expectSameResult`.
+pub fn expectSameResultInFiber(rt: *Runtime, comptime call: anytype, args: anytype) !void {
+    return expect_same_result(rt, call, args, .in_fiber);
+}
+
+const Placement = enum { off_fiber, in_fiber };
+
+fn expect_same_result(
+    rt: *Runtime,
+    comptime call: anytype,
+    args: anytype,
+    comptime placement: Placement,
+) !void {
     const fn_info = @typeInfo(@TypeOf(call)).@"fn";
     comptime assert(fn_info.params.len == args.len + 1);
     comptime assert(fn_info.params[0].type == std.Io);
@@ -33,9 +56,21 @@ pub fn expectSameResult(rt: *Runtime, comptime call: anytype, args: anytype) !vo
     const baseline_io = rt.baselineIo();
     assert(native_io.vtable != baseline_io.vtable);
 
-    const native = @call(.auto, call, .{native_io} ++ args);
+    const native = switch (placement) {
+        .off_fiber => @call(.auto, call, .{native_io} ++ args),
+        .in_fiber => call_in_fiber(native_io, call, args),
+    };
     const baseline = @call(.auto, call, .{baseline_io} ++ args);
     return expectSameOutcome(native, baseline);
+}
+
+fn call_in_fiber(
+    io: std.Io,
+    comptime call: anytype,
+    args: anytype,
+) @typeInfo(@TypeOf(call)).@"fn".return_type.? {
+    var future = io.async(call, .{io} ++ args);
+    return future.await(io);
 }
 
 fn expectSameOutcome(native: anytype, baseline: anytype) !void {
@@ -103,6 +138,54 @@ test "identical values and identical errors pass" {
 
     try expectSameResult(&rt, both_value, .{2});
     try expectSameResult(&rt, both_error, .{0});
+}
+
+const Probe = struct {
+    fiber_calls: u32 = 0,
+    calls: u32 = 0,
+};
+
+fn record_context(io: std.Io, rt: *Runtime, probe: *Probe) void {
+    _ = io;
+    probe.calls += 1;
+    if (rt.sched.in_fiber()) probe.fiber_calls += 1;
+}
+
+test "expectSameResultInFiber runs only the native side inside a fiber" {
+    if (!Runtime.fibers_supported) return error.SkipZigTest;
+    var rt = try fixtures.init_runtime(.forward);
+    defer rt.deinit();
+
+    var probe: Probe = .{};
+    try expectSameResultInFiber(&rt, record_context, .{ &rt, &probe });
+    try std.testing.expectEqual(@as(u32, 2), probe.calls);
+    try std.testing.expectEqual(@as(u32, 1), probe.fiber_calls);
+
+    probe = .{};
+    try expectSameResult(&rt, record_context, .{ &rt, &probe });
+    try std.testing.expectEqual(@as(u32, 2), probe.calls);
+    try std.testing.expectEqual(@as(u32, 0), probe.fiber_calls);
+}
+
+test "expectSameResultInFiber catches mismatches and carries values and errors" {
+    var rt = try fixtures.init_runtime(.forward);
+    defer rt.deinit();
+
+    try expectSameResultInFiber(&rt, both_value, .{2});
+    try expectSameResultInFiber(&rt, both_error, .{0});
+    const native_vtable: *const std.Io.VTable = rt.io().vtable;
+    try std.testing.expectError(
+        error.TestExpectedEqual,
+        expectSameResultInFiber(&rt, is_native, .{native_vtable}),
+    );
+    try std.testing.expectError(
+        error.TestExpectedEqual,
+        expectSameResultInFiber(&rt, native_only_error, .{native_vtable}),
+    );
+    try std.testing.expectError(
+        error.TestExpectedEqual,
+        expectSameResultInFiber(&rt, error_names_differ, .{native_vtable}),
+    );
 }
 
 test "a payload mismatch is caught" {
