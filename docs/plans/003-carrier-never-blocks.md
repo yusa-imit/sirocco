@@ -52,7 +52,7 @@ carrier owns one poller; item 7's ADR records that choice for the human to appro
       `async` task. Why before 7-8: every parity call today runs off-fiber, where offload never
       engages, so item 8 would otherwise be verified by nothing. Verify: `zig build test` runs
       the `dir.zig`, `time.zig` and `futex.zig` tables in both modes.
-- [ ] 7. `docs/adr/0002-offload-before-multi-carrier.md` and `src/offload.zig`: `offload_threads`
+- [x] 7. `docs/adr/0002-offload-before-multi-carrier.md` and `src/offload.zig`: `offload_threads`
       workers (new required `Options` field) spawned in `init`, an intrusive request queue whose
       records live on the parked fiber's stack (bounded by `fibers_max`), completion through
       `Sched.unpark_foreign`, join in `deinit`. The ADR also records why `now`/`clockResolution`

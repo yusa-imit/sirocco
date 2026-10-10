@@ -31,6 +31,7 @@ pub fn init_runtime_in(
         .argv0 = .empty,
         .fibers_max = fibers_max,
         .fiber_stack_size = fiber_stack_size_default,
+        .offload_threads = 2,
     });
 }
 

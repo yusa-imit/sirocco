@@ -22,7 +22,8 @@
 //!
 //! Allocation: `init` allocates nothing itself; `gpa` is handed to `Io.Threaded`, which uses it
 //! lazily for `groupAsync`/`groupConcurrent` closures, thread stacks and process spawn. The first
-//! `io()` allocates the fiber table and stacks (two blocks) from the same `gpa`, and the native
+//! `io()` allocates the fiber table, stacks and wheel nodes plus the offload pool's thread handles
+//! (four blocks) from the same `gpa` and spawns `offload_threads` workers, and the native
 //! `async` still allocates one task record per started task, as Threaded does; "no allocation
 //! after init" becomes true per slot group in later plan-002 items.
 //!
@@ -40,6 +41,7 @@ const Sched = @import("sched.zig");
 const concurrency = @import("concurrency.zig");
 const futex = @import("futex.zig");
 const sleep = @import("sleep.zig");
+const Offload = @import("offload.zig");
 
 const assert = stdx.assert;
 
@@ -62,6 +64,9 @@ sched_state: SchedState,
 sched_pin: usize,
 fibers_max: u32,
 fiber_stack_size: u32,
+offload_threads: u32,
+/// The blocking-call pool (`src/offload.zig`); valid only while `sched_state == .ready`.
+offload: Offload,
 
 /// True when the native future-producing slots (and with them the fiber scheduler) exist here.
 pub const fibers_supported = Sched.supported;
@@ -105,6 +110,10 @@ pub const Options = struct {
     /// Bytes per fiber stack: a multiple of 16, at least `Sched.stack_size_min`. std's `Io` call
     /// chain runs on these stacks, so Debug builds want well over the minimum.
     fiber_stack_size: u32,
+    /// Worker threads of the offload pool (`src/offload.zig`), spawned at the first `io()`;
+    /// positive. A blocking call holds a worker until it returns, so a call that waits on another
+    /// (an accept on a connect) needs at least as many workers as such calls in flight.
+    offload_threads: u32,
 };
 
 pub const InitError = error{
@@ -125,6 +134,7 @@ pub fn init(gpa: std.mem.Allocator, options: Options) InitError!Runtime {
     assert(options.fibers_max > 0);
     assert(options.fiber_stack_size >= Sched.stack_size_min);
     assert(options.fiber_stack_size % 16 == 0);
+    assert(options.offload_threads > 0);
 
     var threaded: Io.Threaded = .init(gpa, .{
         .stack_size = std.Thread.SpawnConfig.default_stack_size,
@@ -154,6 +164,8 @@ pub fn init(gpa: std.mem.Allocator, options: Options) InitError!Runtime {
         .sched_pin = 0,
         .fibers_max = options.fibers_max,
         .fiber_stack_size = options.fiber_stack_size,
+        .offload_threads = options.offload_threads,
+        .offload = undefined, // Built in place with `sched`, never read before `.ready`.
     };
 }
 
@@ -164,6 +176,7 @@ pub fn deinit(rt: *Runtime) void {
     assert(rt.backend == .threaded);
     if (rt.sched_state == .ready) {
         assert(rt.sched_pin == @intFromPtr(&rt.sched));
+        rt.offload.deinit(rt.threaded.allocator);
         rt.sched.deinit(rt.threaded.allocator);
     }
     rt.threaded.deinit();
@@ -196,6 +209,7 @@ fn test_options(backend: Backend, unimplemented: Unimplemented) Options {
         .argv0 = .empty,
         .fibers_max = 4,
         .fiber_stack_size = 64 * 1024,
+        .offload_threads = 2,
     };
 }
 
