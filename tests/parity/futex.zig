@@ -126,6 +126,8 @@ test "futex: a wait on a changed value returns, on both Io values, in and out of
             try harness.expectSameResult(rt, async_wait_mismatch, .{});
             try harness.expectSameResult(rt, wake_nobody, .{});
             try harness.expectSameResult(rt, async_wake_nobody, .{});
+            try harness.expectSameResultInFiber(rt, wait_mismatch, .{});
+            try harness.expectSameResultInFiber(rt, wake_nobody, .{});
             try wait_mismatch(rt.io());
         }
     }.scenario);
@@ -136,6 +138,8 @@ test "futex: a timed-out wait reports error.Timeout through Event.waitTimeout, a
         fn scenario(rt: *Runtime) anyerror!void {
             try harness.expectSameResult(rt, async_event_times_out, .{});
             try harness.expectSameResult(rt, async_event_already_set, .{});
+            try harness.expectSameResultInFiber(rt, event_times_out, .{});
+            try harness.expectSameResultInFiber(rt, event_already_set, .{});
             const io = rt.io();
             try std.testing.expectError(error.Timeout, async_event_times_out(io));
             try async_event_already_set(io);

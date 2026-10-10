@@ -23,6 +23,8 @@ test "dirAccess agrees on an existing and a missing path" {
 
     try harness.expectSameResult(&rt, access, .{"."});
     try harness.expectSameResult(&rt, access, .{"sirocco-parity-no-such-path"});
+    try harness.expectSameResultInFiber(&rt, access, .{"."});
+    try harness.expectSameResultInFiber(&rt, access, .{"sirocco-parity-no-such-path"});
     try std.testing.expectError(
         error.FileNotFound,
         access(rt.io(), "sirocco-parity-no-such-path"),
@@ -35,5 +37,7 @@ test "dirStatFile agrees on the kind of the working directory and of a missing p
 
     try harness.expectSameResult(&rt, stat_file, .{"."});
     try harness.expectSameResult(&rt, stat_file, .{"sirocco-parity-no-such-path"});
+    try harness.expectSameResultInFiber(&rt, stat_file, .{"."});
+    try harness.expectSameResultInFiber(&rt, stat_file, .{"sirocco-parity-no-such-path"});
     try std.testing.expectEqual(Io.File.Kind.directory, try stat_file(rt.io(), "."));
 }
