@@ -137,6 +137,11 @@ pub const Runtime = struct {
         pending_ops_max: u32 = 4096,
         sockets_max: u32 = 4096,
         timers_max: u32 = 4096,
+        /// Worker threads that run forwarded blocking calls (`dir*`, `file*`, `net*`) while
+        /// their fiber parks (ADR 0002). Positive. A call holds a worker until it returns, so
+        /// calls that wait on each other (accept on connect) need that many workers. In the
+        /// shipped v0.4.0 this field is required and the sketch's defaults are not.
+        offload_threads: u32 = 4,
     };
 
     pub const InitError = error{
@@ -194,7 +199,9 @@ pub fn main(init: std.process.Init) !void {
   `checkCancel`
 - **P1 — futex (3)**: `Io.Mutex`/`Condition`/`Event`/`Semaphore`/`RwLock`/`Queue`가 모두 이
   세 개 위에 세워진다. `futexWait` · `futexWaitUncancelable` · `futexWake`
-- **P2 — 시간 (3)**: `now` · `clockResolution` · `sleep` (`Io.Timeout` = `.none | .duration |
+- **P2 — 시간 (3)** (v0.4.0: `sleep`은 타이밍 휠 위에서 네이티브, `now`/`clockResolution`은
+  블로킹하지 않으므로 위임 유지; v0.4.0에서 P4/P5의 블로킹 슬롯은 오프로드 풀로 우회):
+  `now` · `clockResolution` · `sleep` (`Io.Timeout` = `.none | .duration |
   .deadline` 을 받는다; 공개 `io.sleep(duration, clock)`은 별도 2-인자 형태)
 - **P3 — 제출 엔진 (4)**: `Io.Operation`이 `file_read_streaming`, `file_write_streaming`,
   `device_io_control`, `net_receive`를 포함한다 — 즉 모든 스트리밍 read/write와 모든

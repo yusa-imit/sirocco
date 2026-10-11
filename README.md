@@ -20,14 +20,16 @@ epoll(Linux) 백엔드로 109개 vtable 슬롯을 채우고, 아직 네이티브
 
 ## Status
 
-**v0.3.0 — 내부 마일스톤, 소비자용 아님.** 설계는 `docs/adr/0001-std-io-vtable.md`로
+**v0.4.0 — 내부 마일스톤, 소비자용 아님.** 설계는 `docs/adr/0001-std-io-vtable.md`로
 확정되었고, 109개 슬롯 중 `Runtime`이 네이티브로 구현한 것은 파이버 위의
-동시성·취소·futex 슬롯(`async`/`await`/`cancel`, `group*`, `checkCancel`/`recancel`/
-`swapCancelProtection`, `futexWait`/`futexWake`, `crashHandler`)이고 `concurrent`는 항상
-`error.ConcurrencyUnavailable`을 반환한다. 나머지 슬롯은 전부 내장 `Io.Threaded`로 위임된다
-(`Options.unimplemented`). 캐리어 스레드가 하나뿐이라 위임된 블로킹 슬롯(파일, 디렉터리,
-네트워크, `sleep`)은 모든 파이버를 멈춘다 — silica/zoltraak에 쓸 준비가 되지 않았고, 이
-제약은 plan 003이 제거한다. 파이버 스케줄러는 aarch64/x86_64에서만 동작하며
+동시성·취소·futex·`sleep` 슬롯(`async`/`await`/`cancel`, `group*`, `checkCancel`/`recancel`/
+`swapCancelProtection`, `futexWait`/`futexWake`, `sleep`, `crashHandler`)이고 `concurrent`는
+항상 `error.ConcurrencyUnavailable`을 반환한다. 나머지 슬롯은 내장 `Io.Threaded`로 위임된다
+(`Options.unimplemented`). 위임된 블로킹 슬롯(파일, 디렉터리, 네트워크)은 오프로드 풀
+(`Options.offload_threads`)의 워커 스레드에서 실행되고 호출한 파이버만 멈추므로 캐리어는
+막히지 않는다 (`docs/adr/0002-offload-before-multi-carrier.md`; 캐리어는 아직 하나이고
+`close`/`shutdown` 등 가벼운 호출은 캐리어에서 실행된다). silica/zoltraak에 쓸 준비는
+아직 되지 않았다. 파이버 스케줄러는 aarch64/x86_64에서만 동작하며
 (`Runtime.fibers_supported`), 그 외 타깃에서는 슬롯이 위임 상태로 남는다. 작업 순서는
 `docs/plans/`가 기준이다. 안정 릴리즈 전까지 API는 변경될 수 있다.
 
@@ -63,7 +65,7 @@ pub fn main(init: std.process.Init) !void {
 ## Install
 
 ```
-zig fetch --save https://github.com/yusa-imit/sirocco/archive/refs/tags/v0.3.0.tar.gz
+zig fetch --save https://github.com/yusa-imit/sirocco/archive/refs/tags/v0.4.0.tar.gz
 ```
 
 ```zig

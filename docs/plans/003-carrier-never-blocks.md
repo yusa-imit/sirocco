@@ -68,7 +68,7 @@ carrier owns one poller; item 7's ADR records that choice for the human to appro
       and the cheap or unblocking calls (closes, `netShutdown`, seeks, memory-map allocation). Verify: fiber A `netAccept`s while fiber B `netConnectIp`s on one
       `rt.io()` over loopback (deadlocks on v0.3.0); `dir.zig` in-fiber parity; a comptime test
       that each thunk's type equals its field type.
-- [ ] 9. Reconcile README (drop "stalls every fiber"), CHANGELOG, PRD §4.1/§4.3/§5 with what
+- [x] 9. Reconcile README (drop "stalls every fiber"), CHANGELOG, PRD §4.1/§4.3/§5 with what
       shipped, bump `build.zig.zon` to 0.4.0 and release. Verify: `gh release view v0.4.0`.
 
 `blocked_by`: none — zero-dependency foundation, and no kingdom repo pins sirocco yet.

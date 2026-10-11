@@ -7,6 +7,8 @@ exemption recorded in `citadel/protocol/VERSIONING.md`.
 
 ## [Unreleased]
 
+## [0.4.0] - 2026-10-11
+
 ### Added
 
 - `src/offload.zig`: a bounded worker-thread pool that runs a blocking call for a parked fiber
