@@ -255,8 +255,11 @@ test "delegated slots are the baseline's own function, native ones are not" {
 
     const vtable = rt.io().vtable;
     const baseline = rt.baselineIo().vtable;
+    // Offloaded slots are thunks over the baseline's function, so they differ from it too, and
+    // only where fibers exist.
     inline for (delegated) |name| {
-        try std.testing.expect(@field(vtable, name) == @field(baseline, name));
+        const thunked = Runtime.fibers_supported and Runtime.is_offloaded(name);
+        try std.testing.expectEqual(!thunked, @field(vtable, name) == @field(baseline, name));
     }
     // Native slots exist only where the fiber switch does; elsewhere they stay forwarded.
     const expect_native = Runtime.fibers_supported;

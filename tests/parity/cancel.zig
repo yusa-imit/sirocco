@@ -69,11 +69,11 @@ test "swapCancelProtection returns the previous state; a task holds its own" {
 
 /// Holds a task before its first cancelation point: `async` runs the task up to this wait, the
 /// test opens the gate, and the task proceeds only when the scheduler next runs it.
-fn gate_wait(io: Io, gate: *u32) void {
+pub fn gate_wait(io: Io, gate: *u32) void {
     while (@atomicLoad(u32, gate, .acquire) == 0) io.futexWaitUncancelable(u32, gate, 0);
 }
 
-fn gate_open(io: Io, gate: *u32) void {
+pub fn gate_open(io: Io, gate: *u32) void {
     @atomicStore(u32, gate, 1, .release);
     io.futexWake(u32, gate, 16);
 }

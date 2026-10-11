@@ -24,6 +24,16 @@ pub fn init_runtime_in(
     unimplemented: Runtime.Unimplemented,
     fibers_max: u32,
 ) Runtime.InitError!Runtime {
+    return init_runtime_pool(gpa, unimplemented, fibers_max, 2);
+}
+
+/// Like `init_runtime_in` with an explicit offload pool size, for tests of the sizing rule.
+pub fn init_runtime_pool(
+    gpa: std.mem.Allocator,
+    unimplemented: Runtime.Unimplemented,
+    fibers_max: u32,
+    offload_threads: u32,
+) Runtime.InitError!Runtime {
     return Runtime.init(gpa, .{
         .backend = .threaded,
         .unimplemented = unimplemented,
@@ -31,7 +41,7 @@ pub fn init_runtime_in(
         .argv0 = .empty,
         .fibers_max = fibers_max,
         .fiber_stack_size = fiber_stack_size_default,
-        .offload_threads = 2,
+        .offload_threads = offload_threads,
     });
 }
 
