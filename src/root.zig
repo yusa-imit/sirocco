@@ -19,4 +19,5 @@ test {
     _ = @import("sched.zig");
     _ = @import("timer.zig");
     _ = @import("offload.zig");
+    _ = @import("offload_slots.zig");
 }

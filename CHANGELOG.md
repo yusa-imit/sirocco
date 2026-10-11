@@ -12,7 +12,13 @@ exemption recorded in `citadel/protocol/VERSIONING.md`.
 - `src/offload.zig`: a bounded worker-thread pool that runs a blocking call for a parked fiber
   and wakes it through `Sched.unpark_foreign` (plan `003` item 7, ADR 0002). `Runtime.Options`
   gains the required field `offload_threads`; the pool is built with the scheduler at the first
-  `io()`. No slot uses it yet (item 8). Internal.
+  `io()`. Internal.
+- `src/offload_slots.zig`: in `.forward` mode the blocking `dir*`, `file*` and `net*` slots (except
+  `netLookup`), `operate` and `childWait` run on the offload pool while the calling fiber parks, so
+  one blocked call no longer freezes the carrier; a pending cancel is delivered before submit
+  (plan `003` item 8, ADR 0002). Closes, `netShutdown`, seeks and memory-map allocation stay on
+  the carrier. Off a fiber the slots still call `Io.Threaded` directly. `Runtime.init`'s `gpa`
+  must be thread-safe.
 - `src/timer.zig`: a hierarchical timing wheel (131 us tick, bounded node array, no allocation
   after `init`, clock passed in) that native `sleep` and futex timeouts run on (plan `003`
   item 3). Internal.

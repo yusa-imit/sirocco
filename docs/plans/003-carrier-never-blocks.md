@@ -59,12 +59,13 @@ carrier owns one poller; item 7's ADR records that choice for the human to appro
       stay delegated (they never block; native buys nothing until a backend owns a clock).
       Verify: `src/offload.zig` tests — `fibers_max` fibers each offload a 20 ms blocking job and
       overlap; allocation counter flat after init (gate 5); `deinit` joins idle workers.
-- [ ] 8. Offload the declared blocking set — `dir*`, `file*`, `net*`, `operate`, `childWait` —
-      through comptime thunks built from each `VTable` field type in `src/runtime.zig`, still the
-      only file naming slots. A pending cancel is checked before submit when the error set has
-      `Canceled`; once submitted the call completes, as ADR 0001 allows. Excluded, reasons in
-      ADR 0002: `batch*` (Threaded's own concurrency), `*Stderr` (thread-owned lock), `process*`
-      (process-global state). Verify: fiber A `netAccept`s while fiber B `netConnectIp`s on one
+- [x] 8. Offload the declared blocking set — `dir*`, `file*`, `net*`, `operate`, `childWait` —
+      through comptime thunks built from each `VTable` field type (`src/offload_slots.zig`,
+      installed by `src/runtime.zig`). A pending cancel is checked before submit when the error
+      set has `Canceled`; once submitted the call completes, as ADR 0001 allows. Excluded,
+      reasons in ADR 0002: `batch*` (Threaded's own concurrency), `*Stderr` (thread-owned lock),
+      `process*` (process-global state), `netLookup` (queue woken through the baseline futex),
+      and the cheap or unblocking calls (closes, `netShutdown`, seeks, memory-map allocation). Verify: fiber A `netAccept`s while fiber B `netConnectIp`s on one
       `rt.io()` over loopback (deadlocks on v0.3.0); `dir.zig` in-fiber parity; a comptime test
       that each thunk's type equals its field type.
 - [ ] 9. Reconcile README (drop "stalls every fiber"), CHANGELOG, PRD §4.1/§4.3/§5 with what

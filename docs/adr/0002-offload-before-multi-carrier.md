@@ -58,6 +58,10 @@ carriers first would fix a placement policy before the thing it places exists.
 | `batch*` | Threaded's own batch machinery already runs its operations concurrently. |
 | `lockStderr`, `tryLockStderr`, `unlockStderr` | The lock is owned by a thread; locking on a worker and unlocking on the carrier would unlock a lock the carrier never held. |
 | `process*`, `child*` except `childWait` | Process-global state (signal handlers, the environ block) with no blocking wait. `childWait` blocks and is offloaded. |
+| `netLookup` | It fills a caller's `Io.Queue` through the baseline's futexes, which sirocco's native futex table never sees, so a fiber waiting on that queue would not wake. It also blocks its worker whenever the queue is full. |
+| `netShutdown`, the `*Close` calls, `fileUnlock`, `fileSeekBy`/`fileSeekTo`, `fileIsTty`, the ANSI queries, `netInterfaceName*` | They never block for long, so two hand-offs cost more than the call. `netShutdown` and the closes also end calls parked in a read or accept; queued behind workers held by those calls they could never run. |
+| `fileMemoryMapCreate`, `fileMemoryMapSetLength`, `fileMemoryMapDestroy` | They allocate from the runtime's `gpa`, which the carrier uses too; a worker must not. |
+| `netWriteFile` | `Io.Threaded` implements it as a TODO panic. |
 | `now`, `clockResolution` | They never block. A native version buys nothing until a backend owns a clock. They stay delegated. |
 | `random`, `randomSecure` | They never block for a meaningful time. |
 
@@ -69,6 +73,9 @@ carriers first would fix a placement policy before the thing it places exists.
   calls that block for milliseconds and the reason P3/P4 still make `net*` and `file*` native.
 - `Options` gains a required field, so `Runtime.init` call sites break: MINOR in `0.x`.
 - Each slot leaves the offload set when it turns native.
+- A started call cannot be interrupted, so a `cancel` of a task parked in an offloaded
+  `netAccept` or read waits until the call returns; the request is delivered at the task's next
+  cancelation point. Closing or shutting down the socket from another fiber ends the call.
 - Observed during item 7 (cause not investigated): 16 concurrent `Io.sleep` calls of 20 ms on
   `Io.Threaded` took 160 ms on the aarch64 dev box, so its sleep does not overlap well; this
   may relate to the slow Threaded row of PRD gate 7. Tests that need concurrent blocking jobs

@@ -10,7 +10,9 @@
 //! `futexWaitUncancelable`, `futexWake`; `src/futex.zig`) and `sleep` (`src/sleep.zig`, on the
 //! scheduler's timing wheel), installed in both modes. Where
 //! `fibers_supported` is false (Windows, 32-bit and other architectures) the set is not installed
-//! and stays forwarded, so `.auto` and `.threaded` keep working on every target.
+//! and stays forwarded, so `.auto` and `.threaded` keep working on every target. In `.forward`
+//! mode the blocking `dir*`/`file*`/`net*` slots, `operate` and `childWait` are thunks that run
+//! the baseline call on the offload pool while the fiber parks (`src/offload_slots.zig`).
 //!
 //! Invariants: the vtable has exactly 109 slots (`slots_count`, a comptime guard against a std
 //! bump); no field of `Runtime` holds a pointer into `Runtime` — `io()` and `baselineIo()` are
@@ -42,6 +44,7 @@ const concurrency = @import("concurrency.zig");
 const futex = @import("futex.zig");
 const sleep = @import("sleep.zig");
 const Offload = @import("offload.zig");
+const offload_slots = @import("offload_slots.zig");
 
 const assert = stdx.assert;
 
@@ -70,6 +73,9 @@ offload: Offload,
 
 /// True when the native future-producing slots (and with them the fiber scheduler) exist here.
 pub const fibers_supported = Sched.supported;
+
+/// True when the slot called `name` runs on the offload pool where fibers exist (`.forward` mode).
+pub const is_offloaded = offload_slots.is_offloaded;
 
 /// Life cycle of `sched`; `.unsupported` is a comptime fact of the target, `.unavailable` is the
 /// outcome of an out-of-memory scheduler build (async then runs inline, concurrent refuses).
@@ -121,8 +127,9 @@ pub const InitError = error{
     BackendUnavailable,
 };
 
-/// Builds a runtime. Precondition: `options` is fully specified; no default is implied, and the
-/// fiber limits satisfy `Sched.Options`. The result becomes self-referential at the first
+/// Builds a runtime. Precondition: `options` is fully specified; no default is implied, the
+/// fiber limits satisfy `Sched.Options`, and `gpa` is thread-safe (offload workers and the
+/// embedded `Io.Threaded` allocate from it on their own threads). The result becomes self-referential at the first
 /// `io()`/`baselineIo()` call (std stores `Threaded.io()` inside `Threaded` itself) and, through
 /// the scheduler, at the first `io()`; do not move it after that.
 pub fn init(gpa: std.mem.Allocator, options: Options) InitError!Runtime {
@@ -152,6 +159,11 @@ pub fn init(gpa: std.mem.Allocator, options: Options) InitError!Runtime {
         concurrency.install(&base);
         futex.install(&base);
         sleep.install(&base);
+        // The thunks call the baseline, so under `.fail` the slots stay `Io.failing`'s.
+        switch (options.unimplemented) {
+            .forward => offload_slots.install(&base),
+            .fail => {},
+        }
     }
     return .{
         .threaded = threaded,
@@ -252,7 +264,7 @@ test "io() and baselineIo() share userdata but not the vtable" {
     try std.testing.expect(native.userdata != null);
 }
 
-test "forward mode installs every baseline slot except the native future set" {
+test "forward mode installs every baseline slot except the native and offloaded sets" {
     var rt: Runtime = try .init(std.testing.allocator, test_options(.threaded, .forward));
     defer rt.deinit();
 
@@ -260,7 +272,9 @@ test "forward mode installs every baseline slot except the native future set" {
     const baseline = rt.baselineIo().vtable;
     inline for (@typeInfo(Io.VTable).@"struct".fields) |field| {
         const forwarded = @field(native, field.name) == @field(baseline, field.name);
-        try std.testing.expectEqual(!(fibers_supported and is_future_slot(field.name)), forwarded);
+        const replaced = fibers_supported and
+            (is_future_slot(field.name) or is_offloaded(field.name));
+        try std.testing.expectEqual(!replaced, forwarded);
     }
 }
 
