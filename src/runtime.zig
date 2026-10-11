@@ -129,9 +129,9 @@ pub const InitError = error{
 
 /// Builds a runtime. Precondition: `options` is fully specified; no default is implied, the
 /// fiber limits satisfy `Sched.Options`, and `gpa` is thread-safe (offload workers and the
-/// embedded `Io.Threaded` allocate from it on their own threads). The result becomes self-referential at the first
-/// `io()`/`baselineIo()` call (std stores `Threaded.io()` inside `Threaded` itself) and, through
-/// the scheduler, at the first `io()`; do not move it after that.
+/// embedded `Io.Threaded` allocate from it on their own threads). The result becomes
+/// self-referential at the first `io()`/`baselineIo()` call (std stores `Threaded.io()` inside
+/// `Threaded` itself) and, through the scheduler, at the first `io()`; do not move it after that.
 pub fn init(gpa: std.mem.Allocator, options: Options) InitError!Runtime {
     const backend: Backend = switch (options.backend) {
         .auto, .threaded => .threaded,
