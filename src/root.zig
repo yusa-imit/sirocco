@@ -17,6 +17,7 @@ test {
     std.testing.refAllDecls(@This());
     // Internal substrate: tested here, deliberately not public (ADR 0001: the surface is `Io`).
     _ = @import("sched.zig");
+    _ = @import("sched_test.zig");
     _ = @import("timer.zig");
     _ = @import("offload.zig");
     _ = @import("offload_slots.zig");
