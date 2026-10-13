@@ -21,4 +21,7 @@ test {
     _ = @import("timer.zig");
     _ = @import("offload.zig");
     _ = @import("offload_slots.zig");
+    _ = @import("backend/poller.zig");
+    _ = @import("backend/kqueue.zig");
+    _ = @import("backend/poller_test.zig");
 }

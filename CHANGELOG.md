@@ -7,6 +7,16 @@ exemption recorded in `citadel/protocol/VERSIONING.md`.
 
 ## [Unreleased]
 
+### Added
+
+- `src/backend/poller.zig` and `src/backend/kqueue.zig`: a one-shot readiness `Poller` on kqueue
+  (fixed registration table allocated in `init`, thread-safe latched `wake`) and the contract
+  epoll will share, with ADR 0003 (plan `004` item 2). Internal; nothing uses it yet.
+
+### Changed
+
+- `src/sched.zig` tests moved to `src/sched_test.zig` (plan `004` item 1).
+
 ## [0.4.0] - 2026-10-11
 
 ### Added
