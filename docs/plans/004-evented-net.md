@@ -17,11 +17,11 @@ lets that number decide. kqueue first: the dev box is macOS arm64; epoll is CI-o
 
 ## Scope
 
-- [ ] 1. Move the tests of `src/sched.zig` (823 lines) to `src/sched_test.zig`, adding `pub`
+- [x] 1. Move the tests of `src/sched.zig` (823 lines) to `src/sched_test.zig`, adding `pub`
       accessors that `root.zig` does not re-export. Why first: tidy caps files at 800 lines, and
       item 3 grows this file. Verify: `zig build tidy`; `wc -l src/*.zig` all < 800; the
       `zig build test --summary all` test count is unchanged.
-- [ ] 2. `docs/adr/0003-evented-backends.md` + `src/backend/kqueue.zig`: a `Poller` with `init(gpa,
+- [x] 2. `docs/adr/0003-evented-backends.md` + `src/backend/kqueue.zig`: a `Poller` with `init(gpa,
       registrations_max)`, `arm(fd, .read|.write, token)` (`EV_ONESHOT`), `disarm`, `wait(deadline,
       out)` and a thread-safe `wake` (`EVFILT_USER`), its table allocated in `init`. ADR rules:
       one poller per `Sched`; sockets are `O_NONBLOCK`, owned by the `Io` that made them; item
