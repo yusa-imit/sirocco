@@ -12,6 +12,12 @@ const Io = std.Io;
 const Fiber = Sched.Fiber;
 const Options = Sched.Options;
 const supported = Sched.supported;
+const poller_supported = @import("backend/poller.zig").Native != void;
+const sleep = @import("sleep.zig");
+
+const ns_per_ms: u64 = 1_000_000;
+// std's `Io` clock call runs on a fiber stack in the sleeper tests; Debug builds want room.
+const stack_size_clock: u32 = 128 * 1024;
 
 const TestLog = struct {
     sched: *Sched,
@@ -44,8 +50,70 @@ fn test_stopper(arg: ?*anyopaque) void {
 }
 
 fn test_options(fibers_max: u32, stack_size: u32) Options {
-    return .{ .fibers_max = fibers_max, .stack_size = stack_size, .now_ns = 0 };
+    return .{
+        .fibers_max = fibers_max,
+        .stack_size = stack_size,
+        .now_ns = now_ns(std.testing.io),
+        .idle = .futex,
+    };
 }
+
+/// The same limits with the carrier idling in the kernel poller instead of the futex word.
+fn test_options_poller(fibers_max: u32, stack_size: u32) Options {
+    return .{
+        .fibers_max = fibers_max,
+        .stack_size = stack_size,
+        .now_ns = now_ns(std.testing.io),
+        .idle = .{ .poller = .{ .registrations_max = 8 } },
+    };
+}
+
+fn now_ns(io: Io) u64 {
+    return @intCast(Io.Clock.awake.now(io).nanoseconds);
+}
+
+/// An `Io` that forwards to `std.testing.io` and counts the futex calls the scheduler makes, so
+/// a test can prove which way the carrier slept. Counters are atomic: wakers run on threads.
+const CountingIo = struct {
+    var vtable: Io.VTable = undefined;
+    var waits: u32 = 0;
+    var wakes: u32 = 0;
+
+    fn make() Io {
+        const inner = std.testing.io;
+        vtable = inner.vtable.*;
+        vtable.futexWait = wait;
+        vtable.futexWaitUncancelable = wait_uncancelable;
+        vtable.futexWake = wake;
+        @atomicStore(u32, &waits, 0, .monotonic);
+        @atomicStore(u32, &wakes, 0, .monotonic);
+        return .{ .userdata = inner.userdata, .vtable = &vtable };
+    }
+
+    fn wait(
+        userdata: ?*anyopaque,
+        ptr: *const u32,
+        expected: u32,
+        timeout: Io.Timeout,
+    ) Io.Cancelable!void {
+        _ = @atomicRmw(u32, &waits, .Add, 1, .monotonic);
+        return std.testing.io.vtable.futexWait(userdata, ptr, expected, timeout);
+    }
+
+    fn wait_uncancelable(userdata: ?*anyopaque, ptr: *const u32, expected: u32) void {
+        _ = @atomicRmw(u32, &waits, .Add, 1, .monotonic);
+        return std.testing.io.vtable.futexWaitUncancelable(userdata, ptr, expected);
+    }
+
+    fn wake(userdata: ?*anyopaque, ptr: *const u32, max_waiters: u32) void {
+        _ = @atomicRmw(u32, &wakes, .Add, 1, .monotonic);
+        return std.testing.io.vtable.futexWake(userdata, ptr, max_waiters);
+    }
+
+    fn futex_calls() u32 {
+        return @atomicLoad(u32, &waits, .monotonic) + @atomicLoad(u32, &wakes, .monotonic);
+    }
+};
 
 test "run_until stops once the flag is set and leaves the rest for a later run" {
     if (!supported) return error.SkipZigTest;
@@ -211,19 +279,127 @@ fn test_foreign_waker(log: *TestLog, io: Io) void {
     log.sched.unpark_foreign(io, log.fiber.?);
 }
 
-test "unpark_foreign wakes a carrier blocked on an empty ready queue" {
-    if (!supported) return error.SkipZigTest;
+/// Runs one parked fiber that a second thread unparks; returns `inbox_version` afterwards.
+fn run_foreign_wake(options: Options, io: Io) !u32 {
     var sched: Sched = undefined;
-    try sched.init(std.testing.allocator, test_options(1, 32 * 1024));
+    try sched.init(std.testing.allocator, options);
     defer sched.deinit(std.testing.allocator);
 
     var log: TestLog = .{ .sched = &sched, .ids = @splat(0), .len = 0, .fiber = null, .flag = 0 };
     _ = try sched.spawn(test_foreign_parker, &log);
-    const waker = try std.Thread.spawn(.{}, test_foreign_waker, .{ &log, std.testing.io });
-    sched.run(std.testing.io);
+    const waker = try std.Thread.spawn(.{}, test_foreign_waker, .{ &log, io });
+    sched.run(io);
     waker.join();
 
     try std.testing.expectEqualSlices(u32, &.{7}, log.ids[0..log.len]);
+    return sched.inbox_version;
+}
+
+test "unpark_foreign wakes a carrier blocked on an empty ready queue" {
+    if (!supported) return error.SkipZigTest;
+    const version = try run_foreign_wake(test_options(1, 32 * 1024), std.testing.io);
+    try std.testing.expectEqual(@as(u32, 1), version);
+}
+
+test "poller idle: unpark_foreign wakes a carrier asleep in the poller, not the futex" {
+    if (!supported or !poller_supported) return error.SkipZigTest;
+    const io = CountingIo.make();
+    const version = try run_foreign_wake(test_options_poller(1, 32 * 1024), io);
+    // The evented path needs no `inbox_version` (ADR 0003): the poller's latched wake does it.
+    try std.testing.expectEqual(@as(u32, 0), version);
+    try std.testing.expectEqual(@as(u32, 0), CountingIo.futex_calls());
+}
+
+const SleepProbe = struct { sched: *Sched, io: Io, sleep_ns: u64, elapsed_ns: u64 };
+
+fn test_sleeper(arg: ?*anyopaque) void {
+    const probe: *SleepProbe = @ptrCast(@alignCast(arg.?));
+    const fiber = probe.sched.current_fiber();
+    fiber.wait = .{ .addr = 0, .prev = null, .next = null, .sleeping = true, .outcome = .waiting };
+    const started_ns = now_ns(probe.io);
+    sleep.arm(probe.sched, fiber, .{ .at = @intCast(started_ns + probe.sleep_ns) });
+    probe.sched.park();
+    probe.elapsed_ns = now_ns(probe.io) - started_ns;
+    fiber.wait = .none;
+}
+
+/// Parks one fiber on a wheel deadline with nothing else alive; returns how long it slept.
+fn run_sleeper(options: Options, io: Io, sleep_ns: u64) !u64 {
+    var sched: Sched = undefined;
+    try sched.init(std.testing.allocator, options);
+    defer sched.deinit(std.testing.allocator);
+
+    var probe: SleepProbe = .{ .sched = &sched, .io = io, .sleep_ns = sleep_ns, .elapsed_ns = 0 };
+    _ = try sched.spawn(test_sleeper, &probe);
+    sched.run(io);
+    try std.testing.expectEqual(@as(u32, 0), sched.live_count);
+    return probe.elapsed_ns;
+}
+
+test "futex idle: a timed park waits in the futex until the wheel deadline" {
+    if (!supported) return error.SkipZigTest;
+    const sleep_ns: u64 = 20 * ns_per_ms;
+    const options = test_options(1, stack_size_clock);
+    const elapsed_ns = try run_sleeper(options, CountingIo.make(), sleep_ns);
+    try std.testing.expect(elapsed_ns >= sleep_ns);
+    // Proves the counter sees the idle path, so the poller twin below is not vacuous.
+    try std.testing.expect(CountingIo.futex_calls() > 0);
+}
+
+test "poller idle: a timed park wakes from the poller at the wheel deadline" {
+    if (!supported or !poller_supported) return error.SkipZigTest;
+    const sleep_ns: u64 = 20 * ns_per_ms;
+    const options = test_options_poller(1, stack_size_clock);
+    const elapsed_ns = try run_sleeper(options, CountingIo.make(), sleep_ns);
+    try std.testing.expect(elapsed_ns >= sleep_ns);
+    try std.testing.expect(elapsed_ns < 10 * sleep_ns);
+    try std.testing.expectEqual(@as(u32, 0), CountingIo.futex_calls());
+}
+
+test "poller idle: init adds the poller table and nothing allocates afterwards" {
+    if (!supported or !poller_supported) return error.SkipZigTest;
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{});
+    const gpa = failing.allocator();
+    var sched: Sched = undefined;
+    try sched.init(gpa, test_options_poller(2, stack_size_clock));
+    defer sched.deinit(gpa);
+    // Fiber table, stack arena, wheel nodes and the poller table.
+    try std.testing.expectEqual(@as(usize, 4), failing.alloc_index);
+
+    var probe: SleepProbe = .{
+        .sched = &sched,
+        .io = std.testing.io,
+        .sleep_ns = ns_per_ms,
+        .elapsed_ns = 0,
+    };
+    _ = try sched.spawn(test_sleeper, &probe);
+    sched.run(std.testing.io);
+    try std.testing.expect(probe.elapsed_ns >= ns_per_ms);
+    try std.testing.expectEqual(@as(usize, 4), failing.alloc_index);
+}
+
+test "poller idle: init reports allocation failure at every block and frees the others" {
+    if (!supported or !poller_supported) return error.SkipZigTest;
+    for (0..4) |fail_index| {
+        var failing = std.testing.FailingAllocator.init(
+            std.testing.allocator,
+            .{ .fail_index = fail_index },
+        );
+        var sched: Sched = undefined;
+        try std.testing.expectError(
+            error.OutOfMemory,
+            sched.init(failing.allocator(), test_options_poller(2, 16 * 1024)),
+        );
+    }
+}
+
+test "poller idle: a target without a poller refuses the option" {
+    if (!supported or poller_supported) return error.SkipZigTest;
+    var sched: Sched = undefined;
+    try std.testing.expectError(
+        error.PollerUnsupported,
+        sched.init(std.testing.allocator, test_options_poller(1, 16 * 1024)),
+    );
 }
 
 fn test_in_fiber_probe(arg: ?*anyopaque) void {

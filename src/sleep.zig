@@ -94,7 +94,8 @@ pub fn fire(sched: *Sched, io: Io) ?i96 {
     if (sched.wheel.count() == 0) return null;
     const now_ns = Io.Clock.awake.now(io).nanoseconds;
     _ = sched.wheel.expire(std.math.lossyCast(u64, now_ns));
-    for (0..sched.fibers.len) |_| {
+    // One pass per fiber that can be due, plus the pass that finds the list empty and breaks.
+    for (0..sched.fibers.len + 1) |_| {
         const index = sched.wheel.pop_due() orelse break;
         const fiber = &sched.fibers[index];
         if (!fiber.wait.sleeping) {

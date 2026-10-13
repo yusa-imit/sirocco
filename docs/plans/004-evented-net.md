@@ -28,7 +28,7 @@ lets that number decide. kqueue first: the dev box is macOS arm64; epoll is CI-o
       10's gate-1 rule. Verify: `src/backend/poller_test.zig`, generic over the backend, on a
       socketpair: armed read + a written byte -> token; `wake` from a thread unblocks `wait`; a
       deadline -> empty; a full table -> `SystemResources`; allocations flat after `init` (gate 5).
-- [ ] 3. Add `Options.sockets_max` (required), and make `.auto` resolve to `.kqueue` where kqueue
+- [x] 3. Add `Options.sockets_max` (required), and make `.auto` resolve to `.kqueue` where kqueue
       and fibers exist. `Sched.idle_wait` blocks in `Poller.wait` until the wheel's next
       deadline, and `unpark_foreign` calls `Poller.wake`; `.threaded` keeps the futex path.
       Why: offload completions and foreign futex wakes must reach a carrier asleep in kqueue.

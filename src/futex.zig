@@ -374,6 +374,7 @@ const test_options: Runtime.Options = .{
     .fibers_max = 4,
     .fiber_stack_size = 128 * 1024,
     .offload_threads = 2,
+    .sockets_max = 8,
 };
 
 test "enqueue refuses past waiters_max and leaves the table intact" {

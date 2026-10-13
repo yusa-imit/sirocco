@@ -55,21 +55,30 @@ pub fn build(b: *std.Build) void {
     const exe_tests = b.addTest(.{ .root_module = exe.root_module });
     const run_exe_tests = b.addRunArtifact(exe_tests);
     // Differential suite: every slot group runs on `rt.io()` and `rt.baselineIo()` (tests/parity).
-    const parity_tests = b.addTest(.{
-        .root_module = b.createModule(.{
-            .root_source_file = b.path("tests/parity/root.zig"),
-            .target = target,
-            .optimize = optimize,
-            .imports = &.{
-                .{ .name = "sirocco", .module = mod },
-            },
-        }),
-    });
-    const run_parity_tests = b.addRunArtifact(parity_tests);
+    // Compiled once per backend so the whole suite is checked under each idle path: `.threaded`
+    // everywhere, `.kqueue` where the target has it.
     const test_step = b.step("test", "Run unit tests");
     test_step.dependOn(&run_mod_tests.step);
     test_step.dependOn(&run_exe_tests.step);
-    test_step.dependOn(&run_parity_tests.step);
+    const parity_backends = [_][]const u8{ "threaded", "kqueue" };
+    for (parity_backends) |backend| {
+        const evented = !std.mem.eql(u8, backend, "threaded");
+        if (evented and !target.result.os.tag.isDarwin()) continue;
+        const config = b.addOptions();
+        config.addOption([]const u8, "backend", backend);
+        const parity_tests = b.addTest(.{
+            .root_module = b.createModule(.{
+                .root_source_file = b.path("tests/parity/root.zig"),
+                .target = target,
+                .optimize = optimize,
+                .imports = &.{
+                    .{ .name = "sirocco", .module = mod },
+                    .{ .name = "parity_config", .module = config.createModule() },
+                },
+            }),
+        });
+        test_step.dependOn(&b.addRunArtifact(parity_tests).step);
+    }
 
     // Tidy — Tiger Style mechanical checks (tools/tidy.zig), run over src/bench/tests.
     const tidy_tests = b.addTest(.{
