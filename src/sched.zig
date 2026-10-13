@@ -441,7 +441,8 @@ pub fn unpark_foreign(sched: *Sched, io: Io, fiber: *Fiber) void {
 }
 
 /// Runs fibers on the calling thread until none is alive. A fiber that parks with nothing else
-/// runnable blocks the carrier in the baseline futex until `unpark_foreign` delivers it.
+/// runnable blocks the carrier in the idle sleep (futex or poller) until `unpark_foreign`
+/// delivers it.
 /// Precondition: not nested, and called from outside any fiber.
 pub fn run(sched: *Sched, io: Io) void {
     sched.run_loop(io, null);

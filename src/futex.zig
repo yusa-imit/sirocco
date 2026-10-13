@@ -19,9 +19,9 @@
 //! slot (the native table has none of its own) and armed as a `Clock.awake` deadline on the
 //! scheduler's wheel (`Sched.wheel`, node = fiber index). `Sched.run` fires the wheel and calls
 //! `Table.timeout` through `Sched.Expiry` for each futex waiter that is due; when every fiber is
-//! parked it sleeps in the baseline futex until the earliest deadline. A wake that beats the
-//! deadline leaves the node linked until the fiber runs again and clears it; if the node fires
-//! first, `timeout` finds the waiter already out of the table and does nothing.
+//! parked it sleeps in the idle sleep (futex or poller) until the earliest deadline. A wake that
+//! beats the deadline leaves the node linked until the fiber runs again and clears it; if the
+//! node fires first, `timeout` finds the waiter already out of the table and does nothing.
 //!
 //! Cancelation: `futexWait` is a cancelation point. A request that is pending (and not blocked by
 //! `swapCancelProtection`) when the call starts is delivered before anything else, even if the
