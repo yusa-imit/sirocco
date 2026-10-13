@@ -1,11 +1,14 @@
 //! Timer wake-error benchmark (PRD §5 gate 7). Run: `zig build bench-timer`.
 //!
 //! One task sleeps 1 ms, `samples_target` times in a row, on `rt.io()` and on `rt.baselineIo()`
-//! (the embedded `Io.Threaded`) from one `Runtime`. Each sample is `elapsed - 1 ms` on
+//! (the embedded `Io.Threaded`) from one `Runtime`, and again on `rt.io()` of a second `Runtime`
+//! built with `.auto` (kqueue where it exists: the carrier idles in the poller instead of the
+//! futex). Each sample is `elapsed - 1 ms` on
 //! `Clock.awake`, the lateness of the wake; the tables print p50, p99 and the maximum. The task
 //! runs through `io.async` so that `sleep` executes on a fiber, where it is native; off a fiber
-//! it would forward to the baseline and the two rows would measure the same thing. The gate is
-//! p99 < 2 ms and sirocco <= Io.Threaded; docs/PRD.md §5 records the machine and numbers.
+//! it would forward to the baseline and the rows would measure the same thing. The gate is
+//! p99 < 2 ms and sirocco <= Io.Threaded, judged on the `.auto` row (the backend a consumer
+//! gets); docs/PRD.md §5 records the machine and numbers.
 //! Allocation: the sample array is allocated once up front from `gpa`.
 
 const std = @import("std");
@@ -71,18 +74,26 @@ fn measure(io: Io, errors_ns: []u64) Stats {
     return summarize(errors_ns);
 }
 
-pub fn main(init: std.process.Init) !void {
-    const gpa = init.gpa;
-    var rt = try Runtime.init(gpa, .{
-        .backend = .threaded,
+fn runtime_init(init: std.process.Init, backend: Runtime.Backend) !Runtime {
+    return Runtime.init(init.gpa, .{
+        .backend = backend,
         .unimplemented = .forward,
         .environ = init.minimal.environ,
         .argv0 = .empty,
         .fibers_max = 4,
         .fiber_stack_size = 64 * 1024,
         .offload_threads = 1,
+        .sockets_max = 1,
     });
-    defer rt.deinit();
+}
+
+pub fn main(init: std.process.Init) !void {
+    const gpa = init.gpa;
+    var rt_futex = try runtime_init(init, .threaded);
+    defer rt_futex.deinit();
+
+    var rt_auto = try runtime_init(init, .auto);
+    defer rt_auto.deinit();
 
     const errors_ns = try gpa.alloc(u64, samples_target);
     defer gpa.free(errors_ns);
@@ -92,16 +103,18 @@ pub fn main(init: std.process.Init) !void {
     const out = &w.interface;
     defer out.flush() catch {};
 
-    const baseline = measure(rt.baselineIo(), errors_ns);
-    const native = measure(rt.io(), errors_ns);
-    try out.print("{s:<10} {s:>12} {s:>12} {s:>12}\n", .{ "io", "p50_ns", "p99_ns", "max_ns" });
+    const baseline = measure(rt_futex.baselineIo(), errors_ns);
+    const futex = measure(rt_futex.io(), errors_ns);
+    const native = measure(rt_auto.io(), errors_ns);
+    try out.print("{s:<16} {s:>12} {s:>12} {s:>12}\n", .{ "io", "p50_ns", "p99_ns", "max_ns" });
     const rows = [_]struct { name: []const u8, stats: Stats }{
         .{ .name = "threaded", .stats = baseline },
-        .{ .name = "sirocco", .stats = native },
+        .{ .name = "sirocco/threaded", .stats = futex },
+        .{ .name = @tagName(rt_auto.backend), .stats = native },
     };
     for (rows) |row| {
         try out.print(
-            "{s:<10} {d:>12} {d:>12} {d:>12}\n",
+            "{s:<16} {d:>12} {d:>12} {d:>12}\n",
             .{ row.name, row.stats.p50_ns, row.stats.p99_ns, row.stats.max_ns },
         );
     }

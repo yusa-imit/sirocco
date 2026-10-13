@@ -29,6 +29,13 @@
 //! `async` still allocates one task record per started task, as Threaded does; "no allocation
 //! after init" becomes true per slot group in later plan-002 items.
 //!
+//! Backends: `.threaded` idles the carrier in a futex; `.kqueue` (Darwin, where fibers exist)
+//! gives the scheduler one kqueue poller (`src/backend/kqueue.zig`, ADR 0003) that the carrier
+//! sleeps in until the next timer deadline, and that offload completions and foreign futex wakes
+//! reach through `Poller.wake`. `.auto` is `.kqueue` where that exists, else `.threaded`;
+//! `.epoll` and `.uring` are refused until their items land. The poller's table is sized from
+//! `Options.sockets_max` (two registrations per socket) and allocated with the scheduler.
+//!
 //! Process-wide effects: `Io.Threaded.init` installs `SIGIO`/`SIGPIPE` handlers and `deinit`
 //! restores them, so overlapping runtimes must be torn down in reverse order of creation.
 //!
@@ -37,9 +44,11 @@
 //! and `cancel` are `unreachable`, sound only while its `async` returns no future.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const Io = std.Io;
 const stdx = @import("stdx.zig");
 const Sched = @import("sched.zig");
+const evented = @import("backend/poller.zig");
 const concurrency = @import("concurrency.zig");
 const futex = @import("futex.zig");
 const sleep = @import("sleep.zig");
@@ -68,6 +77,7 @@ sched_pin: usize,
 fibers_max: u32,
 fiber_stack_size: u32,
 offload_threads: u32,
+sockets_max: u32,
 /// The blocking-call pool (`src/offload.zig`); valid only while `sched_state == .ready`.
 offload: Offload,
 
@@ -89,7 +99,8 @@ comptime {
 }
 
 pub const Backend = enum {
-    /// Picks the best backend available on this target; today that is `.threaded`.
+    /// Picks the best backend available on this target: `.kqueue` where it exists, else
+    /// `.threaded`. `Runtime.backend` holds the choice.
     auto,
     kqueue,
     epoll,
@@ -120,12 +131,35 @@ pub const Options = struct {
     /// positive. A blocking call holds a worker until it returns, so a call that waits on another
     /// (an accept on a connect) needs at least as many workers as such calls in flight.
     offload_threads: u32,
+    /// Sockets the evented backends track at once (the poller registry, ADR 0003); positive and
+    /// at most half of `backend.poller.registrations_max_limit`. The poller table holds two
+    /// registrations per socket (read and write), allocated once with the scheduler, so a socket
+    /// past the limit is served by the offload pool instead. Ignored by `.threaded`, which
+    /// still requires it positive so one option set runs on every backend.
+    sockets_max: u32,
 };
 
 pub const InitError = error{
-    /// The requested backend does not exist yet (kqueue, epoll, uring land with plan 003+).
+    /// The requested backend is not available here: `.kqueue` needs Darwin and fibers, and
+    /// `.epoll` and `.uring` do not exist yet.
     BackendUnavailable,
 };
+
+// kqueue is compiled for Darwin only (ADR 0003) and needs the fiber scheduler to idle in it.
+const kqueue_supported = fibers_supported and evented.Native != void and
+    builtin.os.tag.isDarwin();
+
+fn backend_resolve(requested: Backend) InitError!Backend {
+    const resolved: Backend = switch (requested) {
+        .auto => if (kqueue_supported) .kqueue else .threaded,
+        .threaded => .threaded,
+        .kqueue => if (kqueue_supported) .kqueue else return error.BackendUnavailable,
+        .epoll, .uring => return error.BackendUnavailable,
+    };
+    assert(resolved != .auto);
+    assert(resolved == .threaded or kqueue_supported);
+    return resolved;
+}
 
 /// Builds a runtime. Precondition: `options` is fully specified; no default is implied, the
 /// fiber limits satisfy `Sched.Options`, and `gpa` is thread-safe (offload workers and the
@@ -133,11 +167,9 @@ pub const InitError = error{
 /// self-referential at the first `io()`/`baselineIo()` call (std stores `Threaded.io()` inside
 /// `Threaded` itself) and, through the scheduler, at the first `io()`; do not move it after that.
 pub fn init(gpa: std.mem.Allocator, options: Options) InitError!Runtime {
-    const backend: Backend = switch (options.backend) {
-        .auto, .threaded => .threaded,
-        .kqueue, .epoll, .uring => return error.BackendUnavailable,
-    };
-    assert(backend == .threaded);
+    const backend = try backend_resolve(options.backend);
+    assert(options.sockets_max > 0);
+    assert(options.sockets_max <= @divExact(evented.registrations_max_limit, 2));
     assert(options.fibers_max > 0);
     assert(options.fiber_stack_size >= Sched.stack_size_min);
     assert(options.fiber_stack_size % 16 == 0);
@@ -177,6 +209,7 @@ pub fn init(gpa: std.mem.Allocator, options: Options) InitError!Runtime {
         .fibers_max = options.fibers_max,
         .fiber_stack_size = options.fiber_stack_size,
         .offload_threads = options.offload_threads,
+        .sockets_max = options.sockets_max,
         .offload = undefined, // Built in place with `sched`, never read before `.ready`.
     };
 }
@@ -185,7 +218,8 @@ pub fn init(gpa: std.mem.Allocator, options: Options) InitError!Runtime {
 /// Preconditions: no `Io` value obtained from this runtime is used afterwards, and every future
 /// from `async` was awaited or cancelled (no fiber is alive).
 pub fn deinit(rt: *Runtime) void {
-    assert(rt.backend == .threaded);
+    assert(rt.backend != .auto);
+    assert(rt.sockets_max > 0);
     if (rt.sched_state == .ready) {
         assert(rt.sched_pin == @intFromPtr(&rt.sched));
         rt.offload.deinit(rt.threaded.allocator);
@@ -199,11 +233,22 @@ pub fn deinit(rt: *Runtime) void {
 /// The whole public surface. Takes the address of `rt`, so `rt` must not move afterwards. The
 /// first call also builds the fiber scheduler in place (allocating its two blocks).
 pub fn io(rt: *Runtime) Io {
-    assert(rt.backend == .threaded);
+    assert(rt.backend != .auto);
     assert(@intFromPtr(&rt.threaded) != 0);
     if (fibers_supported) concurrency.sched_ensure(rt);
     assert(rt.sched_state != .pending);
     return .{ .userdata = &rt.threaded, .vtable = &rt.vtable };
+}
+
+/// How the scheduler's carrier sleeps under this runtime's backend (`Sched.Options.idle`):
+/// `.threaded` in the futex, `.kqueue` in the poller with two registrations per socket.
+pub fn idle_options(rt: *const Runtime) Sched.IdleOptions {
+    assert(rt.sockets_max > 0);
+    return switch (rt.backend) {
+        .threaded => .futex,
+        .kqueue => .{ .poller = .{ .registrations_max = 2 * rt.sockets_max } },
+        .auto, .epoll, .uring => unreachable, // `backend_resolve` never yields these.
+    };
 }
 
 /// The same runtime's `Io.Threaded`, for differential tests and as an escape hatch.
@@ -222,6 +267,7 @@ fn test_options(backend: Backend, unimplemented: Unimplemented) Options {
         .fibers_max = 4,
         .fiber_stack_size = 64 * 1024,
         .offload_threads = 2,
+        .sockets_max = 8,
     };
 }
 
@@ -341,9 +387,10 @@ test "the scheduler is built by the first io() and pinned there" {
     try std.testing.expectEqual(@as(u32, 4), @as(u32, @intCast(rt.sched.fibers.len)));
 }
 
-test "unavailable backends are refused, auto resolves" {
-    const options_unavailable: [3]Options = .{
-        test_options(.kqueue, .forward),
+const kqueue_here = builtin.os.tag.isDarwin() and fibers_supported;
+
+test "unavailable backends are refused" {
+    const options_unavailable: [2]Options = .{
         test_options(.epoll, .fail),
         test_options(.uring, .forward),
     };
@@ -353,7 +400,47 @@ test "unavailable backends are refused, auto resolves" {
             Runtime.init(std.testing.allocator, options),
         );
     }
+    // kqueue exists exactly where the poller and the fibers do.
+    const kqueue = Runtime.init(std.testing.allocator, test_options(.kqueue, .forward));
+    if (kqueue_here) {
+        var rt = try kqueue;
+        defer rt.deinit();
+        try std.testing.expectEqual(Backend.kqueue, rt.backend);
+    } else {
+        try std.testing.expectError(error.BackendUnavailable, kqueue);
+    }
+}
+
+test "auto resolves to kqueue where kqueue and fibers exist, else threaded" {
     var rt: Runtime = try .init(std.testing.allocator, test_options(.auto, .forward));
     defer rt.deinit();
-    try std.testing.expectEqual(Backend.threaded, rt.backend);
+    const expected: Backend = if (kqueue_here) .kqueue else .threaded;
+    try std.testing.expectEqual(expected, rt.backend);
+    // An explicit `.threaded` stays threaded even where `.auto` goes evented.
+    var threaded: Runtime = try .init(std.testing.allocator, test_options(.threaded, .forward));
+    defer threaded.deinit();
+    try std.testing.expectEqual(Backend.threaded, threaded.backend);
+}
+
+fn sleep_once(rio: Io) void {
+    rio.sleep(.fromMilliseconds(5), .awake) catch return;
+}
+
+test "the scheduler idles where the backend says, and sleeping works on both" {
+    if (!fibers_supported) return error.SkipZigTest;
+    const backends = [_]Backend{ .threaded, .auto };
+    for (backends) |requested| {
+        var rt: Runtime = try .init(std.testing.allocator, test_options(requested, .forward));
+        defer rt.deinit();
+
+        const rio = rt.io();
+        var future = rio.async(sleep_once, .{rio});
+        future.await(rio);
+        try std.testing.expectEqual(SchedState.ready, rt.sched_state);
+        switch (rt.backend) {
+            .threaded => try std.testing.expect(rt.sched.idle == .futex),
+            .kqueue => try std.testing.expect(rt.sched.idle == .poller),
+            .auto, .epoll, .uring => return error.TestUnexpectedResult,
+        }
+    }
 }

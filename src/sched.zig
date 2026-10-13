@@ -16,19 +16,27 @@
 //! neighbouring stack, and there are no guard pages yet. The `Sched` must not move after `init`
 //! (fibers hold a pointer to it), so `init` fills the caller's storage in place.
 //!
-//! Allocation: `init` allocates three blocks (fiber table, stack arena, wheel nodes) from `gpa`;
-//! `Sched` stores no allocator, so nothing allocates afterwards, and `deinit` takes the same `gpa`
-//! back.
+//! Allocation: `init` allocates three blocks (fiber table, stack arena, wheel nodes) from `gpa`,
+//! plus the poller's table under `.poller`; `Sched` stores no allocator, so nothing allocates
+//! afterwards, and `deinit` takes the same `gpa` back.
+//!
+//! Idling (`Options.idle`): with nothing ready the carrier sleeps until the wheel's next deadline
+//! or a foreign wake. Under `.futex` it blocks in the baseline futex on `inbox_version`. Under
+//! `.poller` (ADR 0003) the `Sched` owns one `backend.poller.Native`, built in `init` and torn
+//! down in `deinit`, and the carrier blocks in `Poller.wait` with the time left to that deadline
+//! (`null` when none), so sockets armed later share the sleep. Nothing arms a socket yet.
 //!
 //! Threads: everything except `unpark_foreign` runs on the carrier thread. `unpark_foreign` may be
-//! called from any thread: it pushes onto a lock-free inbox and bumps a futex word, and the
-//! carrier, when its ready queue drains, blocks in the baseline `futexWaitUncancelable` on that
-//! word. The waker's thread must be joined before `deinit`: `unpark_foreign` touches the futex
-//! word after the carrier may have finished.
+//! called from any thread: it pushes onto a lock-free inbox, then wakes the carrier: under
+//! `.futex` it bumps `inbox_version` and wakes that word, under `.poller` it calls `Poller.wake`,
+//! which is latched, so a wake that lands before the carrier enters `wait` is not lost and the
+//! futex word goes unused. The waker's thread must be joined before `deinit`: `unpark_foreign`
+//! touches the futex word or the poller after the carrier may have finished.
 //!
 //! Sketch: `spawn` touches one `Fiber` record and the top cache line of one stack; a switch
 //! saves and restores 3 words plus the callee-saved registers (rbx, r12-r15 / x19-x28, d8-d15,
-//! x30), pushed on the old stack; zero syscalls on the ready path, one futex wait per idle period.
+//! x30), pushed on the old stack; zero syscalls on the ready path, one futex wait (or one
+//! `kevent`) per idle period.
 //! Eager start (`spawn_first`) puts the new fiber at the queue front and runs it before returning.
 
 const std = @import("std");
@@ -37,6 +45,7 @@ const stdx = @import("stdx.zig");
 const switch_context = @import("fiber_switch.zig").switch_context;
 const Wheel = @import("timer.zig");
 const sleep = @import("sleep.zig");
+const evented = @import("backend/poller.zig");
 
 const Io = std.Io;
 const assert = stdx.assert;
@@ -57,8 +66,11 @@ parked_count: u32,
 running: bool,
 /// Fibers made ready from other threads; a Treiber stack drained with one exchange.
 inbox: ?*Fiber,
-/// Futex word bumped after every inbox push; the carrier waits on it when it has nothing to run.
+/// Futex word bumped after every inbox push under `.futex` idling, which the carrier waits on when
+/// it has nothing to run; stays 0 under `.poller`.
 inbox_version: u32,
+/// How the carrier sleeps; chosen by `Options.idle` and fixed for life.
+idle: Idle,
 /// Handler for futex waiters whose deadline passed; null until `src/futex.zig` installs it.
 expiry: ?Expiry,
 /// Deadlines of timed waits, keyed by fiber index; a fiber has at most one node.
@@ -89,13 +101,25 @@ pub const Options = struct {
     stack_size: u32,
     /// `Clock.awake` reading at creation, the wheel's starting time.
     now_ns: u64,
+    /// Where the idle carrier sleeps; `.poller` allocates the poller's table in `init`.
+    idle: IdleOptions,
 };
+
+pub const IdleOptions = union(enum) {
+    /// Block in the baseline futex on `inbox_version`.
+    futex,
+    /// Block in the target's `backend.poller.Native` (`registrations_max` positive).
+    poller: evented.Options,
+};
+
+const Idle = union(enum) { futex, poller: evented.Native };
 
 pub const InitError = error{
     /// The target has no `Io.fiber` assembly; use the `.threaded` backend.
     FibersUnsupported,
-    OutOfMemory,
-};
+    /// `Options.idle` is `.poller` on a target with no evented backend yet.
+    PollerUnsupported,
+} || evented.InitError;
 
 pub const SpawnError = error{
     /// `fibers_max` fibers are already alive.
@@ -165,7 +189,7 @@ const Start = struct {
 
 /// Fills `target` in place. Precondition: `options.fibers_max > 0`, `options.stack_size` is a
 /// multiple of 16 and at least `stack_size_min`. Runs nothing; allocates the fiber table and the
-/// stack arena, and nothing after.
+/// stack arena (and the poller's table under `.poller`), and nothing after.
 pub fn init(target: *Sched, gpa: std.mem.Allocator, options: Options) InitError!void {
     return init_checked(target, gpa, options, supported);
 }
@@ -195,6 +219,9 @@ fn init_checked(
     try wheel.init(gpa, .{ .nodes_max = options.fibers_max, .now_ns = options.now_ns });
     errdefer wheel.deinit(gpa);
 
+    var idle = try idle_init(gpa, options.idle);
+    errdefer idle_deinit(&idle, gpa);
+
     target.* = .{
         .fibers = fibers,
         .stacks = stacks,
@@ -209,6 +236,7 @@ fn init_checked(
         .running = false,
         .inbox = null,
         .inbox_version = 0,
+        .idle = idle,
         .expiry = null,
         .wheel = wheel,
         .first = null,
@@ -230,12 +258,38 @@ fn init_checked(
     assert(target.free_head == &fibers[0]);
 }
 
-/// Frees the fiber table and stack arena. Precondition: `gpa` is the allocator given to `init`,
-/// and no fiber is alive (every spawned fiber ran to completion).
+fn idle_init(gpa: std.mem.Allocator, options: IdleOptions) InitError!Idle {
+    switch (options) {
+        .futex => return .futex,
+        .poller => |poller_options| {
+            assert(poller_options.registrations_max > 0);
+            if (comptime evented.Native == void) return error.PollerUnsupported;
+            var native: evented.Native = undefined; // Filled in place by `init`, before any read.
+            try native.init(gpa, poller_options);
+            return .{ .poller = native };
+        },
+    }
+}
+
+fn idle_deinit(idle: *Idle, gpa: std.mem.Allocator) void {
+    switch (idle.*) {
+        .futex => assert(idle.* == .futex),
+        .poller => |*native| {
+            // Proof: `idle_init` refuses `.poller` on a target without a poller.
+            if (comptime evented.Native == void) unreachable;
+            native.deinit(gpa);
+        },
+    }
+}
+
+/// Frees the fiber table, stack arena, wheel and poller. Precondition: `gpa` is the allocator
+/// given to `init`, no fiber is alive (every spawned fiber ran to completion), and nothing is
+/// armed in the poller.
 pub fn deinit(sched: *Sched, gpa: std.mem.Allocator) void {
     assert(sched.live_count == 0);
     assert(sched.current == null);
     assert(!sched.running);
+    idle_deinit(&sched.idle, gpa);
     sched.wheel.deinit(gpa);
     gpa.free(sched.stacks);
     gpa.free(sched.fibers);
@@ -356,8 +410,10 @@ pub fn unpark(sched: *Sched, fiber: *Fiber) void {
 }
 
 /// `unpark` from any thread. The fiber may not have parked yet; it is made ready only once the
-/// carrier next drains the inbox, which happens after the fiber has switched out. Precondition:
-/// the fiber is running toward `park` or already parked, and is named by at most one waker.
+/// carrier next drains the inbox, which happens after the fiber has switched out. The carrier is
+/// woken from its idle sleep: through `io` (the baseline) under `.futex`, through the poller's
+/// latched wake under `.poller`, where `io` is unused. Precondition: the fiber is running toward
+/// `park` or already parked, and is named by at most one waker.
 pub fn unpark_foreign(sched: *Sched, io: Io, fiber: *Fiber) void {
     // `fiber.state` is carrier-owned and not read here: the carrier may be writing it.
     fiber.queue_next = @atomicLoad(?*Fiber, &sched.inbox, .monotonic);
@@ -371,12 +427,22 @@ pub fn unpark_foreign(sched: *Sched, io: Io, fiber: *Fiber) void {
     )) |seen| {
         fiber.queue_next = seen;
     }
-    _ = @atomicRmw(u32, &sched.inbox_version, .Add, 1, .release);
-    io.futexWake(u32, &sched.inbox_version, 1);
+    switch (sched.idle) {
+        .futex => {
+            _ = @atomicRmw(u32, &sched.inbox_version, .Add, 1, .release);
+            io.futexWake(u32, &sched.inbox_version, 1);
+        },
+        .poller => |*native| {
+            // Proof: `idle_init` refuses `.poller` on a target without a poller.
+            if (comptime evented.Native == void) unreachable;
+            native.wake();
+        },
+    }
 }
 
 /// Runs fibers on the calling thread until none is alive. A fiber that parks with nothing else
-/// runnable blocks the carrier in the baseline futex until `unpark_foreign` delivers it.
+/// runnable blocks the carrier in the idle sleep (futex or poller) until `unpark_foreign`
+/// delivers it.
 /// Precondition: not nested, and called from outside any fiber.
 pub fn run(sched: *Sched, io: Io) void {
     sched.run_loop(io, null);
@@ -428,18 +494,54 @@ fn run_loop(sched: *Sched, io: Io, stop: ?*const bool) void {
     }
 }
 
-/// Blocks the carrier until `inbox_version` moves from `version` or, when given, `deadline_ns`
-/// (`Clock.awake`) passes. Returning early is fine: `run_loop` re-checks everything.
+/// Blocks the carrier until a foreign wake or, when given, `deadline_ns` (`Clock.awake`) passes:
+/// on `inbox_version` under `.futex` (`version` is the value read before the inbox drain), in
+/// the poller under `.poller`. Returning early is fine: `run_loop` re-checks everything.
 fn idle_wait(sched: *Sched, io: Io, version: u32, deadline_ns: ?i96) void {
+    switch (sched.idle) {
+        .futex => idle_wait_futex(&sched.inbox_version, io, version, deadline_ns),
+        .poller => |*native| {
+            // Proof: `idle_init` refuses `.poller` on a target without a poller.
+            if (comptime evented.Native == void) unreachable;
+            assert(sched.inbox_version == 0);
+            idle_wait_poller(native, io, deadline_ns);
+        },
+    }
+}
+
+fn idle_wait_futex(word: *const u32, io: Io, version: u32, deadline_ns: ?i96) void {
     const at = deadline_ns orelse {
-        return io.futexWaitUncancelable(u32, &sched.inbox_version, version);
+        return io.futexWaitUncancelable(u32, word, version);
     };
     const raw: Io.Timestamp = .fromNanoseconds(at);
     const timeout: Io.Timeout = .{ .deadline = .{ .raw = raw, .clock = .awake } };
-    io.futexWaitTimeout(u32, &sched.inbox_version, version, timeout) catch |err| switch (err) {
+    io.futexWaitTimeout(u32, word, version, timeout) catch |err| switch (err) {
         // The carrier is no `Io` task, so nothing can cancel it; looping again is harmless anyway.
         error.Canceled => {},
     };
+}
+
+fn idle_wait_poller(native: *evented.Native, io: Io, deadline_ns: ?i96) void {
+    const timeout_ns: ?u64 = if (deadline_ns) |at|
+        timeout_until(at, Io.Clock.awake.now(io).nanoseconds)
+    else
+        null;
+    var events: [evented.events_max]evented.Event = undefined; // `wait` writes before any read.
+    const count = native.wait(timeout_ns, &events);
+    assert(count <= events.len);
+    // Nothing arms a descriptor yet (plan 004 item 4), so only a wake or the deadline ends it.
+    assert(count == 0);
+}
+
+/// The relative `Poller.wait` timeout for an absolute `deadline_ns`: the time left, 0 once it has
+/// passed. Both are `Clock.awake` nanoseconds.
+fn timeout_until(deadline_ns: i96, now_ns: i96) u64 {
+    assert(now_ns >= 0);
+    const remaining_ns = deadline_ns -| now_ns;
+    if (remaining_ns <= 0) return 0;
+    const timeout_ns = std.math.lossyCast(u64, remaining_ns);
+    assert(timeout_ns > 0);
+    return timeout_ns;
 }
 
 fn push_ready(sched: *Sched, fiber: *Fiber) void {
@@ -565,7 +667,15 @@ fn fiber_entry() callconv(.naked) void {
 }
 
 fn test_options(fibers_max: u32, stack_size: u32) Options {
-    return .{ .fibers_max = fibers_max, .stack_size = stack_size, .now_ns = 0 };
+    return .{ .fibers_max = fibers_max, .stack_size = stack_size, .now_ns = 0, .idle = .futex };
+}
+
+test "timeout_until is the time left, never negative, saturating" {
+    try std.testing.expectEqual(@as(u64, 500), timeout_until(1_500, 1_000));
+    try std.testing.expectEqual(@as(u64, 0), timeout_until(1_000, 1_000));
+    try std.testing.expectEqual(@as(u64, 0), timeout_until(900, 1_000));
+    const far: i96 = std.math.maxInt(i96);
+    try std.testing.expectEqual(@as(u64, std.math.maxInt(u64)), timeout_until(far, 1));
 }
 
 test "canary detects a clobbered stack base" {

@@ -1,7 +1,8 @@
 //! sirocco's `sleep` slot on fibers (plan 003 item 4), and the wheel helpers the futex timeouts
 //! share. A sleeping fiber parks with a node on `Sched.wheel` (key: its fiber index), so the
 //! carrier never blocks in `sleep`: other fibers run, and `Sched.run` wakes the sleeper when its
-//! deadline passes or, when every fiber is parked, waits in the baseline futex until then.
+//! deadline passes or, when every fiber is parked, waits in the idle sleep (futex or poller)
+//! until then.
 //!
 //! Clocks: `.real`, `.awake` and `.boot` are all measured on `Clock.awake`. A `.duration` is
 //! relative, so it is exact; a `.deadline` is converted to a remaining duration once, at entry,
@@ -94,7 +95,8 @@ pub fn fire(sched: *Sched, io: Io) ?i96 {
     if (sched.wheel.count() == 0) return null;
     const now_ns = Io.Clock.awake.now(io).nanoseconds;
     _ = sched.wheel.expire(std.math.lossyCast(u64, now_ns));
-    for (0..sched.fibers.len) |_| {
+    // One pass per fiber that can be due, plus the pass that finds the list empty and breaks.
+    for (0..sched.fibers.len + 1) |_| {
         const index = sched.wheel.pop_due() orelse break;
         const fiber = &sched.fibers[index];
         if (!fiber.wait.sleeping) {

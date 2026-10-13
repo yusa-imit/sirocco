@@ -7,6 +7,17 @@ exemption recorded in `citadel/protocol/VERSIONING.md`.
 
 ## [Unreleased]
 
+### Changed
+
+- **Breaking:** `Runtime.Options.sockets_max` is required (plan `004` item 3). `.auto` resolves to
+  `.kqueue` on Darwin and `.threaded` elsewhere; under `.kqueue` the carrier idles in the kqueue
+  poller and foreign wakes reach it through `Poller.wake`. `.kqueue` is refused with
+  `BackendUnavailable` where kqueue does not exist.
+
+### Fixed
+
+- `sleep.fire` trapped when every sleeping fiber's deadline came due in one pass.
+
 ### Added
 
 - `src/backend/poller.zig` and `src/backend/kqueue.zig`: a one-shot readiness `Poller` on kqueue

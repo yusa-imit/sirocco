@@ -251,10 +251,13 @@ fn worker_main(pool: *Offload) void {
 // Tests build a scheduler plus a pool and run fibers on the test thread (the carrier).
 
 const ns_per_ms: i96 = 1_000_000;
+const poller_supported = @import("backend/poller.zig").Native != void;
 
-fn test_sched_options(fibers_max: u32) Sched.Options {
-    return .{ .fibers_max = fibers_max, .stack_size = 64 * 1024, .now_ns = 0 };
+fn test_sched_options(fibers_max: u32, idle: Sched.IdleOptions) Sched.Options {
+    return .{ .fibers_max = fibers_max, .stack_size = 64 * 1024, .now_ns = 0, .idle = idle };
 }
+
+const idle_poller: Sched.IdleOptions = .{ .poller = .{ .registrations_max = 8 } };
 
 const TestRun = struct {
     sched: Sched,
@@ -306,8 +309,9 @@ fn test_run_init(
     fibers_max: u32,
     threads_count: u32,
     job_ms: i64,
+    idle: Sched.IdleOptions,
 ) !void {
-    try run.sched.init(gpa, test_sched_options(fibers_max));
+    try run.sched.init(gpa, test_sched_options(fibers_max, idle));
     errdefer run.sched.deinit(gpa);
     try run.pool.init(gpa, std.testing.io, &run.sched, .{
         .threads_count = threads_count,
@@ -337,7 +341,7 @@ fn test_spawn_callers(run: *TestRun, slots: []TestCall) !void {
 test "fibers_max fibers each offload a 20 ms job and the jobs overlap in flight" {
     if (!Sched.supported) return error.SkipZigTest;
     var run: TestRun = undefined;
-    try test_run_init(&run, std.testing.allocator, 16, 16, 20);
+    try test_run_init(&run, std.testing.allocator, 16, 16, 20, .futex);
     defer test_run_deinit(&run, std.testing.allocator);
 
     var slots: [16]TestCall = undefined;
@@ -351,10 +355,28 @@ test "fibers_max fibers each offload a 20 ms job and the jobs overlap in flight"
     try std.testing.expect(run.in_flight_peak >= 2);
 }
 
+test "poller idle: a job completion reaches a carrier asleep in the poller" {
+    if (!Sched.supported or !poller_supported) return error.SkipZigTest;
+    var run: TestRun = undefined;
+    try test_run_init(&run, std.testing.allocator, 4, 2, 30, idle_poller);
+    defer test_run_deinit(&run, std.testing.allocator);
+
+    // Every fiber parks in `call` for 30 ms, so the carrier has nothing ready and no wheel
+    // deadline: only the workers' `unpark_foreign` can end its wait.
+    var slots: [4]TestCall = undefined;
+    try test_spawn_callers(&run, &slots);
+    run.sched.run(std.testing.io);
+
+    try std.testing.expectEqual(@as(u32, 4), run.done_count);
+    try std.testing.expectEqual(@as(u32, 4), run.off_carrier);
+    // The evented wake path leaves the futex word alone (ADR 0003).
+    try std.testing.expectEqual(@as(u32, 0), run.sched.inbox_version);
+}
+
 test "one worker serves more fibers than threads, in submission order" {
     if (!Sched.supported) return error.SkipZigTest;
     var run: TestRun = undefined;
-    try test_run_init(&run, std.testing.allocator, 6, 1, 0);
+    try test_run_init(&run, std.testing.allocator, 6, 1, 0, .futex);
     defer test_run_deinit(&run, std.testing.allocator);
 
     var slots: [6]TestCall = undefined;
@@ -370,7 +392,7 @@ test "init allocates the thread handles once and call allocates nothing" {
     var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{});
     const gpa = failing.allocator();
     var run: TestRun = undefined;
-    try run.sched.init(gpa, test_sched_options(4));
+    try run.sched.init(gpa, test_sched_options(4, .futex));
     defer run.sched.deinit(gpa);
 
     const allocs_before = failing.alloc_index;
@@ -395,7 +417,7 @@ test "init allocates the thread handles once and call allocates nothing" {
 test "deinit wakes and joins workers that are idle on the futex word" {
     if (!Sched.supported) return error.SkipZigTest;
     var run: TestRun = undefined;
-    try test_run_init(&run, std.testing.allocator, 2, 3, 0);
+    try test_run_init(&run, std.testing.allocator, 2, 3, 0, .futex);
     // Workers are blocked on the futex word with nothing queued; deinit must wake and join them.
     try std.testing.expectEqual(@as(u32, 3), run.pool.spawned_count);
     try std.testing.expectEqual(@as(u32, 0), run.pool.queued_count);
@@ -405,7 +427,7 @@ test "deinit wakes and joins workers that are idle on the futex word" {
 test "init reports allocation failure and frees nothing it did not take" {
     if (!Sched.supported) return error.SkipZigTest;
     var sched: Sched = undefined;
-    try sched.init(std.testing.allocator, test_sched_options(1));
+    try sched.init(std.testing.allocator, test_sched_options(1, .futex));
     defer sched.deinit(std.testing.allocator);
 
     var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0 });
@@ -429,7 +451,7 @@ fn test_spawn_limited(pool: *Offload) std.Thread.SpawnError!std.Thread {
 test "init reports ThreadSpawnFailed and joins the workers it started" {
     if (!Sched.supported) return error.SkipZigTest;
     var sched: Sched = undefined;
-    try sched.init(std.testing.allocator, test_sched_options(1));
+    try sched.init(std.testing.allocator, test_sched_options(1, .futex));
     defer sched.deinit(std.testing.allocator);
 
     var pool: Offload = undefined;

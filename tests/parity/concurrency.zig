@@ -359,15 +359,16 @@ test "no allocation beyond the runtime's, and nothing leaks, after await or canc
     defer rt.deinit();
 
     const io = rt.io();
-    // `io()` initialises the scheduler (fiber table, stack arena, the wheel's nodes) and the
-    // offload pool's thread handles.
-    try std.testing.expectEqual(@as(usize, 4), failing.alloc_index);
+    // `io()` initialises the scheduler (fiber table, stack arena, the wheel's nodes, and the
+    // poller's table on an evented backend) and the offload pool's thread handles.
+    const init_blocks: usize = if (fixtures.backend == .threaded) 4 else 5;
+    try std.testing.expectEqual(init_blocks, failing.alloc_index);
     const live_after_init = failing.allocated_bytes - failing.freed_bytes;
     var trace = Trace.init();
     var awaited = io.async(traced_leaf, .{ &trace, 1 });
     var cancelled = io.async(traced_leaf, .{ &trace, 2 });
     // One task record each (async still allocates per call, as Threaded does).
-    try std.testing.expectEqual(@as(usize, 6), failing.alloc_index);
+    try std.testing.expectEqual(init_blocks + 2, failing.alloc_index);
     _ = awaited.await(io);
     _ = cancelled.cancel(io);
     try std.testing.expectEqual(live_after_init, failing.allocated_bytes - failing.freed_bytes);

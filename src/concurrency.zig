@@ -155,8 +155,9 @@ pub fn install(vtable: *Io.VTable) void {
 
 /// Brings `rt.sched` into existence on the first `Runtime.io()`. The `Runtime` is pinned from
 /// that call on, which is what makes the `*Sched` inside every fiber stable; the recorded address
-/// is re-checked on every later call. Allocation failure is not an error: it leaves the runtime
-/// `.unavailable`, where `async` runs inline and `concurrent` refuses, both in the contract.
+/// is re-checked on every later call. Allocation failure, or a kernel that will not give the
+/// backend's poller, is not an error: it leaves the runtime `.unavailable`, where `async` runs
+/// inline and `concurrent` refuses, both in the contract.
 pub fn sched_ensure(rt: *Runtime) void {
     switch (rt.sched_state) {
         .unsupported => assert(!Sched.supported),
@@ -168,9 +169,16 @@ pub fn sched_ensure(rt: *Runtime) void {
                 .fibers_max = rt.fibers_max,
                 .stack_size = rt.fiber_stack_size,
                 .now_ns = std.math.lossyCast(u64, Io.Clock.awake.now(rt.baselineIo()).nanoseconds),
+                .idle = rt.idle_options(),
             };
             rt.sched.init(rt.threaded.allocator, options) catch |err| switch (err) {
-                error.OutOfMemory, error.FibersUnsupported => {
+                error.OutOfMemory,
+                error.FibersUnsupported,
+                error.PollerUnsupported,
+                error.ProcessFdQuotaExceeded,
+                error.SystemFdQuotaExceeded,
+                error.SystemResources,
+                => {
                     rt.sched_state = .unavailable;
                     return;
                 },
