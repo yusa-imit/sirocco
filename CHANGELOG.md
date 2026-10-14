@@ -27,8 +27,10 @@ exemption recorded in `citadel/protocol/VERSIONING.md`.
   holding an offload worker (`src/net.zig`, `src/backend/sys.zig`). A cancel disarms the wait and
   returns `error.Canceled`. Foreign handles, a full registry, sockets created off a fiber and
   option sets the native path does not serve keep the offload path; `.threaded` is unchanged.
-  `netClose` is native too, to keep the registry free of closed fds. The carrier now dispatches
-  poller events and polls once per `fibers_max` dispatches.
+  `netClose` is native too, to keep the registry free of closed fds: a close wakes fibers parked
+  on the handle with `error.SocketNotListening`, from a fiber or from any other thread
+  (`src/net_registry.zig`). The carrier now dispatches poller events and polls once per
+  `fibers_max` dispatches. `EINTR` is retried or continued, never reported as `Unexpected`.
 - `src/backend/poller.zig` and `src/backend/kqueue.zig`: a one-shot readiness `Poller` on kqueue
   (fixed registration table allocated in `init`, thread-safe latched `wake`) and the contract
   epoll will share, with ADR 0003 (plan `004` item 2). Internal; nothing uses it yet.

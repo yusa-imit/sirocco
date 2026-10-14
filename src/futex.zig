@@ -299,7 +299,7 @@ fn slot_futex_wait(
             assert_always(concurrency.task_acknowledge_cancel(task));
             return error.Canceled;
         },
-        .idle, .waiting => unreachable, // Only `wake`, `expire` and `cancel_wait` unpark it.
+        .idle, .waiting, .closed, .closing => unreachable, // Only `wake`, `expire`, `cancel_wait`.
     }
 }
 

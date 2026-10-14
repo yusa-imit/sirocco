@@ -155,8 +155,10 @@ pub const Events = struct {
 /// Which readiness a fiber parked on a socket waits for (`src/net.zig`); `none` otherwise.
 pub const SocketWait = enum(u8) { none, read, write };
 
-/// How a fiber's address wait ended; `futex.zig` owns the transitions.
-pub const WaitOutcome = enum { idle, waiting, woken, timed_out, canceled };
+/// How a fiber's address wait ended; `futex.zig` owns the transitions. `closed` and `closing` are
+/// the socket waits whose handle was closed under them (`src/net_registry.zig`): `closed` leaves
+/// nothing to clean up, `closing` makes the waiter finish the close on the carrier.
+pub const WaitOutcome = enum { idle, waiting, woken, timed_out, canceled, closed, closing };
 
 /// A fiber's place in the futex table: a fiber waits on at most one address, so the record lives
 /// in the fiber and the table can neither allocate nor overflow past `fibers_max`. A sleeping
@@ -528,10 +530,7 @@ fn run_loop(sched: *Sched, io: Io, stop: ?*const bool) void {
 fn idle_wait(sched: *Sched, io: Io, version: u32, deadline_ns: ?i96) void {
     switch (sched.idle) {
         .futex => idle_wait_futex(&sched.inbox_version, io, version, deadline_ns),
-        .poller => |*native| {
-            // Proof: `idle_init` refuses `.poller` on a target without a poller.
-            if (comptime evented.Native == void) unreachable;
-            _ = native;
+        .poller => {
             assert(sched.inbox_version == 0);
             sched_io.idle_wait(sched, io, deadline_ns);
         },

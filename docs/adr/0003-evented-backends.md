@@ -116,7 +116,13 @@ std's `c.EV.EOF`, and OpenBSD and NetBSD lack `EVFILT_USER`, so kqueue is Darwin
   accepted fd switched back to blocking (it is held by nobody else), so it is foreign for life.
   `netClose` is native from item 4 (not 5): without it a closed fd would stay registered and a
   recycled fd number would be mistaken for a non-blocking socket. A registered fd that reappears
-  in `register` is a stale entry and is replaced. Option sets the native path does not serve
+  in `register` is a stale entry and is replaced (it must hold no waiters: closing a registered
+  fd behind the runtime while fibers wait on it is a caller bug and asserted). One lock guards
+  the slots and every waiter list, and the poller is armed under it, so a close cannot slip
+  between a lookup and an arm. A close on a fiber disarms, wakes the waiters with
+  `error.SocketNotListening` and frees the slot before `close(2)`. A close from any other thread
+  cannot touch the poller: it marks the slot closing and hands the waiters to `unpark_foreign`;
+  each runs on the carrier, disarms its interest, and the last closes the fd. Option sets the native path does not serve
   (non-TCP listen/connect modes, a connect timeout, IPv6 interface scopes, abstract Unix paths,
   `ip6_only`/`allow_broadcast` binds) take the foreign path. `Socket.createPair` offers only IP
   families, which no kernel serves, so it fails with `Unexpected` on both `Io`s.

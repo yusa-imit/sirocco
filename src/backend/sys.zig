@@ -6,12 +6,15 @@
 //! never a failure. `src/net.zig` maps `Error` onto each slot's own error set.
 //!
 //! Invariants: no call here blocks except `poll_block`, which the caller uses only off a fiber.
-//! No allocation, no clock. `accept` and `connect` never retry on `EINTR` themselves: the caller's
-//! loop owns the bound. Where the kernel has `accept4`/`SOCK_NONBLOCK` we still set the flags with
+//! No allocation, no clock. `accept` and `connect` never retry on `EINTR` themselves (the caller's
+//! loop owns the bound and reports `error.Interrupted`); `socket`, `socketpair`, `bind` and
+//! `listen` retry up to `attempts_max` times, then report it. Where the kernel has
+//! `accept4`/`SOCK_NONBLOCK` we still set the flags with
 //! `fcntl` after the call, so Darwin and Linux share one path; the window between create and
 //! `fcntl` is harmless because the descriptor is not yet visible to any other thread.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const stdx = @import("../stdx.zig");
 
 const posix = std.posix;
@@ -24,6 +27,8 @@ pub const fd_t = posix.fd_t;
 pub const Error = error{
     WouldBlock,
     InProgress,
+    /// `EINTR` after `attempts_max` retries (or from `accept`/`connect`, which the caller owns).
+    Interrupted,
     AddressInUse,
     AddressUnavailable,
     AddressFamilyUnsupported,
@@ -58,11 +63,22 @@ pub const Interest = enum { read, write };
 
 const attempts_max: u32 = 8;
 
+/// Calls `function(args...)` again while it fails with `EINTR`, at most `attempts_max` times in
+/// all; the last result is returned either way.
+fn retried(comptime function: anytype, args: anytype) @TypeOf(@call(.auto, function, args)) {
+    var rc = @call(.auto, function, args);
+    for (1..attempts_max) |_| {
+        if (posix.errno(rc) != .INTR) break;
+        rc = @call(.auto, function, args);
+    }
+    return rc;
+}
+
 /// A new socket, `O_NONBLOCK | O_CLOEXEC`. `domain` and `kind` are `AF` and `SOCK` values.
 pub fn socket_open(domain: u32, kind: u32, protocol: u32) Error!fd_t {
     assert(kind <= std.math.maxInt(u16));
     assert(domain != 0);
-    const rc = system.socket(domain, kind, protocol);
+    const rc = retried(system.socket, .{ domain, kind, protocol });
     if (posix.errno(rc) != .SUCCESS) return fail(posix.errno(rc));
     const fd: fd_t = @intCast(rc);
     errdefer close(fd);
@@ -76,7 +92,7 @@ pub fn socket_pair(domain: u32, kind: u32, protocol: u32) Error![2]fd_t {
     assert(kind <= std.math.maxInt(u16));
     assert(domain != 0);
     var fds: [2]fd_t = .{ -1, -1 };
-    const rc = system.socketpair(domain, kind, protocol, &fds);
+    const rc = retried(system.socketpair, .{ domain, kind, protocol, &fds });
     if (posix.errno(rc) != .SUCCESS) return fail(posix.errno(rc));
     errdefer close(fds[0]);
     errdefer close(fds[1]);
@@ -118,28 +134,33 @@ pub fn is_nonblocking(fd: fd_t) bool {
     return flags.NONBLOCK;
 }
 
+/// `SO_REUSEADDR`, and `SO_REUSEPORT` where the target has it: what `Io.Threaded` sets for
+/// `ListenOptions.reuse_address`.
 pub fn reuse_address_set(fd: fd_t) Error!void {
     assert(fd >= 0);
+    try option_on(fd, posix.SO.REUSEADDR);
+    if (@hasDecl(posix.SO, "REUSEPORT")) try option_on(fd, posix.SO.REUSEPORT);
+}
+
+fn option_on(fd: fd_t, name: u32) Error!void {
+    assert(fd >= 0);
     const one: c_int = 1;
-    const names = [_]u32{ posix.SO.REUSEADDR, posix.SO.REUSEPORT };
-    for (names) |name| {
-        const bytes = std.mem.asBytes(&one);
-        const rc = system.setsockopt(fd, posix.SOL.SOCKET, name, bytes, @sizeOf(c_int));
-        if (posix.errno(rc) != .SUCCESS) return fail(posix.errno(rc));
-    }
+    const bytes = std.mem.asBytes(&one);
+    const rc = system.setsockopt(fd, posix.SOL.SOCKET, name, bytes, @sizeOf(c_int));
+    if (posix.errno(rc) != .SUCCESS) return fail(posix.errno(rc));
 }
 
 pub fn bind(fd: fd_t, addr: *const Addr) Error!void {
     assert(fd >= 0);
     assert(addr.len > 0);
     const ptr: *const posix.sockaddr = @ptrCast(&addr.storage);
-    const rc = system.bind(fd, ptr, addr.len);
+    const rc = retried(system.bind, .{ fd, ptr, addr.len });
     if (posix.errno(rc) != .SUCCESS) return fail(posix.errno(rc));
 }
 
 pub fn listen(fd: fd_t, backlog: u31) Error!void {
     assert(fd >= 0);
-    const rc = system.listen(fd, backlog);
+    const rc = retried(system.listen, .{ fd, backlog });
     if (posix.errno(rc) != .SUCCESS) return fail(posix.errno(rc));
 }
 
@@ -238,6 +259,8 @@ pub fn addr_from_ip(ip: std.Io.net.IpAddress) Addr {
     return addr;
 }
 
+/// The IP address in `addr`; null for any other family (a Unix peer, for one), which the caller
+/// reports the way `Io.Threaded` does: the unspecified loopback address.
 pub fn addr_to_ip(addr: *const Addr) ?std.Io.net.IpAddress {
     const family: *const posix.sockaddr = @ptrCast(&addr.storage);
     switch (family.family) {
@@ -274,6 +297,7 @@ pub fn addr_from_unix(path: []const u8) ?Addr {
 
 fn fail(errno: posix.E) Error {
     return switch (errno) {
+        .INTR => error.Interrupted,
         .AGAIN => error.WouldBlock,
         .INPROGRESS, .ALREADY => error.InProgress,
         .ADDRINUSE => error.AddressInUse,
@@ -302,6 +326,35 @@ fn fail(errno: posix.E) Error {
 }
 
 const testing = std.testing;
+
+test "fail maps EINTR to Interrupted, not Unexpected" {
+    try testing.expectEqual(@as(Error, error.Interrupted), fail(.INTR));
+    try testing.expectEqual(@as(Error, error.Unexpected), fail(.IO));
+    try testing.expectEqual(@as(Error, error.WouldBlock), fail(.AGAIN));
+}
+
+var interrupts_left: u32 = 0;
+
+/// A stand-in syscall that fails with `EINTR` `interrupts_left` times, then succeeds.
+fn flaky_call() c_int {
+    if (interrupts_left == 0) return 0;
+    interrupts_left -= 1;
+    std.c._errno().* = @intFromEnum(posix.E.INTR);
+    return -1;
+}
+
+test "retried repeats EINTR up to attempts_max and then gives the last result" {
+    if (!builtin.os.tag.isDarwin()) return error.SkipZigTest; // Sets errno through std.c.
+    interrupts_left = attempts_max - 1;
+    try testing.expectEqual(@as(c_int, 0), retried(flaky_call, .{}));
+    try testing.expectEqual(@as(u32, 0), interrupts_left);
+
+    interrupts_left = attempts_max + 3;
+    const rc = retried(flaky_call, .{});
+    try testing.expectEqual(@as(c_int, -1), rc);
+    try testing.expectEqual(posix.E.INTR, posix.errno(rc));
+    try testing.expectEqual(@as(u32, 3), interrupts_left);
+}
 
 test "socket_pair is non-blocking, close-on-exec and connected" {
     const fds = try socket_pair(posix.AF.UNIX, posix.SOCK.STREAM, 0);
