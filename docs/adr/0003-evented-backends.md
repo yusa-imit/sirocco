@@ -110,6 +110,16 @@ std's `c.EV.EOF`, and OpenBSD and NetBSD lack `EVFILT_USER`, so kqueue is Darwin
 - `netClose` (item 5) removes the registry entry, disarms both interests and unparks waiters
   with an error, all before `close(2)`. A reused fd number therefore never inherits a
   registration or a stale event.
+- Item 4 as built: the registry is slots plus a `poller.Table` of fd -> slot, with a per-interest
+  waiter list threaded through `Fiber.wait`. A cancel unlinks the waiter and disarms when the list
+  empties; `Sched.events` carries the event handler. `netAccept` on a full registry returns the
+  accepted fd switched back to blocking (it is held by nobody else), so it is foreign for life.
+  `netClose` is native from item 4 (not 5): without it a closed fd would stay registered and a
+  recycled fd number would be mistaken for a non-blocking socket. A registered fd that reappears
+  in `register` is a stale entry and is replaced. Option sets the native path does not serve
+  (non-TCP listen/connect modes, a connect timeout, IPv6 interface scopes, abstract Unix paths,
+  `ip6_only`/`allow_broadcast` binds) take the foreign path. `Socket.createPair` offers only IP
+  families, which no kernel serves, so it fails with `Unexpected` on both `Io`s.
 - `registrations_max` = 2 x `sockets_max`. `Runtime` derives it, and no `Options` field is
   added. Arms from items 7 and 8 share this table: when it is full, `batchAwaitConcurrent`
   returns `ConcurrencyUnavailable` and `batchAwaitAsync` works in rounds.

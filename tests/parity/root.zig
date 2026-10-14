@@ -7,6 +7,7 @@ test {
     _ = @import("time.zig");
     _ = @import("dir.zig");
     _ = @import("offload.zig");
+    _ = @import("net.zig");
     _ = @import("concurrency.zig");
     _ = @import("cancel.zig");
     _ = @import("group.zig");

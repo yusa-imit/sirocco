@@ -24,7 +24,9 @@
 //! or a foreign wake. Under `.futex` it blocks in the baseline futex on `inbox_version`. Under
 //! `.poller` (ADR 0003) the `Sched` owns one `backend.poller.Native`, built in `init` and torn
 //! down in `deinit`, and the carrier blocks in `Poller.wait` with the time left to that deadline
-//! (`null` when none), so sockets armed later share the sleep. Nothing arms a socket yet.
+//! (`null` when none), so sockets armed by `src/net.zig` share the sleep: `src/sched_io.zig` hands
+//! each delivered event to `Sched.events`, which unparks the fibers it names, and polls without
+//! blocking once per `fibers_max` dispatches so a busy run queue cannot starve sockets.
 //!
 //! Threads: everything except `unpark_foreign` runs on the carrier thread. `unpark_foreign` may be
 //! called from any thread: it pushes onto a lock-free inbox, then wakes the carrier: under
@@ -46,6 +48,7 @@ const switch_context = @import("fiber_switch.zig").switch_context;
 const Wheel = @import("timer.zig");
 const sleep = @import("sleep.zig");
 const evented = @import("backend/poller.zig");
+const sched_io = @import("sched_io.zig");
 
 const Io = std.Io;
 const assert = stdx.assert;
@@ -77,6 +80,10 @@ expiry: ?Expiry,
 wheel: Wheel,
 /// Fiber `spawn_first` runs from outside `run`; `run_loop` returns once it switches out.
 first: ?*Fiber,
+/// Names the fibers a delivered poller event wakes; installed by `src/net.zig` before it arms.
+events: ?Events,
+/// Dispatches since the poller was last polled; `run_loop` polls at `fibers_max`.
+since_poll: u32,
 
 /// True when `Io.fiber` has context-switch assembly sirocco's entry trampolines also cover.
 /// Windows is excluded: the switch assembly assumes the SysV/AAPCS64 argument registers and
@@ -138,6 +145,16 @@ pub const Expiry = struct {
     futex_timeout: *const fn (ctx: *anyopaque, sched: *Sched, fiber: *Fiber) void,
 };
 
+/// What `sched_io` calls for each event the poller delivers; runs on the carrier, outside any
+/// fiber, and must unpark (via `unpark`) every fiber the event's token names.
+pub const Events = struct {
+    ctx: *anyopaque,
+    ready: *const fn (ctx: *anyopaque, sched: *Sched, event: evented.Event) void,
+};
+
+/// Which readiness a fiber parked on a socket waits for (`src/net.zig`); `none` otherwise.
+pub const SocketWait = enum(u8) { none, read, write };
+
 /// How a fiber's address wait ended; `futex.zig` owns the transitions.
 pub const WaitOutcome = enum { idle, waiting, woken, timed_out, canceled };
 
@@ -152,6 +169,8 @@ pub const Wait = struct {
     /// Carrier-only; true while parked in `sleep`.
     sleeping: bool,
     outcome: WaitOutcome,
+    /// Carrier-only; set while the fiber is parked on a socket, with `addr` its registry slot.
+    socket: SocketWait = .none,
 
     pub const none: Wait = .{
         .addr = 0,
@@ -240,6 +259,8 @@ fn init_checked(
         .expiry = null,
         .wheel = wheel,
         .first = null,
+        .events = null,
+        .since_poll = 0,
     };
     // Reverse order so the first `spawn` takes fiber 0 and the free list stays address-ordered.
     for (0..fibers.len) |offset| {
@@ -365,6 +386,11 @@ pub fn in_fiber(sched: *const Sched) bool {
     return false;
 }
 
+/// True while any socket readiness is armed in the poller (always false under `.futex`).
+pub fn armed_any(sched: *const Sched) bool {
+    return sched_io.armed_any(sched);
+}
+
 /// True when `spawn` would succeed, i.e. fewer than `fibers_max` fibers are alive.
 pub fn has_free_fiber(sched: *const Sched) bool {
     assert(sched.live_count <= sched.fibers.len);
@@ -487,6 +513,8 @@ fn run_loop(sched: *Sched, io: Io, stop: ?*const bool) void {
         sched.current = fiber;
         switch_context(&sched.carrier_context, &fiber.context);
         assert(sched.current == null);
+        sched.since_poll += 1;
+        if (sched.since_poll >= sched.fibers.len) sched_io.poll_fair(sched);
         if (sched.first == fiber) {
             sched.first = null;
             break;
@@ -503,8 +531,9 @@ fn idle_wait(sched: *Sched, io: Io, version: u32, deadline_ns: ?i96) void {
         .poller => |*native| {
             // Proof: `idle_init` refuses `.poller` on a target without a poller.
             if (comptime evented.Native == void) unreachable;
+            _ = native;
             assert(sched.inbox_version == 0);
-            idle_wait_poller(native, io, deadline_ns);
+            sched_io.idle_wait(sched, io, deadline_ns);
         },
     }
 }
@@ -519,29 +548,6 @@ fn idle_wait_futex(word: *const u32, io: Io, version: u32, deadline_ns: ?i96) vo
         // The carrier is no `Io` task, so nothing can cancel it; looping again is harmless anyway.
         error.Canceled => {},
     };
-}
-
-fn idle_wait_poller(native: *evented.Native, io: Io, deadline_ns: ?i96) void {
-    const timeout_ns: ?u64 = if (deadline_ns) |at|
-        timeout_until(at, Io.Clock.awake.now(io).nanoseconds)
-    else
-        null;
-    var events: [evented.events_max]evented.Event = undefined; // `wait` writes before any read.
-    const count = native.wait(timeout_ns, &events);
-    assert(count <= events.len);
-    // Nothing arms a descriptor yet (plan 004 item 4), so only a wake or the deadline ends it.
-    assert(count == 0);
-}
-
-/// The relative `Poller.wait` timeout for an absolute `deadline_ns`: the time left, 0 once it has
-/// passed. Both are `Clock.awake` nanoseconds.
-fn timeout_until(deadline_ns: i96, now_ns: i96) u64 {
-    assert(now_ns >= 0);
-    const remaining_ns = deadline_ns -| now_ns;
-    if (remaining_ns <= 0) return 0;
-    const timeout_ns = std.math.lossyCast(u64, remaining_ns);
-    assert(timeout_ns > 0);
-    return timeout_ns;
 }
 
 fn push_ready(sched: *Sched, fiber: *Fiber) void {
@@ -668,14 +674,6 @@ fn fiber_entry() callconv(.naked) void {
 
 fn test_options(fibers_max: u32, stack_size: u32) Options {
     return .{ .fibers_max = fibers_max, .stack_size = stack_size, .now_ns = 0, .idle = .futex };
-}
-
-test "timeout_until is the time left, never negative, saturating" {
-    try std.testing.expectEqual(@as(u64, 500), timeout_until(1_500, 1_000));
-    try std.testing.expectEqual(@as(u64, 0), timeout_until(1_000, 1_000));
-    try std.testing.expectEqual(@as(u64, 0), timeout_until(900, 1_000));
-    const far: i96 = std.math.maxInt(i96);
-    try std.testing.expectEqual(@as(u64, std.math.maxInt(u64)), timeout_until(far, 1));
 }
 
 test "canary detects a clobbered stack base" {

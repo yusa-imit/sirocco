@@ -360,8 +360,9 @@ test "no allocation beyond the runtime's, and nothing leaks, after await or canc
 
     const io = rt.io();
     // `io()` initialises the scheduler (fiber table, stack arena, the wheel's nodes, and the
-    // poller's table on an evented backend) and the offload pool's thread handles.
-    const init_blocks: usize = if (fixtures.backend == .threaded) 4 else 5;
+    // poller's table, and the socket registry's slots and table, on an evented backend) and the
+    // offload pool's thread handles.
+    const init_blocks: usize = if (fixtures.backend == .threaded) 4 else 7;
     try std.testing.expectEqual(init_blocks, failing.alloc_index);
     const live_after_init = failing.allocated_bytes - failing.freed_bytes;
     var trace = Trace.init();

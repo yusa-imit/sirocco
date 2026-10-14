@@ -34,7 +34,7 @@ lets that number decide. kqueue first: the dev box is macOS arm64; epoll is CI-o
       Why: offload completions and foreign futex wakes must reach a carrier asleep in kqueue.
       Verify: the full suite is green under `.kqueue` and `.threaded` (`tests/parity/fixtures.zig`);
       gate 7 is re-run on kqueue.
-- [ ] 4. `src/backend/sys.zig`: non-blocking POSIX socket calls returning `error.WouldBlock`, shared
+- [x] 4. `src/backend/sys.zig`: non-blocking POSIX socket calls returning `error.WouldBlock`, shared
       by both backends. `src/net.zig` goes native for `netListenIp`, `netBindIp`, `netAccept`,
       `netConnectIp` (`EINPROGRESS` -> arm write -> `SO_ERROR`), `netListenUnix`, `netConnectUnix`,
       `netSocketCreatePair`: a would-block parks the fiber on the poller, a cancel unparks it. Off

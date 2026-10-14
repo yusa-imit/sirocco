@@ -95,7 +95,7 @@ fn SlotFn(comptime name: []const u8) type {
     return @typeInfo(@FieldType(Io.VTable, name)).pointer.child;
 }
 
-fn ReturnOf(comptime name: []const u8) type {
+pub fn ReturnOf(comptime name: []const u8) type {
     return @typeInfo(SlotFn(name)).@"fn".return_type.?;
 }
 
@@ -122,17 +122,17 @@ pub fn Thunk(comptime name: []const u8) type {
     const Return = ReturnOf(name);
     return switch (arity) {
         2 => struct {
-            fn call(u: ?*anyopaque, a: ParamOf(name, 1)) Return {
+            pub fn call(u: ?*anyopaque, a: ParamOf(name, 1)) Return {
                 return run(name, u, .{a});
             }
         },
         3 => struct {
-            fn call(u: ?*anyopaque, a: ParamOf(name, 1), b: ParamOf(name, 2)) Return {
+            pub fn call(u: ?*anyopaque, a: ParamOf(name, 1), b: ParamOf(name, 2)) Return {
                 return run(name, u, .{ a, b });
             }
         },
         4 => struct {
-            fn call(
+            pub fn call(
                 u: ?*anyopaque,
                 a: ParamOf(name, 1),
                 b: ParamOf(name, 2),
@@ -142,7 +142,7 @@ pub fn Thunk(comptime name: []const u8) type {
             }
         },
         5 => struct {
-            fn call(
+            pub fn call(
                 u: ?*anyopaque,
                 a: ParamOf(name, 1),
                 b: ParamOf(name, 2),
@@ -153,7 +153,7 @@ pub fn Thunk(comptime name: []const u8) type {
             }
         },
         6 => struct {
-            fn call(
+            pub fn call(
                 u: ?*anyopaque,
                 a: ParamOf(name, 1),
                 b: ParamOf(name, 2),
