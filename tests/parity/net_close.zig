@@ -201,8 +201,9 @@ test "a Unix listener accepts a Unix connect; the peer reads as loopback port 0"
     defer rt.deinit();
 
     var path_buffer: [96]u8 = undefined;
-    const path = try std.fmt.bufPrint(&path_buffer, "/tmp/sirocco-net-{d}.sock", .{
-        std.c.getpid(),
+    // The stack address differs per process (ASLR), which keeps parallel runs apart without libc.
+    const path = try std.fmt.bufPrint(&path_buffer, "/tmp/sirocco-net-{x}.sock", .{
+        @intFromPtr(&path_buffer),
     });
     Io.Dir.deleteFileAbsolute(rt.baselineIo(), path) catch {};
     defer Io.Dir.deleteFileAbsolute(rt.baselineIo(), path) catch {};
@@ -306,7 +307,9 @@ test "canceling connects still in progress closes their sockets and disarms" {
 }
 
 fn is_blocking(fd: std.posix.fd_t) bool {
-    const status = std.c.fcntl(fd, std.posix.F.GETFL, @as(usize, 0));
+    const raw = std.posix.system.fcntl(fd, std.posix.F.GETFL, @as(usize, 0));
+    // Linux returns `usize` (errno folded in), libc returns `c_int`.
+    const status: isize = if (@TypeOf(raw) == usize) @bitCast(raw) else raw;
     std.debug.assert(status >= 0);
     const flags: std.posix.O = @bitCast(@as(u32, @intCast(status)));
     return !flags.NONBLOCK;
