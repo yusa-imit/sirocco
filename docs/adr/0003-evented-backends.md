@@ -122,10 +122,11 @@ std's `c.EV.EOF`, and OpenBSD and NetBSD lack `EVFILT_USER`, so kqueue is Darwin
   between a lookup and an arm. A close on a fiber disarms, wakes the waiters with
   `error.SocketNotListening` and frees the slot before `close(2)`. A close from any other thread
   cannot touch the poller: it marks the slot closing and hands the waiters to `unpark_foreign`;
-  each runs on the carrier, disarms its interest, and the last closes the fd. Option sets the native path does not serve
-  (non-TCP listen/connect modes, a connect timeout, IPv6 interface scopes, abstract Unix paths,
-  `ip6_only`/`allow_broadcast` binds) take the foreign path. `Socket.createPair` offers only IP
-  families, which no kernel serves, so it fails with `Unexpected` on both `Io`s.
+  each runs on the carrier, disarms its interest, and the last closes the fd. Option sets the
+  native path does not serve (non-TCP listen/connect modes, a connect timeout, IPv6 interface
+  scopes, abstract Unix paths, `ip6_only`/`allow_broadcast` binds) take the foreign path.
+  `Socket.createPair` offers only IP families, which no kernel serves, so it fails with
+  `Unexpected` on both `Io`s.
 - `registrations_max` = 2 x `sockets_max`. `Runtime` derives it, and no `Options` field is
   added. Arms from items 7 and 8 share this table: when it is full, `batchAwaitConcurrent`
   returns `ConcurrencyUnavailable` and `batchAwaitAsync` works in rounds.

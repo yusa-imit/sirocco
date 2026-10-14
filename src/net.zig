@@ -72,13 +72,18 @@ fn park(
         .gone => return error.Closed,
         .resources => return error.SystemResources,
     }
+    const index: u32 = @intCast(fiber.wait.addr);
+    const generation = rt.sockets.generation_of(index);
     concurrency.task_cancel_wake(task, fiber);
     rt.sched.park();
     concurrency.task_cancel_wake(task, null);
     const outcome = fiber.wait.outcome;
     fiber.wait = .none;
     switch (outcome) {
-        .woken => {},
+        .woken => {
+            // A close between the wake and this run left the fd closed or reused: leave it be.
+            if (!rt.sockets.still_open(index, generation, fd)) return error.Closed;
+        },
         .canceled => {
             // `cancel` ran because the request is pending and the task unprotected.
             assert_always(concurrency.task_acknowledge_cancel(task));

@@ -41,6 +41,8 @@ const Slot = struct {
     /// Set by a close from another thread; the slot lives until `closing_pending` waiters finish.
     closing: bool,
     closing_pending: u32,
+    /// Bumped each time the slot is freed: tells a woken waiter its socket was closed meanwhile.
+    generation: u32,
 };
 
 /// What `waiter_enter` did.
@@ -79,6 +81,7 @@ pub const Registry = struct {
                 .waiters = .{ null, null },
                 .closing = false,
                 .closing_pending = 0,
+                .generation = 0,
             };
         }
         target.slots = slots;
@@ -151,6 +154,7 @@ pub const Registry = struct {
             .waiters = .{ null, null },
             .closing = false,
             .closing_pending = 0,
+            .generation = slot.generation,
         };
         // Proof: the key was removed above and a free slot exists, so the table has room.
         registry.table.insert(poller.key(fd, .read), index) catch unreachable; // proof: above
@@ -199,6 +203,29 @@ pub const Registry = struct {
         return .parked;
     }
 
+    /// The generation of slot `index`, to be compared later by `still_open`. Any thread.
+    pub fn generation_of(registry: *Registry, index: u32) u32 {
+        registry.lock();
+        defer registry.mutex.unlock();
+
+        assert(index < registry.slots.len);
+        return registry.slots[index].generation;
+    }
+
+    /// True while slot `index` still holds `fd` as the same, not closing, socket it held when
+    /// `generation` was read. A fiber woken by an event checks it before retrying its syscall:
+    /// a close in the window between wake and run left the fd closed or reused. Any thread.
+    pub fn still_open(registry: *Registry, index: u32, generation: u32, fd: fd_t) bool {
+        registry.lock();
+        defer registry.mutex.unlock();
+
+        assert(index < registry.slots.len);
+        const slot = &registry.slots[index];
+        if (slot.generation != generation) return false;
+        assert_always(slot.fd == fd); // Same generation, same socket.
+        return !slot.closing;
+    }
+
     /// One waiter leaves because a cancelation reached it: unlink, disarm when it was the last,
     /// make it runnable with outcome `.canceled`. A no-op when an event or a close ended its wait
     /// first. Carrier-only; `fiber.wait.socket != .none`.
@@ -235,7 +262,7 @@ pub const Registry = struct {
             if (head == null) continue;
             sched_io.disarm(sched, fd, if (side == 0) .read else .write);
             var waiter = head;
-            for (0..sched.fibers.len) |_| {
+            for (0..sched.fibers.len + 1) |_| {
                 const fiber = waiter orelse break;
                 waiter = fiber.wait.next;
                 fiber.wait.prev = null;
@@ -243,6 +270,7 @@ pub const Registry = struct {
                 fiber.wait.outcome = .closed;
                 sched.unpark(fiber);
             }
+            assert_always(waiter == null); // More waiters than fibers: the list is corrupt.
         }
         release_locked(registry, index);
     }
@@ -262,11 +290,12 @@ pub const Registry = struct {
         var pending: u32 = 0;
         for (slot.waiters) |head| {
             var waiter = head;
-            for (0..sched.fibers.len) |_| {
+            for (0..sched.fibers.len + 1) |_| {
                 const fiber = waiter orelse break;
                 waiter = fiber.wait.next;
                 pending += 1;
             }
+            assert_always(waiter == null); // More waiters than fibers: the list is corrupt.
         }
         if (pending == 0) {
             release_locked(registry, index);
@@ -278,7 +307,7 @@ pub const Registry = struct {
         slot.waiters = .{ null, null };
         for (heads) |head| {
             var waiter = head;
-            for (0..sched.fibers.len) |_| {
+            for (0..sched.fibers.len + 1) |_| {
                 const fiber = waiter orelse break;
                 waiter = fiber.wait.next; // Read before the hand-off: the carrier may reuse it.
                 fiber.wait.prev = null;
@@ -286,6 +315,7 @@ pub const Registry = struct {
                 fiber.wait.outcome = .closing;
                 sched.unpark_foreign(io, fiber);
             }
+            assert_always(waiter == null); // Counted above: the list is intact.
         }
         return false;
     }
@@ -323,6 +353,7 @@ pub const Registry = struct {
         slot.waiters = .{ null, null };
         slot.closing = false;
         slot.closing_pending = 0;
+        slot.generation +%= 1;
         slot.next_free = registry.free_head;
         registry.free_head = @intCast(index);
     }
@@ -386,15 +417,15 @@ pub fn on_event(ctx: *anyopaque, sched: *Sched, event: poller.Event) void {
     assert_always(head.* != null); // Armed exactly while the list is non-empty.
     var waiter = head.*;
     head.* = null;
-    for (0..sched.fibers.len) |_| {
+    for (0..sched.fibers.len + 1) |_| {
         const fiber = waiter orelse break;
         waiter = fiber.wait.next;
         fiber.wait.prev = null;
         fiber.wait.next = null;
         fiber.wait.outcome = .woken;
         sched.unpark(fiber);
-    } else assert_always(false); // More waiters than fibers: the list is corrupt.
-    assert(waiter == null);
+    }
+    assert_always(waiter == null); // More waiters than fibers: the list is corrupt.
 }
 
 test "registry: slots recycle, a recycled fd replaces a stale entry, a full registry says so" {
@@ -430,4 +461,22 @@ test "registry: a closing slot is invisible to lookup and its table entry stays"
     try std.testing.expectEqual(@as(u32, 1), registry.count());
     registry.slots[index].closing = false;
     try std.testing.expect(registry.unregister(7));
+}
+
+test "registry: a freed slot changes generation, so a woken waiter sees the close" {
+    var registry: Registry = .empty;
+    try registry.init(std.testing.allocator, 1);
+    defer registry.deinit(std.testing.allocator);
+
+    const index = try registry.register(9);
+    const generation = registry.generation_of(index);
+    try std.testing.expect(registry.still_open(index, generation, 9));
+    try std.testing.expect(registry.unregister(9));
+    // The same fd number registered again lands in the same slot, yet is not the same socket.
+    try std.testing.expectEqual(index, try registry.register(9));
+    try std.testing.expect(!registry.still_open(index, generation, 9));
+    registry.slots[index].closing = true;
+    try std.testing.expect(!registry.still_open(index, registry.generation_of(index), 9));
+    registry.slots[index].closing = false;
+    try std.testing.expect(registry.unregister(9));
 }

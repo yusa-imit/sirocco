@@ -297,12 +297,13 @@ test "canceling connects still in progress closes their sockets and disarms" {
     // Nobody accepts: once the kernel's queue is full the handshake of a connect stays pending.
     var futures: [16]Io.Future(Address.ConnectError!void) = undefined;
     for (&futures) |*future| future.* = io.async(connect_close, .{ io, server.socket.address });
-    if (rt.sched.parked_count == 0) return error.SkipZigTest; // The kernel queued every one.
+    const queued_all = rt.sched.parked_count == 0; // The kernel queued every one.
 
     for (&futures) |*future| future.cancel(io) catch |err| switch (err) {
         error.Canceled, error.ConnectionRefused, error.Timeout => {},
         else => return err,
     };
+    if (queued_all) return error.SkipZigTest;
     try expect_clean(&rt, 1);
 }
 
