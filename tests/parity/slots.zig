@@ -28,7 +28,9 @@ pub const Divergence = struct {
 /// Slots implemented on sirocco's own fibers (where `Runtime.fibers_supported`; elsewhere they
 /// are forwarded, and `tests/parity/concurrency.zig` checks that too). Parity tests:
 /// `tests/parity/concurrency.zig`, `cancel.zig`, `group.zig`; the futex trio: `futex.zig` and
-/// `futex_sync.zig` (std's `Mutex`/`Condition`/`Event` on top of it); `sleep`: `time.zig`.
+/// `futex_sync.zig` (std's `Mutex`/`Condition`/`Event` on top of it); `sleep`: `time.zig`;
+/// the seven socket-creating `net*` slots and `netClose`
+/// (the registry's bookkeeping, plan 004 item 4): `net.zig`.
 pub const native: []const []const u8 = &.{
     "async",
     "await",
@@ -44,6 +46,14 @@ pub const native: []const []const u8 = &.{
     "futexWaitUncancelable",
     "futexWake",
     "sleep",
+    "netListenIp",
+    "netAccept",
+    "netBindIp",
+    "netConnectIp",
+    "netListenUnix",
+    "netConnectUnix",
+    "netSocketCreatePair",
+    "netClose",
 };
 
 /// Slots still forwarded to the embedded `Io.Threaded`.
@@ -125,18 +135,10 @@ pub const delegated: []const []const u8 = &.{
     "clockResolution",
     "random",
     "randomSecure",
-    "netListenIp",
-    "netAccept",
-    "netBindIp",
-    "netConnectIp",
-    "netListenUnix",
-    "netConnectUnix",
-    "netSocketCreatePair",
     "netSend",
     "netRead",
     "netWrite",
     "netWriteFile",
-    "netClose",
     "netShutdown",
     "netInterfaceNameResolve",
     "netInterfaceName",

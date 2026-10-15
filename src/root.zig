@@ -18,10 +18,13 @@ test {
     // Internal substrate: tested here, deliberately not public (ADR 0001: the surface is `Io`).
     _ = @import("sched.zig");
     _ = @import("sched_test.zig");
+    _ = @import("sched_io.zig");
     _ = @import("timer.zig");
     _ = @import("offload.zig");
     _ = @import("offload_slots.zig");
     _ = @import("backend/poller.zig");
     _ = @import("backend/kqueue.zig");
     _ = @import("backend/poller_test.zig");
+    _ = @import("backend/sys.zig");
+    _ = @import("net.zig");
 }

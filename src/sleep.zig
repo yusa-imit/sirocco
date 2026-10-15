@@ -172,7 +172,7 @@ fn slot_sleep(userdata: ?*anyopaque, timeout: Io.Timeout) Io.Cancelable!void {
             assert_always(concurrency.task_acknowledge_cancel(task));
             return error.Canceled;
         },
-        .idle, .waiting, .woken => unreachable, // Only the wheel and `cancel` unpark it.
+        .idle, .waiting, .woken, .closed, .closing => unreachable, // Only the wheel and `cancel`.
     }
 }
 

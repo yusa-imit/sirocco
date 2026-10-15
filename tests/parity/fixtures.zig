@@ -45,6 +45,18 @@ pub fn init_runtime_pool(
     fibers_max: u32,
     offload_threads: u32,
 ) Runtime.InitError!Runtime {
+    const sockets_max = sockets_max_default;
+    return init_runtime_sockets(gpa, unimplemented, fibers_max, offload_threads, sockets_max);
+}
+
+/// Like `init_runtime_pool` with an explicit registry size, for the evented socket tests.
+pub fn init_runtime_sockets(
+    gpa: std.mem.Allocator,
+    unimplemented: Runtime.Unimplemented,
+    fibers_max: u32,
+    offload_threads: u32,
+    sockets_max: u32,
+) Runtime.InitError!Runtime {
     return Runtime.init(gpa, .{
         .backend = backend,
         .unimplemented = unimplemented,
@@ -53,7 +65,7 @@ pub fn init_runtime_pool(
         .fibers_max = fibers_max,
         .fiber_stack_size = fiber_stack_size_default,
         .offload_threads = offload_threads,
-        .sockets_max = sockets_max_default,
+        .sockets_max = sockets_max,
     });
 }
 

@@ -66,6 +66,7 @@ const stdx = @import("stdx.zig");
 const Sched = @import("sched.zig");
 const Runtime = @import("runtime.zig");
 const futex = @import("futex.zig");
+const net = @import("net.zig");
 
 const Io = std.Io;
 const assert = stdx.assert;
@@ -193,6 +194,15 @@ pub fn sched_ensure(rt: *Runtime) void {
                     return;
                 },
             };
+            if (rt.backend != .threaded) {
+                rt.sockets.init(rt.threaded.allocator, rt.sockets_max) catch {
+                    rt.offload.deinit(rt.threaded.allocator);
+                    rt.sched.deinit(rt.threaded.allocator);
+                    rt.sched_state = .unavailable;
+                    return;
+                };
+                rt.sched.events = .{ .ctx = &rt.sockets, .ready = net.on_event };
+            }
             rt.sched.expiry = futex.expiry(&rt.waits);
             rt.sched_pin = @intFromPtr(&rt.sched);
             rt.sched_state = .ready;
@@ -342,6 +352,7 @@ fn task_request_cancel(task: *Task) void {
     }
     const fiber = task.waiting orelse return;
     const rt: *Runtime = @fieldParentPtr("sched", task.sched);
+    if (fiber.wait.socket != .none) return net.cancel(rt, fiber);
     futex.cancel_wait(&rt.waits, task.sched, fiber);
 }
 
