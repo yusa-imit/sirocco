@@ -247,17 +247,18 @@ pub const Registry = struct {
     }
 
     /// Close of `fd` on the carrier, from a fiber: disarm, wake every waiter with `.closed`
-    /// (they touch nothing of the slot again) and free the slot. A no-op when `fd` is not entered;
-    /// the caller closes the fd either way.
-    pub fn close_on_carrier(registry: *Registry, sched: *Sched, fd: fd_t) void {
+    /// (they touch nothing of the slot again) and free the slot. True when the caller closes the fd
+    /// (also when `fd` is not entered); false when a close from another thread got there first and
+    /// left the fd to its last waiter, so a second close must not touch it.
+    pub fn close_on_carrier(registry: *Registry, sched: *Sched, fd: fd_t) bool {
         assert(sched.in_fiber());
         registry.lock();
         defer registry.mutex.unlock();
 
-        const found = registry.table.get(poller.key(fd, .read)) orelse return;
+        const found = registry.table.get(poller.key(fd, .read)) orelse return true;
         const index: u32 = @intCast(found);
         const slot = &registry.slots[index];
-        assert_always(!slot.closing); // A double close, or a close racing a foreign one.
+        if (slot.closing) return false;
         for (slot.waiters, 0..) |head, side| {
             if (head == null) continue;
             sched_io.disarm(sched, fd, if (side == 0) .read else .write);
@@ -273,6 +274,7 @@ pub const Registry = struct {
             assert_always(waiter == null); // More waiters than fibers: the list is corrupt.
         }
         release_locked(registry, index);
+        return true;
     }
 
     /// Close of `fd` from a thread that is not the carrier's fiber. With no waiter the slot is

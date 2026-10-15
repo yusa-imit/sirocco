@@ -1,8 +1,9 @@
 //! Close, cancel and edge tests of the evented socket slots (plan 004 item 4, ADR 0003 section 3):
-//! a close that meets parked waiters, from a fiber, from a thread that is not the carrier's, and
-//! racing a real second thread; an accept off a fiber; bind and Unix sockets on the registry; a
-//! recycled fd number; two waiters on one listener; a cancel in the middle of a connect; and the
-//! registry-full overflow. Under `.threaded` the evented-only tests skip.
+//! a cancel after a readiness wake; a close that meets parked waiters, from a fiber, from a
+//! thread that is not the carrier's, and racing a real second thread; an accept off a fiber; bind
+//! and Unix sockets on the registry; a recycled fd number; two waiters on one listener; a cancel in
+//! the middle of a connect; and the registry-full overflow. Under `.threaded` the evented-only
+//! tests skip.
 
 const std = @import("std");
 const Io = std.Io;
@@ -277,6 +278,44 @@ test "canceling the head of two parked accepts keeps the other armed" {
 test "canceling the tail of two parked accepts keeps the other armed" {
     if (!fibers_supported or !evented) return error.SkipZigTest;
     try two_waiters(.tail);
+}
+
+const AcceptFuture = Io.Future(Server.AcceptError!void);
+
+/// Accepts, then cancels the other parked accept before yielding: the victim was woken by the
+/// same readiness event and has not run yet, so the cancel finds it `.woken`, not parked.
+fn accept_cancel_victim(io: Io, server: *Server, victim: *?*AcceptFuture, seen: *?bool) void {
+    const stream = server.accept(io) catch return;
+    stream.close(io);
+    const other = victim.* orelse return;
+    seen.* = if (other.cancel(io)) |_| false else |err| err == error.Canceled;
+}
+
+test "a cancel that lands after the readiness wake is honored on the retry" {
+    if (!fibers_supported or !evented) return error.SkipZigTest;
+    var rt = try fixtures.init_runtime_sockets(std.testing.allocator, .forward, 8, 1, 4);
+    defer rt.deinit();
+
+    const io = rt.io();
+    var listening = io.async(listen_loopback, .{io});
+    var server = try listening.await(io);
+    defer server.deinit(io);
+
+    var victim: ?*AcceptFuture = null;
+    var seen: ?bool = null;
+    // The most recent joiner heads the list and is woken first, so it is the one that cancels.
+    var second = io.async(accept_close, .{ io, &server });
+    victim = &second;
+    var first = io.async(accept_cancel_victim, .{ io, &server, &victim, &seen });
+    try std.testing.expectEqual(@as(u32, 2), rt.sched.parked_count);
+
+    var connecting = io.async(connect_close, .{ io, server.socket.address });
+    try connecting.await(io);
+    first.await(io);
+    try std.testing.expectEqual(@as(?bool, true), seen);
+    // The loser retried into WouldBlock only if the cancel was lost, and then it never returns.
+    try std.testing.expectEqual(@as(u32, 0), rt.sched.parked_count);
+    try std.testing.expect(!rt.sched.armed_any());
 }
 
 fn listen_backlog_one(io: Io) Address.ListenError!Server {

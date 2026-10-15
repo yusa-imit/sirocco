@@ -67,6 +67,9 @@ fn park(
 ) WaitError!void {
     const fiber = rt.sched.current_fiber();
     assert(fiber.wait.outcome == .idle);
+    // A cancel that arrived while this fiber was woken (not parked) found nothing to unpark, so
+    // every re-park after a spurious wake looks at the request again, as `futex` does.
+    if (concurrency.task_acknowledge_cancel(task)) return error.Canceled;
     switch (rt.sockets.waiter_enter(&rt.sched, fd, interest, fiber)) {
         .parked => {},
         .gone => return error.Closed,
@@ -435,8 +438,7 @@ fn slot_close(userdata: ?*anyopaque, handles: []const Socket.Handle) void {
 /// when a close from another thread left it to the last waiter (`net_registry.zig`).
 fn close_registered(rt: *Runtime, fd: fd_t) bool {
     if (rt.sched.in_fiber()) {
-        rt.sockets.close_on_carrier(&rt.sched, fd);
-        return true;
+        return rt.sockets.close_on_carrier(&rt.sched, fd);
     }
     return rt.sockets.close_off_carrier(&rt.sched, rt.baselineIo(), fd);
 }
