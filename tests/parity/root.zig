@@ -9,6 +9,8 @@ test {
     _ = @import("offload.zig");
     _ = @import("net.zig");
     _ = @import("net_close.zig");
+    _ = @import("net_data.zig");
+    _ = @import("net_data_edges.zig");
     _ = @import("concurrency.zig");
     _ = @import("cancel.zig");
     _ = @import("group.zig");

@@ -156,8 +156,12 @@ pub const Registry = struct {
             .closing_pending = 0,
             .generation = slot.generation,
         };
-        // Proof: the key was removed above and a free slot exists, so the table has room.
-        registry.table.insert(poller.key(fd, .read), index) catch unreachable; // proof: above
+        assert(registry.table.count < registry.table.count_max);
+        registry.table.insert(poller.key(fd, .read), index) catch |err| switch (err) {
+            // Proof: every table entry owns one occupied slot and the table holds as many entries
+            // as there are slots; a free slot was just taken, so `count < count_max` (asserted).
+            error.SystemResources => unreachable,
+        };
         return index;
     }
 
