@@ -9,7 +9,8 @@
 //! `error.SocketUnconnected` without touching the fd again. Dispatch per ADR: registered handle on
 //! a fiber: park on would-block; registered handle off a fiber: `poll(2)` on would-block; a foreign
 //! handle (or any handle under `.threaded`, whose registry is empty) takes the v0.4.0 offload
-//! thunk, and `netShutdown`, which never blocks, calls the baseline slot directly.
+//! thunk. A close under an off-fiber caller blocked in `poll(2)` is a caller bug: it has no
+//! registry entry to wake it. `netShutdown`, which never blocks, calls the baseline slot directly.
 //!
 //! Invariants: no allocation after init, no recursion, every retry loop bounded by
 //! `net.wakeups_max`. A write returns the bytes the kernel took, which may be fewer than offered,
@@ -331,4 +332,24 @@ test "iovecs_read skips empty buffers and caps at iovecs_max" {
     const iov = iovecs_read(&data, &out);
     try std.testing.expectEqual(@as(usize, 2), iov.len);
     try std.testing.expectEqual(@as(usize, 4), iov[0].len);
+}
+
+test "iovecs_read stops at iovecs_max and leaves the extra buffers for the next call" {
+    var bytes: [4]u8 = undefined;
+    var out: [sys.iovecs_max]posix.iovec = undefined;
+    var data: [sys.iovecs_max + 4][]u8 = undefined;
+    for (&data) |*buffer| buffer.* = &bytes;
+    const iov = iovecs_read(&data, &out);
+    try std.testing.expectEqual(@as(usize, sys.iovecs_max), iov.len);
+    try std.testing.expectEqual(@as(usize, 4), iov[sys.iovecs_max - 1].len);
+}
+
+test "iovecs_write caps header plus data at iovecs_max" {
+    var out: [sys.iovecs_max]posix.iovec_const = undefined;
+    var fill: [fill_len]u8 = undefined;
+    var data: [sys.iovecs_max + 4][]const u8 = undefined;
+    for (&data) |*buffer| buffer.* = "ab";
+    const count = iovecs_write(&out, &fill, "head", &data, 1);
+    try std.testing.expectEqual(@as(u32, sys.iovecs_max), count);
+    try std.testing.expect(out[0].base == "head".ptr);
 }

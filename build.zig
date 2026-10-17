@@ -67,7 +67,6 @@ pub fn build(b: *std.Build) void {
         const config = b.addOptions();
         config.addOption([]const u8, "backend", backend);
         const parity_tests = b.addTest(.{
-            .filters = &.{"read canceled in flight"},
             .root_module = b.createModule(.{
                 .root_source_file = b.path("tests/parity/root.zig"),
                 .target = target,

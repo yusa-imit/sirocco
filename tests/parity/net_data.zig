@@ -541,7 +541,8 @@ test "a native write against a full socket buffer is short and the rest follows"
     const result = try future.await(io);
     try std.testing.expect(result.first > 0);
     try std.testing.expect(result.first < payload.len);
-    try std.testing.expectEqual(@as(u64, payload.len - result.first), result.total);
+    // The receiver counts the short first write too, so everything offered arrives.
+    try std.testing.expectEqual(@as(u64, payload.len), result.total);
 }
 
 const send_buffer: [70_000]u8 = @splat('z');

@@ -36,7 +36,8 @@ exemption recorded in `citadel/protocol/VERSIONING.md`.
   non-blocking syscall (`readv`, `sendmsg`); a would-block parks the fiber on the poller and a
   cancel or a close ends the park (`src/net_data.zig`). `header`, `data` and a `splat` pattern
   reach the kernel as iovecs of the caller's buffers; a write returns the bytes the kernel took.
-  Foreign handles and `.threaded` keep the offload path.
+  Foreign handles and `.threaded` keep the offload path. The native-path parity tests run on the
+  kqueue build only; Linux CI covers them once epoll lands (item 6).
 - `src/backend/poller.zig` and `src/backend/kqueue.zig`: a one-shot readiness `Poller` on kqueue
   (fixed registration table allocated in `init`, thread-safe latched `wake`) and the contract
   epoll will share, with ADR 0003 (plan `004` item 2). Internal; nothing uses it yet.
