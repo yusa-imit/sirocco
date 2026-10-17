@@ -103,8 +103,10 @@ pub const Registry = struct {
         return registry.slots.len > 0;
     }
 
-    /// Sockets entered, closing ones included. Any thread.
+    /// Sockets entered, closing ones included; 0 for a disabled registry. Any thread.
     pub fn count(registry: *Registry) u32 {
+        if (!registry.enabled()) return 0;
+
         registry.lock();
         defer registry.mutex.unlock();
 
