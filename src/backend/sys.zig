@@ -235,6 +235,94 @@ pub fn poll_block(fd: fd_t, interest: Interest) void {
     }
 }
 
+/// What the data-path calls (`readv`, `sendmsg`, `shutdown`) report: the names of the `Io.net`
+/// read, write, send and shutdown error sets, so `src/net_data.zig` narrows by name.
+/// `WouldBlock` means "arm the poller and retry"; `Interrupted` is `EINTR` past `attempts_max`.
+pub const DataError = error{
+    WouldBlock,
+    Interrupted,
+    ConnectionResetByPeer,
+    ConnectionAborted,
+    SocketUnconnected,
+    SystemResources,
+    Timeout,
+    NetworkDown,
+    NetworkUnreachable,
+    HostUnreachable,
+    AddressFamilyUnsupported,
+    AccessDenied,
+    ConnectionRefused,
+    MessageOversize,
+    FastOpenAlreadyInProgress,
+    Unexpected,
+};
+
+/// Iovec entries one data-path call hands the kernel (std's `Io.Threaded` uses 8).
+pub const iovecs_max: u32 = 16;
+
+pub const ShutdownHow = enum { recv, send, both };
+
+/// The argument type of `iovcnt` on this target (`c_uint` on libc, `u32` or `i32` elsewhere).
+fn IovCount(comptime function: anytype) type {
+    return @typeInfo(@TypeOf(function)).@"fn".params[2].type.?;
+}
+
+/// One `readv`: the bytes read, 0 at end of stream. Precondition: `1 <= iov.len <= iovecs_max`.
+pub fn readv(fd: fd_t, iov: []const posix.iovec) DataError!usize {
+    assert(fd >= 0);
+    assert(iov.len >= 1);
+    assert(iov.len <= iovecs_max);
+    const count: IovCount(system.readv) = @intCast(iov.len);
+    const rc = retried(system.readv, .{ fd, iov.ptr, count });
+    if (posix.errno(rc) != .SUCCESS) return data_fail(posix.errno(rc));
+    return @intCast(rc);
+}
+
+/// One `sendmsg` with `MSG_NOSIGNAL` added to `flags`: the bytes the kernel took, which may be
+/// fewer than offered on a stream. Precondition: `msg` describes at most `iovecs_max` entries.
+pub fn sendmsg(fd: fd_t, msg: *const posix.msghdr_const, flags: u32) DataError!usize {
+    assert(fd >= 0);
+    assert(msg.iovlen <= iovecs_max);
+    const rc = retried(system.sendmsg, .{ fd, msg, flags | posix.MSG.NOSIGNAL });
+    if (posix.errno(rc) != .SUCCESS) return data_fail(posix.errno(rc));
+    return @intCast(rc);
+}
+
+pub fn shutdown(fd: fd_t, how: ShutdownHow) DataError!void {
+    assert(fd >= 0);
+    const posix_how: i32 = switch (how) {
+        .recv => posix.SHUT.RD,
+        .send => posix.SHUT.WR,
+        .both => posix.SHUT.RDWR,
+    };
+    const rc = retried(system.shutdown, .{ fd, posix_how });
+    if (posix.errno(rc) != .SUCCESS) return data_fail(posix.errno(rc));
+}
+
+/// The data-path reading of an errno. A descriptor, argument or socket-kind mistake (`EBADF`,
+/// `EINVAL`, `ENOTSOCK`, `EFAULT`, `EISCONN`, ...) is `Unexpected`, not a panic: a handle closed
+/// from another thread between the registry lookup and the call lands here legitimately.
+fn data_fail(errno: posix.E) DataError {
+    return switch (errno) {
+        .INTR => error.Interrupted,
+        .AGAIN => error.WouldBlock,
+        .CONNRESET => error.ConnectionResetByPeer,
+        .CONNABORTED => error.ConnectionAborted,
+        .NOTCONN, .PIPE => error.SocketUnconnected,
+        .NOBUFS, .NOMEM => error.SystemResources,
+        .TIMEDOUT => error.Timeout,
+        .NETDOWN => error.NetworkDown,
+        .NETUNREACH => error.NetworkUnreachable,
+        .HOSTUNREACH => error.HostUnreachable,
+        .AFNOSUPPORT => error.AddressFamilyUnsupported,
+        .ACCES, .PERM => error.AccessDenied,
+        .CONNREFUSED => error.ConnectionRefused,
+        .MSGSIZE => error.MessageOversize,
+        .ALREADY => error.FastOpenAlreadyInProgress,
+        else => error.Unexpected,
+    };
+}
+
 /// An IPv4/IPv6 address in kernel layout.
 pub fn addr_from_ip(ip: std.Io.net.IpAddress) Addr {
     var addr: Addr = .{ .storage = std.mem.zeroes(posix.sockaddr.storage), .len = 0 };
@@ -452,4 +540,39 @@ test "address conversion round-trips and rejects unusable unix paths" {
     try testing.expect(addr_from_unix("\x00abstract") == null);
     const long = [_]u8{'a'} ** 200;
     try testing.expect(addr_from_unix(&long) == null);
+}
+
+test "data_fail maps every errno it names to its exact variant and the rest to Unexpected" {
+    const Row = struct { errno: posix.E, expect: DataError };
+    const rows = [_]Row{
+        .{ .errno = .INTR, .expect = error.Interrupted },
+        .{ .errno = .AGAIN, .expect = error.WouldBlock },
+        .{ .errno = .CONNRESET, .expect = error.ConnectionResetByPeer },
+        .{ .errno = .CONNABORTED, .expect = error.ConnectionAborted },
+        .{ .errno = .NOTCONN, .expect = error.SocketUnconnected },
+        .{ .errno = .PIPE, .expect = error.SocketUnconnected },
+        .{ .errno = .NOBUFS, .expect = error.SystemResources },
+        .{ .errno = .NOMEM, .expect = error.SystemResources },
+        .{ .errno = .TIMEDOUT, .expect = error.Timeout },
+        .{ .errno = .NETDOWN, .expect = error.NetworkDown },
+        .{ .errno = .NETUNREACH, .expect = error.NetworkUnreachable },
+        .{ .errno = .HOSTUNREACH, .expect = error.HostUnreachable },
+        .{ .errno = .AFNOSUPPORT, .expect = error.AddressFamilyUnsupported },
+        .{ .errno = .ACCES, .expect = error.AccessDenied },
+        .{ .errno = .PERM, .expect = error.AccessDenied },
+        .{ .errno = .CONNREFUSED, .expect = error.ConnectionRefused },
+        .{ .errno = .MSGSIZE, .expect = error.MessageOversize },
+        .{ .errno = .ALREADY, .expect = error.FastOpenAlreadyInProgress },
+        // Descriptor, argument and socket-kind mistakes are Unexpected, never a panic.
+        .{ .errno = .BADF, .expect = error.Unexpected },
+        .{ .errno = .INVAL, .expect = error.Unexpected },
+        .{ .errno = .NOTSOCK, .expect = error.Unexpected },
+        .{ .errno = .FAULT, .expect = error.Unexpected },
+        .{ .errno = .ISCONN, .expect = error.Unexpected },
+        .{ .errno = .IO, .expect = error.Unexpected },
+    };
+    try testing.expect(rows.len > 0);
+    for (rows) |row| {
+        try testing.expectEqual(row.expect, data_fail(row.errno));
+    }
 }

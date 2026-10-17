@@ -103,8 +103,10 @@ pub const Registry = struct {
         return registry.slots.len > 0;
     }
 
-    /// Sockets entered, closing ones included. Any thread.
+    /// Sockets entered, closing ones included; 0 for a disabled registry. Any thread.
     pub fn count(registry: *Registry) u32 {
+        if (!registry.enabled()) return 0;
+
         registry.lock();
         defer registry.mutex.unlock();
 
@@ -156,8 +158,12 @@ pub const Registry = struct {
             .closing_pending = 0,
             .generation = slot.generation,
         };
-        // Proof: the key was removed above and a free slot exists, so the table has room.
-        registry.table.insert(poller.key(fd, .read), index) catch unreachable; // proof: above
+        assert(registry.table.count < registry.table.count_max);
+        registry.table.insert(poller.key(fd, .read), index) catch |err| switch (err) {
+            // Proof: every table entry owns one occupied slot and the table holds as many entries
+            // as there are slots; a free slot was just taken, so `count < count_max` (asserted).
+            error.SystemResources => unreachable,
+        };
         return index;
     }
 

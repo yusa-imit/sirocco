@@ -14,8 +14,10 @@
 //! mode the blocking `dir*`/`file*`/`net*` slots, `operate` and `childWait` are thunks that run
 //! the baseline call on the offload pool while the fiber parks (`src/offload_slots.zig`). On an
 //! evented backend (`.kqueue`) seven socket-creating `net*` slots and `netClose` are native
-//! (`src/net.zig`): sockets made on a fiber are non-blocking, entered in a `sockets_max` registry
-//! and parked on the poller; everything else, and every `.threaded` call, keeps the thunk.
+//! (`src/net.zig`), and so are `netRead`, `netWrite`, `netSend` and `netShutdown`
+//! (`src/net_data.zig`): sockets made on a fiber are non-blocking, entered in a `sockets_max`
+//! registry and parked on the poller; everything else, and every `.threaded` call, keeps the
+//! thunk.
 //!
 //! Invariants: the vtable has exactly 109 slots (`slots_count`, a comptime guard against a std
 //! bump); no field of `Runtime` holds a pointer into `Runtime` — `io()` and `baselineIo()` are
@@ -57,6 +59,7 @@ const futex = @import("futex.zig");
 const sleep = @import("sleep.zig");
 const Offload = @import("offload.zig");
 const net = @import("net.zig");
+const net_data = @import("net_data.zig");
 const offload_slots = @import("offload_slots.zig");
 
 const assert = stdx.assert;
@@ -202,6 +205,7 @@ pub fn init(gpa: std.mem.Allocator, options: Options) InitError!Runtime {
             .forward => {
                 offload_slots.install(&base);
                 net.install(&base);
+                net_data.install(&base);
             },
             .fail => {},
         }
@@ -330,7 +334,8 @@ test "forward mode installs every baseline slot except the native and offloaded 
     inline for (@typeInfo(Io.VTable).@"struct".fields) |field| {
         const forwarded = @field(native, field.name) == @field(baseline, field.name);
         const replaced = fibers_supported and
-            (is_future_slot(field.name) or is_offloaded(field.name) or net.is_native(field.name));
+            (is_future_slot(field.name) or is_offloaded(field.name) or net.is_native(field.name) or
+                net_data.is_native(field.name));
         try std.testing.expectEqual(!replaced, forwarded);
     }
 }

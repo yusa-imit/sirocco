@@ -30,7 +30,8 @@ pub const Divergence = struct {
 /// `tests/parity/concurrency.zig`, `cancel.zig`, `group.zig`; the futex trio: `futex.zig` and
 /// `futex_sync.zig` (std's `Mutex`/`Condition`/`Event` on top of it); `sleep`: `time.zig`;
 /// the seven socket-creating `net*` slots and `netClose`
-/// (the registry's bookkeeping, plan 004 item 4): `net.zig`.
+/// (the registry's bookkeeping, plan 004 item 4): `net.zig`; the data path (`netRead`,
+/// `netWrite`, `netSend`, `netShutdown`, plan 004 item 5): `net_data.zig`.
 pub const native: []const []const u8 = &.{
     "async",
     "await",
@@ -54,6 +55,10 @@ pub const native: []const []const u8 = &.{
     "netConnectUnix",
     "netSocketCreatePair",
     "netClose",
+    "netRead",
+    "netWrite",
+    "netSend",
+    "netShutdown",
 };
 
 /// Slots still forwarded to the embedded `Io.Threaded`.
@@ -135,11 +140,7 @@ pub const delegated: []const []const u8 = &.{
     "clockResolution",
     "random",
     "randomSecure",
-    "netSend",
-    "netRead",
-    "netWrite",
     "netWriteFile",
-    "netShutdown",
     "netInterfaceNameResolve",
     "netInterfaceName",
     "netLookup",
