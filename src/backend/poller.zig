@@ -5,8 +5,8 @@
 //! value types, the limits, the bounded `Table` that remembers armed pairs, and `contract`,
 //! which makes drift between backends a compile error.
 //!
-//! Invariants: `Native` is the one backend compiled for the target (kqueue on Darwin, `void`
-//! elsewhere until FreeBSD and epoll land). Registrations are one-shot. At most
+//! Invariants: `Native` is the one backend compiled for the target (kqueue on Darwin, epoll on
+//! Linux, `void` elsewhere until FreeBSD lands). Registrations are one-shot. At most
 //! `registrations_max` pairs are armed, the `Table` is allocated in `init` and never grows.
 //! Every `Poller` function except `wake` is carrier-only.
 
@@ -50,9 +50,11 @@ pub const fd_t = std.posix.fd_t;
 
 /// The evented backend of this target, chosen at comptime (ADR 0003: no vtable).
 /// kqueue is compiled for Darwin only: FreeBSD lacks `c.EV.EOF` in std, and OpenBSD and NetBSD
-/// lack `EVFILT_USER`. Every other target is `void` until its backend lands.
+/// lack `EVFILT_USER`. epoll is compiled for Linux. Every other target is `void` until its
+/// backend lands.
 pub const Native = switch (builtin.os.tag) {
     .macos, .ios, .tvos, .watchos, .visionos => @import("kqueue.zig"),
+    .linux => @import("epoll.zig"),
     else => void,
 };
 

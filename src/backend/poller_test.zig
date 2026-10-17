@@ -15,7 +15,8 @@ const shared = @import("poller.zig");
 const assert = stdx.assert;
 const assert_always = stdx.assert_always;
 const testing = std.testing;
-const c = std.c;
+const posix = std.posix;
+const system = posix.system;
 
 const Event = shared.Event;
 const Interest = shared.Interest;
@@ -29,37 +30,47 @@ const Pair = struct { a: fd_t, b: fd_t };
 
 fn pair_open() Pair {
     var fds: [2]fd_t = undefined;
-    assert_always(c.socketpair(c.AF.UNIX, c.SOCK.STREAM, 0, &fds) == 0);
-    const nonblock: c_int = @bitCast(c.O{ .NONBLOCK = true });
-    for (fds) |fd| {
-        const flags = c.fcntl(fd, c.F.GETFL, @as(c_int, 0));
-        assert_always(flags >= 0);
-        assert_always(c.fcntl(fd, c.F.SETFL, flags | nonblock) == 0);
-    }
+    const created = system.socketpair(posix.AF.UNIX, posix.SOCK.STREAM, 0, &fds);
+    assert_always(posix.errno(created) == .SUCCESS);
+    for (fds) |fd| nonblocking_set(fd);
     assert(fds[0] != fds[1]);
     return .{ .a = fds[0], .b = fds[1] };
 }
 
+fn nonblocking_set(fd: fd_t) void {
+    assert(fd >= 0);
+    const status = system.fcntl(fd, posix.F.GETFL, @as(usize, 0));
+    assert_always(posix.errno(status) == .SUCCESS);
+    var flags: posix.O = @bitCast(@as(u32, @intCast(status)));
+    flags.NONBLOCK = true;
+    const rc = system.fcntl(fd, posix.F.SETFL, @as(usize, @as(u32, @bitCast(flags))));
+    assert_always(posix.errno(rc) == .SUCCESS);
+}
+
 fn pair_close(pair: Pair) void {
     assert(pair.a != pair.b);
-    assert_always(c.close(pair.a) == 0);
-    if (pair.b >= 0) assert_always(c.close(pair.b) == 0);
+    close_fd(pair.a);
+    if (pair.b >= 0) close_fd(pair.b);
+}
+
+fn close_fd(fd: fd_t) void {
+    assert(fd >= 0);
+    assert_always(posix.errno(system.close(fd)) == .SUCCESS);
 }
 
 fn byte_write(fd: fd_t) void {
     const byte = [1]u8{0x5a};
     assert(fd >= 0);
-    assert_always(c.write(fd, &byte, 1) == 1);
+    assert_always(system.write(fd, &byte, 1) == 1);
 }
 
 /// True when a byte was read, false when the socket had none.
 fn byte_read(fd: fd_t) bool {
     var byte: [1]u8 = undefined;
     assert(fd >= 0);
-    const rc = c.read(fd, &byte, 1);
+    const rc = system.read(fd, &byte, 1);
     if (rc == 1) return true;
-    assert_always(rc == -1);
-    assert_always(c.errno(rc) == .AGAIN);
+    assert_always(posix.errno(rc) == .AGAIN);
     return false;
 }
 
@@ -233,7 +244,7 @@ fn case_hangup(comptime P: type) !void {
     defer pair_close(pair);
 
     try poller.arm(pair.a, .read, 33);
-    assert_always(c.close(pair.b) == 0);
+    close_fd(pair.b);
     pair.b = -1;
     var out: [4]Event = undefined;
     try testing.expectEqual(@as(u32, 1), poller.wait(wait_ns_max, &out));
@@ -419,9 +430,10 @@ fn case_init_oom_leaks_no_fd(comptime P: type) !void {
 
 /// The lowest free descriptor number: a leaked kernel queue would shift it.
 fn fd_probe(open_fd: fd_t) fd_t {
-    const fd = c.dup(open_fd);
-    assert_always(fd >= 0);
-    assert_always(c.close(fd) == 0);
+    const rc = system.dup(open_fd);
+    assert_always(posix.errno(rc) == .SUCCESS);
+    const fd: fd_t = @intCast(rc);
+    close_fd(fd);
     return fd;
 }
 
@@ -434,10 +446,12 @@ fn case_unpollable(comptime P: type) !void {
     try P.init(&poller, testing.allocator, .{ .registrations_max = 4 });
     defer poller.deinit(testing.allocator);
 
-    // The kernel queue refuses character devices such as /dev/null with EINVAL on macOS.
-    const fd = c.open("/dev/null", .{ .ACCMODE = .RDONLY });
-    assert_always(fd >= 0);
-    defer assert_always(c.close(fd) == 0);
+    // The kernel queue refuses character devices such as /dev/null: EINVAL on macOS, EPERM on
+    // Linux.
+    const opened = system.open("/dev/null", .{ .ACCMODE = .RDONLY }, @as(posix.mode_t, 0));
+    assert_always(posix.errno(opened) == .SUCCESS);
+    const fd: fd_t = @intCast(opened);
+    defer close_fd(fd);
 
     try testing.expectError(error.Unpollable, poller.arm(fd, .read, 1));
     try testing.expect(!poller.is_armed(fd, .read));
@@ -445,8 +459,7 @@ fn case_unpollable(comptime P: type) !void {
 
 test "poller: an fd the kernel will not poll is Unpollable" {
     if (comptime shared.Native == void) return error.SkipZigTest;
-    if (comptime !@import("builtin").os.tag.isDarwin()) return error.SkipZigTest;
-    try case_unpollable(shared.Native);
+    try run_case(case_unpollable);
 }
 
 /// The model test's world: eight socket pairs, a shadow of what is armed, and which bytes
@@ -525,12 +538,23 @@ fn model_disarm(comptime P: type, poller: *P, shadow: *Shadow, index: usize, i: 
     shadow.armed[index][@intFromEnum(i)] = false;
 }
 
+/// Polls until the kernel has nothing more to report. A backend may split the two ready
+/// interests of one fd over successive waits (epoll reports one raw event per fd), so the count
+/// is checked over the rounds, at most one per interest plus the empty one that ends them.
 fn model_wait(comptime P: type, poller: *P, shadow: *Shadow) !void {
     var out: [shared.events_max]Event = undefined;
     const expected = shadow.expected_count();
-    const n = poller.wait(0, &out);
-    try testing.expectEqual(expected, n);
-    for (out[0..n]) |event| try shadow.consume(event);
+    const rounds_max: u32 = 3;
+    var total: u32 = 0;
+    var last: u32 = undefined;
+    for (0..rounds_max) |_| {
+        last = poller.wait(0, &out);
+        for (out[0..last]) |event| try shadow.consume(event);
+        total += last;
+        if (last == 0) break;
+    }
+    try testing.expectEqual(@as(u32, 0), last);
+    try testing.expectEqual(expected, total);
 }
 
 fn case_model(comptime P: type) !void {

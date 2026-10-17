@@ -79,6 +79,27 @@ is on the carrier's idle path, so `poller.Native` is chosen at comptime. The one
 choice, evented or `.threaded`, is a `switch` on `Runtime.backend`. FreeBSD fails to compile
 std's `c.EV.EOF`, and OpenBSD and NetBSD lack `EVFILT_USER`, so kqueue is Darwin-only for now.
 
+### 2a. What epoll does differently (item 6)
+
+epoll keeps one kernel entry per fd, not per `(fd, interest)`, and `EPOLLONESHOT` disables the
+whole entry when either interest fires. `src/backend/epoll.zig` therefore keeps the `Table` as the
+truth about armed pairs and treats the kernel entry as derived state:
+
+- `arm` adds the entry with the union of the fd's armed interests (`EPOLL_CTL_ADD`, or `MOD`
+  when the other interest is armed or an earlier one-shot left a disabled entry behind, which
+  `ADD` reports as `EEXIST`). `disarm` modifies the entry down to the other interest, or deletes
+  it when none is left, so a pending event of the disarmed pair never surfaces.
+- One raw event yields one `Event`. When both interests are armed, the unused one is re-armed
+  with `MOD`; epoll is level-triggered, so the next `wait` reports it at once. Two ready
+  interests of one fd may therefore arrive over two `wait` calls (kqueue returns both at once),
+  and the conformance suite allows either. `ERR` and `HUP`
+  go to the read interest first, then, one `wait` later, to the write interest.
+- `wake` writes an `eventfd` that is registered level-triggered and never one-shot; `wait` reads
+  it to reset the latch. A write on a full counter (`EAGAIN`) is a pending wake already.
+- `epoll_wait` takes whole milliseconds, so a timeout is rounded up: `wait` may return 1 ms late,
+  never early. The wheel owns the precision (ADR 0002); gate 7 is measured on the dev box.
+- Regular files and `/dev/null` fail `EPOLL_CTL_ADD` with `EPERM`, which is `Unpollable`.
+
 ### 3. Socket ownership, and the registry for foreign fds (item 4)
 
 - A socket that sirocco creates on a fiber (`netListenIp`, `netBindIp`, `netAccept`,
@@ -180,8 +201,8 @@ at 1) on one carrier. Both `Io`s come from one `Runtime`, built ReleaseFast on t
 - Sockets created off a fiber, or beyond `sockets_max`, are foreign: correct, offloaded, slow.
 - Each park costs one extra syscall (the arm). The fairness poll costs one non-blocking
   `wait` per `fibers_max` dispatches.
-- epoll lands in item 6 against the same contract and `poller_test.zig`, and drift is a
-  compile error.
+- epoll (item 6) runs the same `poller_test.zig` and parity suite on Linux CI; drift between
+  the two pollers is a compile error.
 - Nothing changes under `.threaded`.
 - Item 10's numbers, not this ADR, decide whether multi-carrier comes next.
 - Plan 004 item 4's "off a fiber ... the v0.4.0 offload thunk runs" is superseded by the
