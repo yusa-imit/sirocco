@@ -41,7 +41,7 @@ lets that number decide. kqueue first: the dev box is macOS arm64; epoll is CI-o
       a fiber, or on a handle not in the `sockets_max` registry, the v0.4.0 offload thunk runs.
       Verify: `tests/parity/net.zig` in-fiber parity (incl. `ConnectionRefused`, `AddressInUse`);
       64 accept/connect pairs with `offload_threads = 1` (hangs if offloaded); parked-accept cancel.
-- [ ] 5. Data-path slots in `src/net.zig`: `netRead`/`netWrite` (`readv`/`writev`, with `header` and
+- [x] 5. Data-path slots in `src/net.zig`: `netRead`/`netWrite` (`readv`/`writev`, with `header` and
       `splat` not copied), `netSend` (`sendmsg`, partial count), `netShutdown`, `netClose`. A close
       disarms and unparks waiters before `close(2)`, so a reused fd never sees a stale event.
       Verify: a 1 MiB vectored and splat echo matches the baseline; read-cancel parity in flight

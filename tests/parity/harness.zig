@@ -64,7 +64,10 @@ fn expect_same_result(
     return expectSameOutcome(native, baseline);
 }
 
-fn call_in_fiber(
+/// Runs `call(io, args...)` in a fiber of `io` and awaits it from the calling thread, which keeps
+/// the scheduler turning while the call parks. A scenario that blocks in a data-path read must not
+/// run on the carrier thread itself: nothing would run the fibers it waits for.
+pub fn call_in_fiber(
     io: std.Io,
     comptime call: anytype,
     args: anytype,

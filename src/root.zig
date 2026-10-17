@@ -27,4 +27,5 @@ test {
     _ = @import("backend/poller_test.zig");
     _ = @import("backend/sys.zig");
     _ = @import("net.zig");
+    _ = @import("net_data.zig");
 }

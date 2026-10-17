@@ -31,6 +31,12 @@ exemption recorded in `citadel/protocol/VERSIONING.md`.
   on the handle with `error.SocketNotListening`, from a fiber or from any other thread
   (`src/net_registry.zig`). The carrier now dispatches poller events and polls once per
   `fibers_max` dispatches. `EINTR` is retried or continued, never reported as `Unexpected`.
+- Native socket data path on the evented poller (plan `004` item 5, ADR 0003 section 3): on
+  `.kqueue`, `netRead`, `netWrite`, `netSend` and `netShutdown` on a registered socket are one
+  non-blocking syscall (`readv`, `sendmsg`); a would-block parks the fiber on the poller and a
+  cancel or a close ends the park (`src/net_data.zig`). `header`, `data` and a `splat` pattern
+  reach the kernel as iovecs of the caller's buffers; a write returns the bytes the kernel took.
+  Foreign handles and `.threaded` keep the offload path.
 - `src/backend/poller.zig` and `src/backend/kqueue.zig`: a one-shot readiness `Poller` on kqueue
   (fixed registration table allocated in `init`, thread-safe latched `wake`) and the contract
   epoll will share, with ADR 0003 (plan `004` item 2). Internal; nothing uses it yet.
