@@ -43,7 +43,7 @@ const IpAddress = Io.net.IpAddress;
 const Socket = Io.net.Socket;
 
 /// Most wake-ups one call tolerates before reporting `WouldBlock` (a spurious-wake guard).
-const wakeups_max: u32 = 1 << 24;
+pub const wakeups_max: u32 = 1 << 24;
 
 pub const Registry = registry_mod.Registry;
 pub const on_event = registry_mod.on_event;
@@ -108,9 +108,10 @@ fn close_baseline(rt: *Runtime, fd: fd_t) void {
     baseline.vtable.netClose(baseline.userdata, &.{fd});
 }
 
-const Route = union(enum) { fallback, fiber: *concurrency.Task, blocking };
+pub const Route = union(enum) { fallback, fiber: *concurrency.Task, blocking };
 
-fn route(rt: *Runtime, fd: ?fd_t) Route {
+pub fn route(rt: *Runtime, fd: ?fd_t) Route {
+    assert(rt.sched_state == .ready);
     if (!rt.sockets.enabled()) return .fallback;
     const task = concurrency.current_task(rt);
     if (fd) |handle| {
@@ -122,24 +123,30 @@ fn route(rt: *Runtime, fd: ?fd_t) Route {
     return .{ .fiber = creator };
 }
 
-fn cancel_check(r: Route) Io.Cancelable!void {
+pub fn cancel_check(r: Route) Io.Cancelable!void {
     switch (r) {
         .fiber => |task| if (concurrency.task_acknowledge_cancel(task)) return error.Canceled,
         .blocking, .fallback => {},
     }
 }
 
-fn wait_for(
+/// Waits until `(fd, interest)` is ready (on a fiber: parks; off one: `poll(2)`). A handle closed
+/// during the wait ends the call with `closed`, the slot's own reading of "closed under me":
+/// `SocketNotListening` for an accept, `SocketUnconnected` for the data path.
+pub fn wait_for(
     comptime E: type,
     rt: *Runtime,
     r: Route,
     fd: fd_t,
     interest: poller.Interest,
+    closed: anyerror,
 ) E!void {
+    assert(fd >= 0);
+    assert(r != .fallback);
     switch (r) {
         .fiber => |task| park(rt, task, fd, interest) catch |err| switch (err) {
             // The handle was closed under the call, as `shutdown` does to a blocked accept.
-            error.Closed => return narrow(E, error.SocketNotListening),
+            error.Closed => return narrow(E, closed),
             else => return narrow(E, err),
         },
         .blocking => sys.poll_block(fd, switch (interest) {
@@ -151,7 +158,8 @@ fn wait_for(
 }
 
 /// `err` as a member of the slot's error set, or `error.Unexpected` when the set has no such name.
-fn narrow(comptime E: type, err: anyerror) E {
+pub fn narrow(comptime E: type, err: anyerror) E {
+    assert(@typeInfo(E) == .error_set);
     inline for (@typeInfo(E).error_set.?) |member| {
         if (std.mem.eql(u8, member.name, @errorName(err))) return @field(E, member.name);
     }
@@ -175,7 +183,7 @@ fn abandon(rt: *Runtime, fd: fd_t) void {
     sys.close(fd);
 }
 
-fn thunk(
+pub fn thunk(
     comptime name: []const u8,
     userdata: ?*anyopaque,
     args: anytype,
@@ -288,7 +296,7 @@ fn slot_accept(
             };
             return .{ .handle = fd, .address = address };
         } else |err| switch (err) {
-            error.WouldBlock => try wait_for(E, rt, r, server, .read),
+            error.WouldBlock => try wait_for(E, rt, r, server, .read, error.SocketNotListening),
             error.Interrupted => continue,
             else => return narrow(E, err),
         }
@@ -328,11 +336,11 @@ fn connect_wait(comptime E: type, rt: *Runtime, r: Route, fd: fd_t, addr: *const
         sys.connect(fd, addr) catch |err| switch (err) {
             // `EINTR` on a connect leaves the handshake running, like `EINPROGRESS`.
             error.InProgress, error.Interrupted => {
-                try wait_for(E, rt, r, fd, .write);
+                try wait_for(E, rt, r, fd, .write, error.SocketNotListening);
                 return sys.socket_error(fd) catch |e| narrow(E, e);
             },
             error.WouldBlock => {
-                try wait_for(E, rt, r, fd, .write);
+                try wait_for(E, rt, r, fd, .write, error.SocketNotListening);
                 continue;
             },
             else => return narrow(E, err),
