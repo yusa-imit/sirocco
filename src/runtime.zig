@@ -13,8 +13,8 @@
 //! and stays forwarded, so `.auto` and `.threaded` keep working on every target. In `.forward`
 //! mode the blocking `dir*`/`file*`/`net*` slots, `operate` and `childWait` are thunks that run
 //! the baseline call on the offload pool while the fiber parks (`src/offload_slots.zig`). On an
-//! evented backend (`.kqueue`) seven socket-creating `net*` slots and `netClose` are native
-//! (`src/net.zig`), and so are `netRead`, `netWrite`, `netSend` and `netShutdown`
+//! evented backend (`.kqueue`, `.epoll`) seven socket-creating `net*` slots and `netClose` are
+//! native (`src/net.zig`), and so are `netRead`, `netWrite`, `netSend` and `netShutdown`
 //! (`src/net_data.zig`): sockets made on a fiber are non-blocking, entered in a `sockets_max`
 //! registry and parked on the poller; everything else, and every `.threaded` call, keeps the
 //! thunk.
@@ -34,11 +34,12 @@
 //! `async` still allocates one task record per started task, as Threaded does; "no allocation
 //! after init" becomes true per slot group in later plan-002 items.
 //!
-//! Backends: `.threaded` idles the carrier in a futex; `.kqueue` (Darwin, where fibers exist)
-//! gives the scheduler one kqueue poller (`src/backend/kqueue.zig`, ADR 0003) that the carrier
-//! sleeps in until the next timer deadline, and that offload completions and foreign futex wakes
-//! reach through `Poller.wake`. `.auto` is `.kqueue` where that exists, else `.threaded`;
-//! `.epoll` and `.uring` are refused until their items land. The poller's table is sized from
+//! Backends: `.threaded` idles the carrier in a futex; `.kqueue` (Darwin) and `.epoll` (Linux),
+//! where fibers exist, give the scheduler one poller (`src/backend/kqueue.zig`,
+//! `src/backend/epoll.zig`, ADR 0003) that the carrier sleeps in until the next timer deadline,
+//! and that offload completions and foreign futex wakes reach through `Poller.wake`. `.auto` is
+//! the evented backend of the target where one exists, else `.threaded`; `.uring` is refused
+//! until its item lands. The poller's table is sized from
 //! `Options.sockets_max` (two registrations per socket) and allocated with the scheduler.
 //!
 //! Process-wide effects: `Io.Threaded.init` installs `SIGIO`/`SIGPIPE` handlers and `deinit`
@@ -108,8 +109,8 @@ comptime {
 }
 
 pub const Backend = enum {
-    /// Picks the best backend available on this target: `.kqueue` where it exists, else
-    /// `.threaded`. `Runtime.backend` holds the choice.
+    /// Picks the best backend available on this target: `.kqueue` on Darwin and `.epoll` on
+    /// Linux where fibers exist, else `.threaded`. `Runtime.backend` holds the choice.
     auto,
     kqueue,
     epoll,
@@ -149,24 +150,33 @@ pub const Options = struct {
 };
 
 pub const InitError = error{
-    /// The requested backend is not available here: `.kqueue` needs Darwin and fibers, and
-    /// `.epoll` and `.uring` do not exist yet.
+    /// The requested backend is not available here: `.kqueue` needs Darwin and fibers, `.epoll`
+    /// needs Linux and fibers, and `.uring` does not exist yet.
     BackendUnavailable,
 };
 
-// kqueue is compiled for Darwin only (ADR 0003) and needs the fiber scheduler to idle in it.
+// kqueue is compiled for Darwin only and epoll for Linux (ADR 0003); both need the fiber
+// scheduler to idle in them.
 const kqueue_supported = fibers_supported and evented.Native != void and
     builtin.os.tag.isDarwin();
+const epoll_supported = fibers_supported and evented.Native != void and
+    builtin.os.tag == .linux;
 
 fn backend_resolve(requested: Backend) InitError!Backend {
     const resolved: Backend = switch (requested) {
-        .auto => if (kqueue_supported) .kqueue else .threaded,
+        .auto => if (kqueue_supported)
+            .kqueue
+        else if (epoll_supported)
+            .epoll
+        else
+            .threaded,
         .threaded => .threaded,
         .kqueue => if (kqueue_supported) .kqueue else return error.BackendUnavailable,
-        .epoll, .uring => return error.BackendUnavailable,
+        .epoll => if (epoll_supported) .epoll else return error.BackendUnavailable,
+        .uring => return error.BackendUnavailable,
     };
     assert(resolved != .auto);
-    assert(resolved == .threaded or kqueue_supported);
+    assert(resolved == .threaded or kqueue_supported or epoll_supported);
     return resolved;
 }
 
@@ -256,13 +266,14 @@ pub fn io(rt: *Runtime) Io {
 }
 
 /// How the scheduler's carrier sleeps under this runtime's backend (`Sched.Options.idle`):
-/// `.threaded` in the futex, `.kqueue` in the poller with two registrations per socket.
+/// `.threaded` in the futex, `.kqueue` and `.epoll` in the poller with two registrations per
+/// socket.
 pub fn idle_options(rt: *const Runtime) Sched.IdleOptions {
     assert(rt.sockets_max > 0);
     return switch (rt.backend) {
         .threaded => .futex,
-        .kqueue => .{ .poller = .{ .registrations_max = 2 * rt.sockets_max } },
-        .auto, .epoll, .uring => unreachable, // `backend_resolve` never yields these.
+        .kqueue, .epoll => .{ .poller = .{ .registrations_max = 2 * rt.sockets_max } },
+        .auto, .uring => unreachable, // `backend_resolve` never yields these.
     };
 }
 
@@ -404,18 +415,13 @@ test "the scheduler is built by the first io() and pinned there" {
 }
 
 const kqueue_here = builtin.os.tag.isDarwin() and fibers_supported;
+const epoll_here = builtin.os.tag == .linux and fibers_supported;
 
 test "unavailable backends are refused" {
-    const options_unavailable: [2]Options = .{
-        test_options(.epoll, .fail),
-        test_options(.uring, .forward),
-    };
-    for (options_unavailable) |options| {
-        try std.testing.expectError(
-            error.BackendUnavailable,
-            Runtime.init(std.testing.allocator, options),
-        );
-    }
+    try std.testing.expectError(
+        error.BackendUnavailable,
+        Runtime.init(std.testing.allocator, test_options(.uring, .forward)),
+    );
     // kqueue exists exactly where the poller and the fibers do.
     const kqueue = Runtime.init(std.testing.allocator, test_options(.kqueue, .forward));
     if (kqueue_here) {
@@ -425,12 +431,26 @@ test "unavailable backends are refused" {
     } else {
         try std.testing.expectError(error.BackendUnavailable, kqueue);
     }
+    // epoll exists exactly where the poller and the fibers do, on Linux.
+    const epoll = Runtime.init(std.testing.allocator, test_options(.epoll, .fail));
+    if (epoll_here) {
+        var rt = try epoll;
+        defer rt.deinit();
+        try std.testing.expectEqual(Backend.epoll, rt.backend);
+    } else {
+        try std.testing.expectError(error.BackendUnavailable, epoll);
+    }
 }
 
-test "auto resolves to kqueue where kqueue and fibers exist, else threaded" {
+test "auto resolves to the evented backend where one and fibers exist, else threaded" {
     var rt: Runtime = try .init(std.testing.allocator, test_options(.auto, .forward));
     defer rt.deinit();
-    const expected: Backend = if (kqueue_here) .kqueue else .threaded;
+    const expected: Backend = if (kqueue_here)
+        .kqueue
+    else if (epoll_here)
+        .epoll
+    else
+        .threaded;
     try std.testing.expectEqual(expected, rt.backend);
     // An explicit `.threaded` stays threaded even where `.auto` goes evented.
     var threaded: Runtime = try .init(std.testing.allocator, test_options(.threaded, .forward));
@@ -455,8 +475,8 @@ test "the scheduler idles where the backend says, and sleeping works on both" {
         try std.testing.expectEqual(SchedState.ready, rt.sched_state);
         switch (rt.backend) {
             .threaded => try std.testing.expect(rt.sched.idle == .futex),
-            .kqueue => try std.testing.expect(rt.sched.idle == .poller),
-            .auto, .epoll, .uring => return error.TestUnexpectedResult,
+            .kqueue, .epoll => try std.testing.expect(rt.sched.idle == .poller),
+            .auto, .uring => return error.TestUnexpectedResult,
         }
     }
 }

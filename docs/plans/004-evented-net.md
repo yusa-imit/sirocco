@@ -47,7 +47,7 @@ lets that number decide. kqueue first: the dev box is macOS arm64; epoll is CI-o
       Verify: a 1 MiB vectored and splat echo matches the baseline; read-cancel parity in flight
       and under `.blocked`; when fiber B closes the socket fiber A is reading, A gets an error and
       does not hang (checked on `rt.io()` only, since Threaded defines no outcome for it).
-- [ ] 6. `src/backend/epoll.zig`: the same `Poller` on epoll (`EPOLLONESHOT`, an `eventfd` for
+- [x] 6. `src/backend/epoll.zig`: the same `Poller` on epoll (`EPOLLONESHOT`, an `eventfd` for
       `wake`), with `.auto` resolving to `.epoll` on Linux and a comptime check that both pollers
       export the same declarations. Why here: items 7-9 then land on both backends at once.
       Verify: the ubuntu CI job runs `poller_test.zig` and `tests/parity/net.zig` on epoll, and

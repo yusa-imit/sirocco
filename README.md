@@ -32,8 +32,8 @@ epoll(Linux) 백엔드로 109개 vtable 슬롯을 채우고, 아직 네이티브
 아직 되지 않았다. 파이버 스케줄러는 aarch64/x86_64에서만 동작하며
 (`Runtime.fibers_supported`), 그 외 타깃에서는 슬롯이 위임 상태로 남는다.
 (미출시, plan 004) `Options.sockets_max`는 필수이며, `Options.backend = .auto`는 macOS에서
-`.kqueue`(캐리어가 kqueue에서 대기, `docs/adr/0003-evented-backends.md`), 그 외에서는
-`.threaded`로 해석된다. 소켓 슬롯은 아직 네이티브가 아니다. 작업 순서는
+`.kqueue`, Linux에서는 `.epoll`(캐리어가 폴러에서 대기, `docs/adr/0003-evented-backends.md`),
+그 외에서는 `.threaded`로 해석된다. 소켓 슬롯은 아직 네이티브가 아니다. 작업 순서는
 `docs/plans/`가 기준이다. 안정 릴리즈 전까지 API는 변경될 수 있다.
 
 ## Design

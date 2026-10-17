@@ -24,6 +24,7 @@ test {
     _ = @import("offload_slots.zig");
     _ = @import("backend/poller.zig");
     _ = @import("backend/kqueue.zig");
+    _ = @import("backend/epoll.zig");
     _ = @import("backend/poller_test.zig");
     _ = @import("backend/sys.zig");
     _ = @import("net.zig");

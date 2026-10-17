@@ -56,14 +56,20 @@ pub fn build(b: *std.Build) void {
     const run_exe_tests = b.addRunArtifact(exe_tests);
     // Differential suite: every slot group runs on `rt.io()` and `rt.baselineIo()` (tests/parity).
     // Compiled once per backend so the whole suite is checked under each idle path: `.threaded`
-    // everywhere, `.kqueue` where the target has it.
+    // everywhere, `.kqueue` on Darwin, `.epoll` on Linux.
     const test_step = b.step("test", "Run unit tests");
     test_step.dependOn(&run_mod_tests.step);
     test_step.dependOn(&run_exe_tests.step);
-    const parity_backends = [_][]const u8{ "threaded", "kqueue" };
+    const parity_backends = [_][]const u8{ "threaded", "kqueue", "epoll" };
     for (parity_backends) |backend| {
-        const evented = !std.mem.eql(u8, backend, "threaded");
-        if (evented and !target.result.os.tag.isDarwin()) continue;
+        const os_tag = target.result.os.tag;
+        if (std.mem.eql(u8, backend, "kqueue") and !os_tag.isDarwin()) continue;
+        if (std.mem.eql(u8, backend, "epoll") and os_tag != .linux) continue;
+        // Fibers, which an evented runtime needs, exist on these architectures only.
+        const arch = target.result.cpu.arch;
+        if (!std.mem.eql(u8, backend, "threaded") and arch != .aarch64 and arch != .x86_64) {
+            continue;
+        }
         const config = b.addOptions();
         config.addOption([]const u8, "backend", backend);
         const parity_tests = b.addTest(.{

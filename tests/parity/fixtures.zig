@@ -3,9 +3,9 @@
 //! Every parity test builds its runtime here, so the option set (empty environment, fiber limits)
 //! is written once and a later item that runs the suite a second time under `.fail` changes one
 //! call, not every test. The backend comes from the build: `build.zig` compiles this suite once
-//! per backend (`parity_config.backend`, `.threaded` always, `.kqueue` on Darwin), so one source
-//! tree is checked under both idle paths. Ownership: the caller `deinit`s the returned runtime;
-//! it must not move after its first `io()`.
+//! per backend (`parity_config.backend`: `.threaded` always, `.kqueue` on Darwin, `.epoll` on
+//! Linux), so one source tree is checked under every idle path. Ownership: the caller `deinit`s
+//! the returned runtime; it must not move after its first `io()`.
 
 const std = @import("std");
 const Runtime = @import("sirocco").Runtime;
