@@ -541,3 +541,38 @@ test "address conversion round-trips and rejects unusable unix paths" {
     const long = [_]u8{'a'} ** 200;
     try testing.expect(addr_from_unix(&long) == null);
 }
+
+test "data_fail maps every errno it names to its exact variant and the rest to Unexpected" {
+    const Row = struct { errno: posix.E, expect: DataError };
+    const rows = [_]Row{
+        .{ .errno = .INTR, .expect = error.Interrupted },
+        .{ .errno = .AGAIN, .expect = error.WouldBlock },
+        .{ .errno = .CONNRESET, .expect = error.ConnectionResetByPeer },
+        .{ .errno = .CONNABORTED, .expect = error.ConnectionAborted },
+        .{ .errno = .NOTCONN, .expect = error.SocketUnconnected },
+        .{ .errno = .PIPE, .expect = error.SocketUnconnected },
+        .{ .errno = .NOBUFS, .expect = error.SystemResources },
+        .{ .errno = .NOMEM, .expect = error.SystemResources },
+        .{ .errno = .TIMEDOUT, .expect = error.Timeout },
+        .{ .errno = .NETDOWN, .expect = error.NetworkDown },
+        .{ .errno = .NETUNREACH, .expect = error.NetworkUnreachable },
+        .{ .errno = .HOSTUNREACH, .expect = error.HostUnreachable },
+        .{ .errno = .AFNOSUPPORT, .expect = error.AddressFamilyUnsupported },
+        .{ .errno = .ACCES, .expect = error.AccessDenied },
+        .{ .errno = .PERM, .expect = error.AccessDenied },
+        .{ .errno = .CONNREFUSED, .expect = error.ConnectionRefused },
+        .{ .errno = .MSGSIZE, .expect = error.MessageOversize },
+        .{ .errno = .ALREADY, .expect = error.FastOpenAlreadyInProgress },
+        // Descriptor, argument and socket-kind mistakes are Unexpected, never a panic.
+        .{ .errno = .BADF, .expect = error.Unexpected },
+        .{ .errno = .INVAL, .expect = error.Unexpected },
+        .{ .errno = .NOTSOCK, .expect = error.Unexpected },
+        .{ .errno = .FAULT, .expect = error.Unexpected },
+        .{ .errno = .ISCONN, .expect = error.Unexpected },
+        .{ .errno = .IO, .expect = error.Unexpected },
+    };
+    try testing.expect(rows.len > 0);
+    for (rows) |row| {
+        try testing.expectEqual(row.expect, data_fail(row.errno));
+    }
+}

@@ -595,3 +595,89 @@ test "a send that fails on its third datagram returns the count of two, as the b
     }
     try std.testing.expectEqual(@as(usize, 3 * 300), arrived);
 }
+
+// ---------------------------------------------------------------- (5) parked writer
+
+const write_chunk_len: usize = 64 * 1024;
+const write_chunk: [write_chunk_len]u8 = @splat('w');
+
+/// Writes until the call fails. The receiver never reads, so the tiny socket buffers fill and a
+/// write parks; only a cancel or a close ends the loop.
+fn write_until_error(io: Io, handle: Handle) WriteError!u64 {
+    var total: u64 = 0;
+    for (0..loops_max) |_| {
+        total += try raw_write(io, handle, &write_chunk);
+    }
+    // Proof: the socket buffers are 4 KiB each and nothing reads, so a write parks long before
+    // loops_max calls of 64 KiB could all be accepted.
+    unreachable;
+}
+
+/// A connected pair with shrunk buffers and a writer parked on the client end.
+const Parked = struct {
+    pair: Pair,
+    writing: Io.Future(WriteError!u64),
+
+    fn start(rt: *Runtime) !Parked {
+        const io = rt.io();
+        var making = io.async(connect_pair, .{io});
+        const pair = try making.await(io);
+        errdefer pair_close(io, pair);
+
+        buffers_shrink(pair.client.socket.handle);
+        buffers_shrink(pair.served.socket.handle);
+        const writing = io.async(write_until_error, .{ io, pair.client.socket.handle });
+        try std.testing.expectEqual(@as(u32, 1), rt.sched.parked_count);
+        try std.testing.expect(rt.sched.armed_any());
+        return .{ .pair = pair, .writing = writing };
+    }
+};
+
+test "a parked write canceled in flight returns Canceled and leaves the poller clean" {
+    if (!fibers_supported or !evented) return error.SkipZigTest;
+    var rt = try init_rt();
+    defer rt.deinit();
+
+    const io = rt.io();
+    var parked = try Parked.start(&rt);
+    defer pair_close(io, parked.pair);
+
+    try std.testing.expectError(error.Canceled, parked.writing.cancel(io));
+    try std.testing.expectEqual(@as(u32, 0), rt.sched.parked_count);
+    try std.testing.expect(!rt.sched.armed_any());
+    try std.testing.expectEqual(@as(u32, 2), rt.sockets.count());
+}
+
+test "closing the socket a fiber is writing to from a fiber gives the writer an error" {
+    if (!fibers_supported or !evented) return error.SkipZigTest;
+    var rt = try init_rt();
+    defer rt.deinit();
+
+    const io = rt.io();
+    var parked = try Parked.start(&rt);
+    defer parked.pair.served.close(io);
+
+    var closing = io.async(close_stream, .{ io, parked.pair.client });
+    closing.await(io);
+    try std.testing.expectError(error.SocketUnconnected, parked.writing.await(io));
+    try std.testing.expectEqual(@as(u32, 1), rt.sockets.count());
+    try std.testing.expect(!rt.sched.armed_any());
+}
+
+test "closing the socket a fiber is writing to from another thread gives the writer an error" {
+    if (!fibers_supported or !evented) return error.SkipZigTest;
+    var rt = try init_rt();
+    defer rt.deinit();
+
+    const io = rt.io();
+    var parked = try Parked.start(&rt);
+    defer parked.pair.served.close(io);
+
+    var go: std.atomic.Value(bool) = .init(false);
+    const closer = try std.Thread.spawn(.{}, close_after, .{ io, parked.pair.client, &go });
+    go.store(true, .release);
+    try std.testing.expectError(error.SocketUnconnected, parked.writing.await(io));
+    closer.join();
+    try std.testing.expectEqual(@as(u32, 1), rt.sockets.count());
+    try std.testing.expect(!rt.sched.armed_any());
+}
