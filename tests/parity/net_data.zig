@@ -673,11 +673,17 @@ test "closing the socket a fiber is writing to from another thread gives the wri
     var parked = try Parked.start(&rt);
     defer parked.pair.served.close(io);
 
+    // The carrier only runs inside `await`, so joining the closer first forces the interleaving:
+    // the close lands while the writer is parked and before any event can wake it. Closing
+    // concurrently with the carrier let a late ACK wake the writer, whose next `netWrite` then
+    // started after the close: a call on a closed handle, which is the caller's bug and reaches
+    // `Io.Threaded` as a foreign fd (issue 52).
     var go: std.atomic.Value(bool) = .init(false);
     const closer = try std.Thread.spawn(.{}, close_after, .{ io, parked.pair.client, &go });
     go.store(true, .release);
-    try std.testing.expectError(error.SocketUnconnected, parked.writing.await(io));
     closer.join();
+    try std.testing.expectEqual(@as(u32, 1), rt.sched.parked_count);
+    try std.testing.expectError(error.SocketUnconnected, parked.writing.await(io));
     try std.testing.expectEqual(@as(u32, 1), rt.sockets.count());
     try std.testing.expect(!rt.sched.armed_any());
 }
