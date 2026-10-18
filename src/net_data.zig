@@ -10,7 +10,9 @@
 //! a fiber: park on would-block; registered handle off a fiber: `poll(2)` on would-block; a foreign
 //! handle (or any handle under `.threaded`, whose registry is empty) takes the v0.4.0 offload
 //! thunk. A close under an off-fiber caller blocked in `poll(2)` is a caller bug: it has no
-//! registry entry to wake it. `netShutdown`, which never blocks, calls the baseline slot directly.
+//! registry entry to wake it. So is a call that starts after a close: the handle is no longer in
+//! the registry, so it takes the foreign path. Only a call already parked is ended by a close.
+//! `netShutdown`, which never blocks, calls the baseline slot directly.
 //!
 //! Invariants: no allocation after init, no recursion, every retry loop bounded by
 //! `net.wakeups_max`. A write returns the bytes the kernel took, which may be fewer than offered,
