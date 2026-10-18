@@ -29,4 +29,5 @@ test {
     _ = @import("backend/sys.zig");
     _ = @import("net.zig");
     _ = @import("net_data.zig");
+    _ = @import("submit.zig");
 }

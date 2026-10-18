@@ -38,7 +38,7 @@ const Socket = Io.net.Socket;
 const Stream = Io.net.Stream;
 
 /// Bytes of the stack fill a one-byte `splat` pattern is expanded into.
-const fill_len: u32 = 256;
+pub const fill_len: u32 = 256;
 
 const SendResult = struct { ?Socket.SendError, usize };
 
@@ -182,7 +182,7 @@ fn slot_shutdown(
 /// The non-empty buffers of `data` (at most `out.len`) as iovecs: the kernel reads the iovec base
 /// before its length, so an empty buffer must not be passed. Precondition, as `Io.Threaded`'s:
 /// `data` holds at least one non-empty buffer.
-fn iovecs_read(data: []const []u8, out: *[sys.iovecs_max]posix.iovec) []const posix.iovec {
+pub fn iovecs_read(data: []const []u8, out: *[sys.iovecs_max]posix.iovec) []const posix.iovec {
     assert(data.len > 0);
     var count: u32 = 0;
     for (data) |buffer| {
@@ -199,7 +199,7 @@ fn iovecs_read(data: []const []u8, out: *[sys.iovecs_max]posix.iovec) []const po
 /// Lays `header`, every element of `data` but the last, then `splat` copies of the last element
 /// (the pattern) into `out`, skipping empty buffers and stopping when `out` is full. A partial
 /// layout is correct: a write may take fewer bytes than offered. Returns the entry count.
-fn iovecs_write(
+pub fn iovecs_write(
     out: *[sys.iovecs_max]posix.iovec_const,
     fill: *[fill_len]u8,
     header: []const u8,

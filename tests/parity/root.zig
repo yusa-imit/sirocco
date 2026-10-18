@@ -11,6 +11,8 @@ test {
     _ = @import("net_close.zig");
     _ = @import("net_data.zig");
     _ = @import("net_data_edges.zig");
+    _ = @import("operate.zig");
+    _ = @import("operate_files.zig");
     _ = @import("concurrency.zig");
     _ = @import("cancel.zig");
     _ = @import("group.zig");

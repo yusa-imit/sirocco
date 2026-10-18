@@ -2,6 +2,10 @@
 //! and `net*` slots plus `operate` and `childWait`, each replaced by a thunk that runs the
 //! baseline `Io.Threaded` function on the offload pool while the calling fiber parks.
 //!
+//! `operate` is the fallback of `src/submit.zig`: its thunk serves blocking files,
+//! `device_io_control` and handles the registry does not know; `submit` serves `net_receive` on
+//! a registered socket and non-blocking file streams natively over it.
+//!
 //! Purpose: a forwarded call blocks its thread in the kernel, and the one carrier runs every
 //! fiber, so one call freezes them all. The thunk submits the call to `Offload` and parks; the
 //! carrier runs other fibers until the worker finishes.

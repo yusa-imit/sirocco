@@ -31,7 +31,8 @@ pub const Divergence = struct {
 /// `futex_sync.zig` (std's `Mutex`/`Condition`/`Event` on top of it); `sleep`: `time.zig`;
 /// the seven socket-creating `net*` slots and `netClose`
 /// (the registry's bookkeeping, plan 004 item 4): `net.zig`; the data path (`netRead`,
-/// `netWrite`, `netSend`, `netShutdown`, plan 004 item 5): `net_data.zig`.
+/// `netWrite`, `netSend`, `netShutdown`, plan 004 item 5): `net_data.zig`. `operate` is divergent
+/// (below): `operate.zig`.
 pub const native: []const []const u8 = &.{
     "async",
     "await",
@@ -63,7 +64,6 @@ pub const native: []const []const u8 = &.{
 
 /// Slots still forwarded to the embedded `Io.Threaded`.
 pub const delegated: []const []const u8 = &.{
-    "operate",
     "batchAwaitAsync",
     "batchAwaitConcurrent",
     "batchCancel",
@@ -150,6 +150,14 @@ pub const delegated: []const []const u8 = &.{
 /// permits the difference.
 pub const divergent: []const Divergence = &.{
     .{
+        .name = "operate",
+        .contract = "Io.Operation.FileReadStreaming.UnendingError.WouldBlock doc comment: " ++
+            "\"Non-blocking has been enabled, and reading from the file descriptor would " ++
+            "block.\" On a file opened non-blocking, `rt.io()` called on a fiber of an evented " ++
+            "backend waits for the file to become ready (plan 004 item 7) where Io.Threaded " ++
+            "returns that error; every other operation, handle and backend matches Io.Threaded.",
+    },
+    .{
         .name = "groupConcurrent",
         .contract = "Io.ConcurrentError.ConcurrencyUnavailable doc comment: \"May occur due " ++
             "to a temporary condition such as resource exhaustion, or to the Io implementation " ++
@@ -231,7 +239,7 @@ test "the shipped table accounts for all 109 slots" {
 
 test "removing a name from the table is reported" {
     const problem = comptime audit(native, delegated[1..], divergent) orelse "";
-    try std.testing.expect(contains(problem, "`operate`"));
+    try std.testing.expect(contains(problem, "`batchAwaitAsync`"));
     try std.testing.expect(contains(problem, "no list"));
 }
 
@@ -248,8 +256,8 @@ test "a name in two lists is reported" {
 }
 
 test "a name repeated inside one list is reported" {
-    const problem = comptime audit(native, delegated ++ &[_][]const u8{"operate"}, divergent);
-    try std.testing.expect(contains(problem orelse "", "`operate`"));
+    const problem = comptime audit(native, delegated ++ &[_][]const u8{"batchCancel"}, divergent);
+    try std.testing.expect(contains(problem orelse "", "`batchCancel`"));
 }
 
 test "delegated slots are the baseline's own function, native ones are not" {
@@ -293,7 +301,7 @@ test "a divergence must cite its contract, and a cited one moves the slot out of
     const uncited = comptime audit(
         native,
         delegated[1..],
-        divergent ++ &[_]Divergence{.{ .name = "operate", .contract = "" }},
+        divergent ++ &[_]Divergence{.{ .name = "batchAwaitAsync", .contract = "" }},
     ) orelse "";
     try std.testing.expect(contains(uncited, "cites no contract"));
 
@@ -301,7 +309,7 @@ test "a divergence must cite its contract, and a cited one moves the slot out of
         native,
         delegated[1..],
         divergent ++ &[_]Divergence{
-            .{ .name = "operate", .contract = "Io.VTable.operate doc comment" },
+            .{ .name = "batchAwaitAsync", .contract = "Io.VTable.batchAwaitAsync doc comment" },
         },
     );
     try std.testing.expect(cited == null);

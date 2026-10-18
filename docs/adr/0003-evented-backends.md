@@ -3,7 +3,7 @@
 - Status: proposed — merging the plan 004 item 2 PR accepts it; item 10 may append the
   "Gate 1 on one carrier" section, and a comment on the plan 004 milestone issue reopens it
 - Date: 2026-10-13
-- Plan: `docs/plans/004-evented-net.md`, items 2 to 6 and 10
+- Plan: `docs/plans/004-evented-net.md`, items 2 to 7 and 10
 - Builds on: ADR 0001 (hybrid vtable), ADR 0002 (offload before multi-carrier)
 
 ## Context
@@ -99,6 +99,34 @@ truth about armed pairs and treats the kernel entry as derived state:
 - `epoll_wait` takes whole milliseconds, so a timeout is rounded up: `wait` may return 1 ms late,
   never early. The wheel owns the precision (ADR 0002); gate 7 is measured on the dev box.
 - Regular files and `/dev/null` fail `EPOLL_CTL_ADD` with `EPERM`, which is `Unpollable`.
+
+### 2b. `operate` on the poller (item 7)
+
+`src/submit.zig` replaces the `operate` thunk for three cases and leaves the thunk as its fallback:
+
+- **`net_receive`** on a registered socket: `recvmsg` (always `MSG_DONTWAIT`), a would-block arms
+  the read interest and parks. Results follow `Io.Threaded`: `message_buffer[0]` is filled and
+  the result is `{ null, 1 }`, an error is `{ error, 0 }`, `Canceled` rides the outer channel.
+  The datagram, truncation, peek and empty-buffer cases are parity tests.
+- **`file_read_streaming` / `file_write_streaming`** on a file whose `flags.nonblocking` is set.
+  This is the exception ADR section 3 reserved: the caller declared the file non-blocking, so
+  sirocco may arm it without touching the shared `O_NONBLOCK` flag. `Io.Threaded` returns
+  `WouldBlock` there; sirocco waits instead, so `slots.zig` lists `operate` as `divergent`
+  (a fiber on an evented backend never sees that `WouldBlock`; `.threaded` still does).
+- **Blocking files, `device_io_control` and unregistered sockets** keep the offload thunk.
+
+A file fd is not a socket, so it is not created into the registry. A call on a fiber takes a
+**lease** (`Registry.lease`) for its own length and releases it on every exit, so no file stays
+registered and a recycled fd number cannot inherit a registration or a stale event. Fibers
+waiting on one pipe share one slot through a per-slot lease count. Leases count against
+`sockets_max` (one slot per distinct file in flight, two poller registrations at most), which
+is the documented choice over a second table: one lock, one `Table`, one cancel path.
+
+When no slot is free the call runs on an offload worker that waits in `poll(2)` and retries, so
+a full registry degrades to ADR 0002's offload path and never leaks `WouldBlock` (it cannot be
+interrupted once submitted, as for every offloaded call). Off a fiber the calling thread waits in
+`poll(2)`, as for sockets. Regular files never report would-block, so they never arm.
+`batchAwaitAsync`/`batchAwaitConcurrent` (item 8) will share the lease and the table.
 
 ### 3. Socket ownership, and the registry for foreign fds (item 4)
 
