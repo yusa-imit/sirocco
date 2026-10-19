@@ -68,6 +68,9 @@ lets that number decide. kqueue first: the dev box is macOS arm64; epoll is CI-o
       batch to `Io.Threaded` otherwise; the wait is wheel slices (50 us to 2 ms), not a poller
       park, because a fiber sits on one waiter list only. It never needs a registration, so it
       never returns `ConcurrencyUnavailable`.
+- [ ] 8b. Replace the wheel slices of item 8 with a per-operation waiter node in the registry, so
+      an idle batch wakes on the poller event (no 2 ms latency, no `recvmsg` per slice). Verify:
+      `tests/parity/batch.zig` idle-wake latency below one wheel tick; allocations flat.
 - [ ] 9. `concurrent`/`groupConcurrent` in `src/concurrency.zig` run on a free fiber once the
       scheduler is ready, and return `ConcurrencyUnavailable` when none is free. Why: plan 003
       deferred this to the backend plan, and the echo bench needs one server task per connection

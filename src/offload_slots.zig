@@ -16,10 +16,10 @@
 //! scheduler is `.unavailable`) there is no carrier to protect and it calls the baseline slot
 //! directly. A pending cancel is delivered before submit when the error set has `Canceled`;
 //! once submitted the call completes (ADR 0001), and its cancelation point is the next slot.
-//! Slots outside the set (`batch*`, the stderr lock, `process*`, `child*` but `childWait`,
-//! `netLookup`, `now`, `random*`, and the cheap or unblocking calls in `kept_on_carrier`) are in
-//! the ADR with their reasons; `netLookup` also fills a queue through the baseline's futexes,
-//! which sirocco's native futex table never sees.
+//! Slots outside the set (`batch*`, which `src/batch.zig` serves or forwards whole; the stderr
+//! lock, `process*`, `child*` but `childWait`, `netLookup`, `now`, `random*`, and the cheap or
+//! unblocking calls in `kept_on_carrier`) are in the ADR with their reasons; `netLookup` also
+//! fills a queue through the baseline's futexes, which sirocco's native futex table never sees.
 //!
 //! A started call cannot be interrupted: a `netAccept` or read that never completes holds its
 //! worker, and a `cancel` or `Group.cancel` of its task waits for it. The cancel is not lost, it

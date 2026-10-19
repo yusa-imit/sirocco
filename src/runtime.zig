@@ -18,7 +18,10 @@
 //! (`src/net_data.zig`): sockets made on a fiber are non-blocking, entered in a `sockets_max`
 //! registry and parked on the poller. `operate` is native for `net_receive` on such a socket and
 //! for streaming file reads and writes on a file opened non-blocking (`src/submit.zig`); blocking
-//! files, `device_io_control`, everything else, and every `.threaded` call keep the thunk.
+//! files, `device_io_control`, everything else, and every `.threaded` call keep the thunk. The
+//! batch slots are native for a batch awaited on a fiber whose operations are all one-message
+//! `net_receive`s on registered sockets or non-blocking file streams (`src/batch.zig`); any other
+//! batch goes whole to `Io.Threaded`, which holds the carrier.
 //!
 //! Invariants: the vtable has exactly 109 slots (`slots_count`, a comptime guard against a std
 //! bump); no field of `Runtime` holds a pointer into `Runtime` — `io()` and `baselineIo()` are

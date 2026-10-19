@@ -46,13 +46,14 @@ const posix = std.posix;
 const assert = stdx.assert;
 const assert_always = stdx.assert_always;
 const OptionalIndex = Io.Operation.OptionalIndex;
+const NetReceive = Io.Operation.NetReceive;
 
 /// Slice of one idle sleep in nanoseconds: it starts short for a quick answer and doubles to the
 /// cap, so a long idle costs about 500 sweeps a second.
 const slice_ns_min: i96 = 50_000;
 const slice_ns_max: i96 = 2_000_000;
 
-/// Sweeps per await; at the 2 ms cap this is over 70 years, so the bound is never the exit.
+/// Sweeps per await; at the 2 ms cap this is about 70 years, so the bound is never the exit.
 const rounds_max: u64 = 1 << 40;
 
 fn slot_await_async(userdata: ?*anyopaque, b: *Io.Batch) Io.Cancelable!void {
@@ -130,12 +131,13 @@ fn wait(
 ) Io.Batch.AwaitConcurrentError!void {
     assert(rt.sched.in_fiber());
     assert(sleep.on_wall_wheel(timeout));
+    if (b.submitted.head == .none) return; // Nothing to wait for; a cancel stays pending.
     if (concurrency.task_acknowledge_cancel(task)) return error.Canceled;
 
     const limit = sleep.limit_of(rt, timeout);
     var slice_ns: i96 = slice_ns_min;
     for (0..rounds_max) |_| {
-        sweep(b);
+        sweep(rt, b);
         if (b.completed.head != .none or b.submitted.head == .none) return;
 
         const nap_ns: i96 = switch (limit) {
@@ -155,7 +157,8 @@ fn wait(
 }
 
 /// Tries every submitted operation once; the ones that finished move to `completed`, in order.
-fn sweep(b: *Io.Batch) void {
+/// `rt` is null only for a batch of files, which the registry does not own (unit tests).
+fn sweep(rt: ?*Runtime, b: *Io.Batch) void {
     assert(b.storage.len > 0);
     var prev: OptionalIndex = .none;
     var index = b.submitted.head;
@@ -163,7 +166,7 @@ fn sweep(b: *Io.Batch) void {
         if (index == .none) break;
         const storage = &b.storage[index.toIndex()];
         const next = storage.submission.node.next;
-        if (try_once(storage.submission.operation)) |result| {
+        if (try_once(rt, storage.submission.operation)) |result| {
             unlink_submitted(b, prev, index, next);
             complete(b, index, result);
         } else prev = index;
@@ -172,9 +175,16 @@ fn sweep(b: *Io.Batch) void {
     assert_always(index == .none); // A longer list than the storage is corrupt.
 }
 
-fn try_once(operation: Io.Operation) ?Io.Operation.Result {
+fn try_once(rt: ?*Runtime, operation: Io.Operation) ?Io.Operation.Result {
     switch (operation) {
         .net_receive => |o| {
+            // A socket closed while the batch idled must not be read: its fd may be reused. The
+            // registry is the truth, as for a parked `receive` (`SocketUnconnected`).
+            assert(o.message_buffer.len == 1); // `op_served` refused anything else.
+            if (rt.?.sockets.lookup(o.socket_handle) == null) {
+                const closed: NetReceive.Result = .{ error.SocketUnconnected, 0 };
+                return .{ .net_receive = closed };
+            }
             const result = submit.receive_once(o) catch return null;
             return .{ .net_receive = result };
         },
@@ -263,7 +273,7 @@ test "the sweep moves finished operations to completed in order and keeps the re
     } }));
     try std.testing.expectEqual(@as(u32, 2), batch.add(empty_write));
 
-    sweep(&batch);
+    sweep(null, &batch);
     try std.testing.expectEqual(OptionalIndex.fromIndex(1), batch.submitted.head);
     try std.testing.expectEqual(OptionalIndex.fromIndex(1), batch.submitted.tail);
     try std.testing.expectEqual(@as(u32, 0), batch.next().?.index);
@@ -271,7 +281,7 @@ test "the sweep moves finished operations to completed in order and keeps the re
     try std.testing.expect(batch.next() == null);
 
     try std.testing.expect(posix.system.write(fds[1], "x", 1) == 1);
-    sweep(&batch);
+    sweep(null, &batch);
     try std.testing.expect(batch.submitted.head == .none);
     const done = batch.next().?;
     try std.testing.expectEqual(@as(u32, 1), done.index);

@@ -326,6 +326,42 @@ test "a cancel in the middle of a batch wait ends it with Canceled, as the basel
     try std.testing.expectEqual(@as(u32, 0), rt.sockets.count());
 }
 
+fn close_later(io: Io, socket: Socket, delay_ms: i64) void {
+    io.sleep(.fromMilliseconds(delay_ms), .awake) catch return;
+    socket.close(io);
+}
+
+/// The failure of the one `net_receive` whose socket is closed while the batch idles.
+fn scenario_closed(io: Io) !?Socket.ReceiveError {
+    var rig: Rig = undefined;
+    try rig.open(io, 1);
+    // The receiver is closed by `closing`; only the sender is left for the rig.
+    defer rig.sender.close(io);
+
+    var batch = Io.Batch.init(rig.storage[0..1]);
+    defer batch.cancel(io);
+
+    rig.arm_all(&batch);
+    var closing = io.async(close_later, .{ io, rig.receivers[0], @as(i64, 10) });
+    defer closing.cancel(io);
+
+    try batch.awaitConcurrent(io, .none);
+    const failure, const count = batch.next().?.result.net_receive;
+    try std.testing.expectEqual(@as(usize, 0), count);
+    return failure;
+}
+
+test "a socket closed while the batch idles completes with SocketUnconnected" {
+    if (!fibers_supported or !evented) return error.SkipZigTest;
+    var rt = try init_rt();
+    defer rt.deinit();
+
+    try expect_native(&rt);
+    const failure = try harness.call_in_fiber(rt.io(), scenario_closed, .{});
+    try std.testing.expectEqual(@as(?Socket.ReceiveError, error.SocketUnconnected), failure);
+    try std.testing.expectEqual(@as(u32, 0), rt.sockets.count());
+}
+
 // ---------------------------------------------------------------- (4) no allocation
 
 /// Allocations the batch calls made: `io.async` and sockets are measured outside the window.

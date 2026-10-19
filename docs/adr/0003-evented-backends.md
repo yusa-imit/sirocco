@@ -126,7 +126,7 @@ When no slot is free the call runs on an offload worker that waits in `poll(2)` 
 a full registry degrades to ADR 0002's offload path and never leaks `WouldBlock` (it cannot be
 interrupted once submitted, as for every offloaded call). Off a fiber the calling thread waits in
 `poll(2)`, as for sockets. Regular files never report would-block, so they never arm.
-`batchAwaitAsync`/`batchAwaitConcurrent` (item 8) will share the lease and the table.
+Batches (item 8) take no lease and no registration; see section 2c.
 
 ### 2c. Batches on fibers (item 8)
 
@@ -202,8 +202,8 @@ entry that is no longer one. The parity tests compare with `awaitAsync`, or with
   `Socket.createPair` offers only IP families, which no kernel serves, so it fails with
   `Unexpected` on both `Io`s.
 - `registrations_max` = 2 x `sockets_max`. `Runtime` derives it, and no `Options` field is
-  added. Arms from items 7 and 8 share this table: when it is full, `batchAwaitConcurrent`
-  returns `ConcurrencyUnavailable` and `batchAwaitAsync` works in rounds.
+  added. Arms from item 7 share this table; batches (item 8) take no registration, so
+  `batchAwaitConcurrent` never returns `ConcurrencyUnavailable` for want of one (section 2c).
 
 ### 4. Gate 1 on one carrier (item 10)
 

@@ -17,7 +17,9 @@ exemption recorded in `citadel/protocol/VERSIONING.md`.
   that honor `Io.Timeout` and a cancel while the carrier keeps running other fibers. Any other
   batch goes whole to `Io.Threaded`. No allocation, no registration (so no
   `ConcurrencyUnavailable`). `submit.zig` gained `receive_once`, `file_read_once` and
-  `file_write_once`, which its own slot now shares.
+  `file_write_once`, which its own slot now shares. An idle batch wakes within 2 ms of an event
+  (where `poll(2)` woke at once); a socket closed while a batch idles completes with
+  `SocketUnconnected`.
 - `src/submit.zig`: the native `operate` slot (plan `004` item 7). `net_receive` on a registered
   socket and `file_read_streaming` / `file_write_streaming` on a `flags.nonblocking` file park the
   fiber on the poller instead of holding an offload worker; blocking files, `device_io_control`
