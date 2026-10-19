@@ -13,6 +13,7 @@ test {
     _ = @import("net_data_edges.zig");
     _ = @import("operate.zig");
     _ = @import("operate_files.zig");
+    _ = @import("batch.zig");
     _ = @import("concurrency.zig");
     _ = @import("cancel.zig");
     _ = @import("group.zig");
