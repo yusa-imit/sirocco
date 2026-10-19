@@ -14,8 +14,17 @@
 //! leaves the fd open; each woken waiter runs `closing_finish` on the carrier, and the last one
 //! releases the slot and tells its caller to close the fd (`close_off_carrier`).
 //!
+//! A file the caller declared non-blocking (`Io.File.Flags.nonblocking`, plan 004 item 7) may
+//! wait on the poller too: `lease` enters it for the length of one `operate` call and
+//! `lease_release` removes it again, so a file never stays registered after its call and a
+//! recycled fd number cannot inherit a registration. Leases are reference-counted per slot
+//! because several fibers may wait on one pipe; they share its slot (and count against
+//! `sockets_max` once).
+//!
 //! Invariants: a pair `(slot, interest)` has at most one poller registration; the event wakes
-//! every waiter and each retries, so a loser re-arms. Nothing here allocates after `init`.
+//! every waiter and each retries, so a loser re-arms. A slot has either leases or a socket's
+//! ownership, never both (`leases > 0` marks a borrowed file). Nothing here allocates after
+//! `init`.
 
 const std = @import("std");
 const stdx = @import("stdx.zig");
@@ -41,6 +50,8 @@ const Slot = struct {
     /// Set by a close from another thread; the slot lives until `closing_pending` waiters finish.
     closing: bool,
     closing_pending: u32,
+    /// Fibers holding a `lease` on this file; 0 for a socket's slot.
+    leases: u32,
     /// Bumped each time the slot is freed: tells a woken waiter its socket was closed meanwhile.
     generation: u32,
 };
@@ -81,6 +92,7 @@ pub const Registry = struct {
                 .waiters = .{ null, null },
                 .closing = false,
                 .closing_pending = 0,
+                .leases = 0,
                 .generation = 0,
             };
         }
@@ -146,6 +158,51 @@ pub const Registry = struct {
             assert_always(!old.closing);
             release_locked(registry, stale);
         }
+        return insert_locked(registry, fd);
+    }
+
+    /// What `lease` found: `.held` when the caller now owes a `lease_release`, `.socket` when
+    /// `fd` belongs to a socket sirocco made (or is closing), which needs no release.
+    pub const Lease = enum { held, socket };
+
+    /// Enters `fd`, a file declared non-blocking, for one `operate` call, or joins the lease of
+    /// another fiber on the same file. `error.Full` when no slot is free. Carrier-only in
+    /// practice; the lock makes any thread safe.
+    pub fn lease(registry: *Registry, fd: fd_t) error{Full}!Lease {
+        assert(fd >= 0);
+        registry.lock();
+        defer registry.mutex.unlock();
+
+        if (registry.table.get(poller.key(fd, .read))) |found| {
+            const slot = &registry.slots[@intCast(found)];
+            if (slot.leases == 0) return .socket;
+            slot.leases += 1;
+            return .held;
+        }
+        const index = try insert_locked(registry, fd);
+        registry.slots[index].leases = 1;
+        return .held;
+    }
+
+    /// Ends one `lease`; the last one frees the slot. Tolerates an entry that is gone or no
+    /// longer a lease (the file was closed and its number reused under the call, a caller bug
+    /// that must not corrupt a socket's slot). The leaser has left every waiter list by now.
+    pub fn lease_release(registry: *Registry, fd: fd_t) void {
+        assert(fd >= 0);
+        registry.lock();
+        defer registry.mutex.unlock();
+
+        const found = registry.table.get(poller.key(fd, .read)) orelse return;
+        const slot = &registry.slots[@intCast(found)];
+        if (slot.leases == 0) return;
+        slot.leases -= 1;
+        if (slot.leases > 0) return;
+        assert_always(slot.waiters[0] == null);
+        assert_always(slot.waiters[1] == null);
+        release_locked(registry, found);
+    }
+
+    fn insert_locked(registry: *Registry, fd: fd_t) error{Full}!u32 {
         const index = registry.free_head;
         if (index == index_none) return error.Full;
         const slot = &registry.slots[index];
@@ -156,6 +213,7 @@ pub const Registry = struct {
             .waiters = .{ null, null },
             .closing = false,
             .closing_pending = 0,
+            .leases = 0,
             .generation = slot.generation,
         };
         assert(registry.table.count < registry.table.count_max);
@@ -361,6 +419,7 @@ pub const Registry = struct {
         slot.waiters = .{ null, null };
         slot.closing = false;
         slot.closing_pending = 0;
+        slot.leases = 0;
         slot.generation +%= 1;
         slot.next_free = registry.free_head;
         registry.free_head = @intCast(index);
@@ -487,4 +546,39 @@ test "registry: a freed slot changes generation, so a woken waiter sees the clos
     try std.testing.expect(!registry.still_open(index, registry.generation_of(index), 9));
     registry.slots[index].closing = false;
     try std.testing.expect(registry.unregister(9));
+}
+
+test "registry: leases share one slot, the last release frees it, a socket is never leased" {
+    var registry: Registry = .empty;
+    try registry.init(std.testing.allocator, 2);
+    defer registry.deinit(std.testing.allocator);
+
+    try std.testing.expectEqual(Registry.Lease.held, try registry.lease(20));
+    try std.testing.expectEqual(Registry.Lease.held, try registry.lease(20));
+    try std.testing.expectEqual(@as(u32, 1), registry.count());
+    registry.lease_release(20);
+    try std.testing.expectEqual(@as(u32, 1), registry.count());
+    registry.lease_release(20);
+    try std.testing.expectEqual(@as(u32, 0), registry.count());
+    registry.lease_release(20); // Already gone: tolerated.
+
+    _ = try registry.register(21);
+    try std.testing.expectEqual(Registry.Lease.socket, try registry.lease(21));
+    registry.lease_release(21); // Not a lease: the socket's slot survives.
+    try std.testing.expect(registry.lookup(21) != null);
+    try std.testing.expect(registry.unregister(21));
+}
+
+test "registry: a lease on a full registry says so and leaves the registry alone" {
+    var registry: Registry = .empty;
+    try registry.init(std.testing.allocator, 1);
+    defer registry.deinit(std.testing.allocator);
+
+    _ = try registry.register(30);
+    try std.testing.expectError(error.Full, registry.lease(31));
+    try std.testing.expectEqual(@as(u32, 1), registry.count());
+    try std.testing.expect(registry.unregister(30));
+    try std.testing.expectEqual(Registry.Lease.held, try registry.lease(31));
+    registry.lease_release(31);
+    try std.testing.expectEqual(@as(u32, 0), registry.count());
 }

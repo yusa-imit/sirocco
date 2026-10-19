@@ -52,7 +52,7 @@ lets that number decide. kqueue first: the dev box is macOS arm64; epoll is CI-o
       export the same declarations. Why here: items 7-9 then land on both backends at once.
       Verify: the ubuntu CI job runs `poller_test.zig` and `tests/parity/net.zig` on epoll, and
       `zig build -Dtarget=x86_64-linux` compiles locally.
-- [ ] 7. `operate` in `src/submit.zig`: `net_receive` (`recvmsg`) and `file_read_streaming`/
+- [x] 7. `operate` in `src/submit.zig`: `net_receive` (`recvmsg`) and `file_read_streaming`/
       `file_write_streaming` on `flags.nonblocking` files go through the poller. Blocking files
       and `device_io_control` keep the offload thunk. Verify: `tests/parity/operate.zig` covers
       UDP `net_receive` parity and a non-blocking pipe read that parks until the peer writes,

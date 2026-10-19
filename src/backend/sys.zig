@@ -254,6 +254,9 @@ pub const DataError = error{
     ConnectionRefused,
     MessageOversize,
     FastOpenAlreadyInProgress,
+    /// `recvmsg` can install a descriptor passed in ancillary data.
+    ProcessFdQuotaExceeded,
+    SystemFdQuotaExceeded,
     Unexpected,
 };
 
@@ -299,6 +302,95 @@ pub fn shutdown(fd: fd_t, how: ShutdownHow) DataError!void {
     if (posix.errno(rc) != .SUCCESS) return data_fail(posix.errno(rc));
 }
 
+/// One `recvmsg` with `MSG_NOSIGNAL` added to `flags`: the bytes received (0 is an empty
+/// datagram or end of stream). The caller fills `msg` (name, iovec, control) and reads the kernel's
+/// updates (`namelen`, `controllen`, `flags`) afterwards. Precondition: `msg.iovlen == 1`.
+pub fn recvmsg(fd: fd_t, msg: *posix.msghdr, flags: u32) DataError!usize {
+    assert(fd >= 0);
+    assert(msg.iovlen == 1);
+    const rc = retried(system.recvmsg, .{ fd, msg, flags | posix.MSG.NOSIGNAL });
+    if (posix.errno(rc) != .SUCCESS) return data_fail(posix.errno(rc));
+    return @intCast(rc);
+}
+
+/// What `file_readv` and `file_writev` report: the names of `Io.Operation.FileReadStreaming.Error`
+/// and `FileWriteStreaming.Error`. `WouldBlock` means "arm the poller and retry"; `Interrupted`
+/// is `EINTR` (or `ETIMEDOUT`, which `Io.Threaded` retries too) past `attempts_max`.
+pub const FileError = error{
+    WouldBlock,
+    Interrupted,
+    NotOpenForReading,
+    NotOpenForWriting,
+    InputOutput,
+    IsDir,
+    SystemResources,
+    SocketUnconnected,
+    ConnectionResetByPeer,
+    DiskQuota,
+    FileTooBig,
+    NoSpaceLeft,
+    PermissionDenied,
+    BrokenPipe,
+    DeviceBusy,
+    Unexpected,
+};
+
+/// One `readv` on a file: the bytes read, 0 at end of file. Precondition: `1 <= iov.len <=
+/// iovecs_max`.
+pub fn file_readv(fd: fd_t, iov: []const posix.iovec) FileError!usize {
+    assert(fd >= 0);
+    assert(iov.len >= 1);
+    assert(iov.len <= iovecs_max);
+    const count: IovCount(system.readv) = @intCast(iov.len);
+    const rc = retried(system.readv, .{ fd, iov.ptr, count });
+    if (posix.errno(rc) != .SUCCESS) return file_read_fail(posix.errno(rc));
+    return @intCast(rc);
+}
+
+/// One `writev` on a file: the bytes the kernel took, which may be fewer than offered.
+/// Precondition: `1 <= iov.len <= iovecs_max`.
+pub fn file_writev(fd: fd_t, iov: []const posix.iovec_const) FileError!usize {
+    assert(fd >= 0);
+    assert(iov.len >= 1);
+    assert(iov.len <= iovecs_max);
+    const count: IovCount(system.writev) = @intCast(iov.len);
+    const rc = retried(system.writev, .{ fd, iov.ptr, count });
+    if (posix.errno(rc) != .SUCCESS) return file_write_fail(posix.errno(rc));
+    return @intCast(rc);
+}
+
+/// The reading of an errno after `readv` on a file. A mistake in the call itself (`EINVAL`,
+/// `EFAULT`) is `Unexpected`, not a panic, as for the socket calls.
+fn file_read_fail(errno: posix.E) FileError {
+    return switch (errno) {
+        .INTR, .TIMEDOUT => error.Interrupted,
+        .AGAIN => error.WouldBlock,
+        .BADF => error.NotOpenForReading,
+        .IO => error.InputOutput,
+        .ISDIR => error.IsDir,
+        .NOBUFS, .NOMEM => error.SystemResources,
+        .NOTCONN => error.SocketUnconnected,
+        .CONNRESET => error.ConnectionResetByPeer,
+        else => error.Unexpected,
+    };
+}
+
+fn file_write_fail(errno: posix.E) FileError {
+    return switch (errno) {
+        .INTR => error.Interrupted,
+        .AGAIN => error.WouldBlock,
+        .BADF => error.NotOpenForWriting,
+        .DQUOT => error.DiskQuota,
+        .FBIG => error.FileTooBig,
+        .IO => error.InputOutput,
+        .NOSPC => error.NoSpaceLeft,
+        .PERM => error.PermissionDenied,
+        .PIPE => error.BrokenPipe,
+        .BUSY => error.DeviceBusy,
+        else => error.Unexpected,
+    };
+}
+
 /// The data-path reading of an errno. A descriptor, argument or socket-kind mistake (`EBADF`,
 /// `EINVAL`, `ENOTSOCK`, `EFAULT`, `EISCONN`, ...) is `Unexpected`, not a panic: a handle closed
 /// from another thread between the registry lookup and the call lands here legitimately.
@@ -319,6 +411,8 @@ fn data_fail(errno: posix.E) DataError {
         .CONNREFUSED => error.ConnectionRefused,
         .MSGSIZE => error.MessageOversize,
         .ALREADY => error.FastOpenAlreadyInProgress,
+        .MFILE => error.ProcessFdQuotaExceeded,
+        .NFILE => error.SystemFdQuotaExceeded,
         else => error.Unexpected,
     };
 }
@@ -364,6 +458,7 @@ pub fn addr_to_ip(addr: *const Addr) ?std.Io.net.IpAddress {
                 .port = port,
                 .bytes = in6.addr,
                 .flow = std.mem.bigToNative(u32, in6.flowinfo),
+                .interface = .{ .index = in6.scope_id },
             } };
         },
         else => return null,
@@ -563,6 +658,8 @@ test "data_fail maps every errno it names to its exact variant and the rest to U
         .{ .errno = .CONNREFUSED, .expect = error.ConnectionRefused },
         .{ .errno = .MSGSIZE, .expect = error.MessageOversize },
         .{ .errno = .ALREADY, .expect = error.FastOpenAlreadyInProgress },
+        .{ .errno = .MFILE, .expect = error.ProcessFdQuotaExceeded },
+        .{ .errno = .NFILE, .expect = error.SystemFdQuotaExceeded },
         // Descriptor, argument and socket-kind mistakes are Unexpected, never a panic.
         .{ .errno = .BADF, .expect = error.Unexpected },
         .{ .errno = .INVAL, .expect = error.Unexpected },
@@ -575,4 +672,77 @@ test "data_fail maps every errno it names to its exact variant and the rest to U
     for (rows) |row| {
         try testing.expectEqual(row.expect, data_fail(row.errno));
     }
+}
+
+test "file_read_fail and file_write_fail map the names of the file error sets" {
+    const ReadRow = struct { errno: posix.E, expect: FileError };
+    const read_rows = [_]ReadRow{
+        .{ .errno = .INTR, .expect = error.Interrupted },
+        .{ .errno = .TIMEDOUT, .expect = error.Interrupted },
+        .{ .errno = .AGAIN, .expect = error.WouldBlock },
+        .{ .errno = .BADF, .expect = error.NotOpenForReading },
+        .{ .errno = .IO, .expect = error.InputOutput },
+        .{ .errno = .ISDIR, .expect = error.IsDir },
+        .{ .errno = .NOMEM, .expect = error.SystemResources },
+        .{ .errno = .NOTCONN, .expect = error.SocketUnconnected },
+        .{ .errno = .CONNRESET, .expect = error.ConnectionResetByPeer },
+        .{ .errno = .INVAL, .expect = error.Unexpected },
+        .{ .errno = .FAULT, .expect = error.Unexpected },
+    };
+    for (read_rows) |row| try testing.expectEqual(row.expect, file_read_fail(row.errno));
+
+    const write_rows = [_]ReadRow{
+        .{ .errno = .INTR, .expect = error.Interrupted },
+        .{ .errno = .AGAIN, .expect = error.WouldBlock },
+        .{ .errno = .BADF, .expect = error.NotOpenForWriting },
+        .{ .errno = .DQUOT, .expect = error.DiskQuota },
+        .{ .errno = .FBIG, .expect = error.FileTooBig },
+        .{ .errno = .IO, .expect = error.InputOutput },
+        .{ .errno = .NOSPC, .expect = error.NoSpaceLeft },
+        .{ .errno = .PERM, .expect = error.PermissionDenied },
+        .{ .errno = .PIPE, .expect = error.BrokenPipe },
+        .{ .errno = .BUSY, .expect = error.DeviceBusy },
+        .{ .errno = .INVAL, .expect = error.Unexpected },
+        .{ .errno = .CONNRESET, .expect = error.Unexpected },
+    };
+    for (write_rows) |row| try testing.expectEqual(row.expect, file_write_fail(row.errno));
+}
+
+test "recvmsg on an empty socket is WouldBlock, then delivers what was sent" {
+    const fds = try socket_pair(posix.AF.UNIX, posix.SOCK.DGRAM, 0);
+    defer close(fds[0]);
+    defer close(fds[1]);
+
+    var buffer: [8]u8 = @splat(0);
+    var iov = [1]posix.iovec{.{ .base = &buffer, .len = buffer.len }};
+    var msg: posix.msghdr = .{
+        .name = null,
+        .namelen = 0,
+        .iov = &iov,
+        .iovlen = 1,
+        .control = null,
+        .controllen = 0,
+        .flags = 0,
+    };
+    try testing.expectError(error.WouldBlock, recvmsg(fds[0], &msg, 0));
+    const sent = system.write(fds[1], "abc", 3);
+    try testing.expectEqual(@as(usize, 3), @as(usize, @intCast(sent)));
+    try testing.expectEqual(@as(usize, 3), try recvmsg(fds[0], &msg, 0));
+    try testing.expectEqualStrings("abc", buffer[0..3]);
+}
+
+test "file_readv and file_writev move bytes through a non-blocking pipe and report its edges" {
+    var fds: [2]fd_t = undefined;
+    try testing.expectEqual(posix.E.SUCCESS, posix.errno(system.pipe(&fds)));
+    defer close(fds[0]);
+    defer close(fds[1]);
+
+    try blocking_set(fds[0], false);
+    var buffer: [8]u8 = undefined;
+    var iov = [1]posix.iovec{.{ .base = &buffer, .len = buffer.len }};
+    try testing.expectError(error.WouldBlock, file_readv(fds[0], &iov));
+    const out = [1]posix.iovec_const{.{ .base = "pipe", .len = 4 }};
+    try testing.expectEqual(@as(usize, 4), try file_writev(fds[1], &out));
+    try testing.expectEqual(@as(usize, 4), try file_readv(fds[0], &iov));
+    try testing.expectEqualStrings("pipe", buffer[0..4]);
 }

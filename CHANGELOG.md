@@ -9,6 +9,14 @@ exemption recorded in `citadel/protocol/VERSIONING.md`.
 
 ### Added
 
+- `src/submit.zig`: the native `operate` slot (plan `004` item 7). `net_receive` on a registered
+  socket and `file_read_streaming` / `file_write_streaming` on a `flags.nonblocking` file park the
+  fiber on the poller instead of holding an offload worker; blocking files, `device_io_control`
+  and unregistered handles keep the offload thunk. A non-blocking file on a fiber is leased into
+  the socket registry for the call (`Registry.lease`, counted against `sockets_max`); with the
+  registry full the call runs on an offload worker. The data calls gained
+  `ProcessFdQuotaExceeded` / `SystemFdQuotaExceeded` mappings, and accepted and connected
+  addresses now carry an IPv6 `interface` index.
 - `src/backend/epoll.zig`: the `Poller` on Linux epoll (plan `004` item 6) — one-shot interests
   over a shared per-fd registration, an `eventfd` for the latched `wake`, timeouts rounded up to
   a millisecond. `.auto` resolves to `.epoll` on Linux where fibers exist and `.epoll` is no
