@@ -63,6 +63,7 @@ const Offload = @import("offload.zig");
 const net = @import("net.zig");
 const net_data = @import("net_data.zig");
 const submit = @import("submit.zig");
+const batch = @import("batch.zig");
 const offload_slots = @import("offload_slots.zig");
 
 const assert = stdx.assert;
@@ -219,6 +220,7 @@ pub fn init(gpa: std.mem.Allocator, options: Options) InitError!Runtime {
                 net.install(&base);
                 net_data.install(&base);
                 submit.install(&base);
+                batch.install(&base);
             },
             .fail => {},
         }
@@ -349,7 +351,8 @@ test "forward mode installs every baseline slot except the native and offloaded 
         const forwarded = @field(native, field.name) == @field(baseline, field.name);
         const replaced = fibers_supported and
             (is_future_slot(field.name) or is_offloaded(field.name) or net.is_native(field.name) or
-                net_data.is_native(field.name) or submit.is_native(field.name));
+                net_data.is_native(field.name) or submit.is_native(field.name) or
+                batch.is_native(field.name));
         try std.testing.expectEqual(!replaced, forwarded);
     }
 }

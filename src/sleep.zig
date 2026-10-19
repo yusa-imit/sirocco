@@ -125,7 +125,8 @@ fn fiber_index(sched: *const Sched, fiber: *const Fiber) u32 {
     return index;
 }
 
-fn on_wall_wheel(timeout: Io.Timeout) bool {
+/// True when the wheel (a wall clock) can measure `timeout`; the CPU-time clocks cannot.
+pub fn on_wall_wheel(timeout: Io.Timeout) bool {
     const clock = switch (timeout) {
         .none => return true,
         .duration => |duration| duration.clock,

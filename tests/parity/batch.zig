@@ -7,6 +7,12 @@
 //! no pointers, so `harness.expectSameResultInFiber` compares `rt.io()` in a fiber with
 //! `rt.baselineIo()`. A scenario that idles on the batch needs a second fiber to make progress,
 //! so it skips on `.threaded`, where tasks run inline and nothing could ever wake it.
+//!
+//! Oracle caveat (Zig 0.16.0): `Io.Threaded.batchAwaitConcurrent` leaves a `net_receive` that was
+//! ready on entry on the `submitted` list after completing it, so a later await or `Batch.cancel`
+//! trips over it. A comparison against the baseline therefore awaits with `awaitAsync`, or with
+//! `awaitConcurrent` only on operations that are idle at entry; the concurrent form with data
+//! ready at entry is asserted on `rt.io()` alone.
 
 const std = @import("std");
 const Io = std.Io;
@@ -140,20 +146,30 @@ fn scenario_ready(io: Io, count: u32, mode: Mode) !Tally {
     return await_all(io, &rig, &batch, mode, .none);
 }
 
-test "64 sockets with data ready complete as the baseline, concurrent and async" {
+test "64 sockets with data ready complete as the baseline" {
     var rt = try init_rt();
     defer rt.deinit();
 
     try expect_native(&rt);
-    const full = ~@as(u64, 0);
-    for ([_]Mode{ .concurrent, .async }) |mode| {
-        try harness.expectSameResultInFiber(&rt, scenario_ready, .{ receivers_max, mode });
-        const got = try harness.call_in_fiber(rt.io(), scenario_ready, .{ receivers_max, mode });
-        try std.testing.expectEqual(full, got.mask);
-        try std.testing.expectEqual(receivers_max, got.ok);
-        try std.testing.expectEqual(@as(u32, 0), got.failed);
-    }
+    const args = .{ receivers_max, Mode.async };
+    try harness.expectSameResultInFiber(&rt, scenario_ready, args);
+    const got = try harness.call_in_fiber(rt.io(), scenario_ready, args);
+    try std.testing.expectEqual(~@as(u64, 0), got.mask);
+    try std.testing.expectEqual(receivers_max, got.ok);
+    try std.testing.expectEqual(@as(u32, 0), got.failed);
     try std.testing.expectEqual(@as(u32, 0), rt.sockets.count());
+}
+
+test "64 sockets with data ready complete through awaitConcurrent on rt.io()" {
+    if (!fibers_supported or !evented) return error.SkipZigTest; // The oracle is unsound here.
+    var rt = try init_rt();
+    defer rt.deinit();
+
+    try expect_native(&rt);
+    const args = .{ receivers_max, Mode.concurrent };
+    const got = try harness.call_in_fiber(rt.io(), scenario_ready, args);
+    try std.testing.expectEqual(~@as(u64, 0), got.mask);
+    try std.testing.expectEqual(receivers_max, got.ok);
 }
 
 fn send_all_later(io: Io, rig: *Rig, delay_ms: i64) void {
@@ -172,18 +188,39 @@ fn scenario_late(io: Io, mode: Mode) !Tally {
     return await_ready(io, &rig, mode);
 }
 
+fn scenario_first(io: Io) !bool {
+    var rig: Rig = undefined;
+    try rig.open(io, receivers_max);
+    defer rig.close(io);
+
+    var sending = io.async(send_all_later, .{ io, &rig, @as(i64, 20) });
+    defer sending.cancel(io);
+
+    var batch = Io.Batch.init(rig.storage[0..rig.count]);
+    defer batch.cancel(io);
+
+    rig.arm_all(&batch);
+    try batch.awaitConcurrent(io, .none);
+    var tally: Tally = .{ .mask = 0, .ok = 0, .failed = 0 };
+    collect(&rig, &batch, &tally);
+    return tally.ok >= 1 and tally.failed == 0;
+}
+
 test "64 idle sockets wake the batch when their datagrams arrive later, as the baseline" {
     if (!fibers_supported or !evented) return error.SkipZigTest;
     var rt = try init_rt();
     defer rt.deinit();
 
     try expect_native(&rt);
+    try harness.expectSameResultInFiber(&rt, scenario_late, .{Mode.async});
+    try harness.expectSameResultInFiber(&rt, scenario_first, .{});
+    const io = rt.io();
     for ([_]Mode{ .concurrent, .async }) |mode| {
-        try harness.expectSameResultInFiber(&rt, scenario_late, .{mode});
-        const got = try harness.call_in_fiber(rt.io(), scenario_late, .{mode});
+        const got = try harness.call_in_fiber(io, scenario_late, .{mode});
         try std.testing.expectEqual(~@as(u64, 0), got.mask);
         try std.testing.expectEqual(receivers_max, got.ok);
     }
+    try std.testing.expect(try harness.call_in_fiber(io, scenario_first, .{}));
     try std.testing.expect(!rt.sched.armed_any());
 }
 
@@ -200,7 +237,7 @@ test "sockets the registry does not know are served by the baseline for the whol
 
     rig.send_all(base);
     const io = rt.io();
-    var future = io.async(await_ready, .{ io, &rig, Mode.concurrent });
+    var future = io.async(await_ready, .{ io, &rig, Mode.async });
     const got = try future.await(io);
     try std.testing.expectEqual(@as(u64, 0b1111), got.mask);
     try std.testing.expectEqual(@as(u32, 4), got.ok);
@@ -231,7 +268,7 @@ fn scenario_idle(io: Io) !Idle {
     out.waited = waited.nanoseconds >= 10 * std.time.ns_per_ms;
     // The op is still armed after a timeout: a datagram now completes it.
     rig.send_all(io);
-    const tally = try await_all(io, &rig, &batch, .concurrent, .none);
+    const tally = try await_all(io, &rig, &batch, .async, .none);
     out.later_ok = tally.ok == 1;
     return out;
 }
@@ -291,21 +328,43 @@ test "a cancel in the middle of a batch wait ends it with Canceled, as the basel
 
 // ---------------------------------------------------------------- (4) no allocation
 
-test "a batch wait allocates nothing after init" {
+/// Allocations the batch calls made: `io.async` and sockets are measured outside the window.
+fn scenario_flat(io: Io, counting: *std.testing.FailingAllocator) !usize {
+    var rig: Rig = undefined;
+    try rig.open(io, receivers_max);
+    defer rig.close(io);
+
+    var batch = Io.Batch.init(rig.storage[0..rig.count]);
+    rig.arm_all(&batch);
+    const timeout: Io.Timeout = .{ .duration = .{ .raw = .fromMilliseconds(3), .clock = .awake } };
+    const before = counting.alloc_index;
+    if (batch.awaitConcurrent(io, timeout)) |_| {
+        return error.TestUnexpectedResult;
+    } else |err| switch (err) {
+        error.Timeout => {},
+        error.Canceled, error.ConcurrencyUnavailable => return err,
+    }
+    rig.send_all(io);
+    var tally: Tally = .{ .mask = 0, .ok = 0, .failed = 0 };
+    for (0..rounds_max) |_| {
+        if (@popCount(tally.mask) >= rig.count) break;
+        try batch.awaitAsync(io);
+        collect(&rig, &batch, &tally);
+    }
+    batch.cancel(io);
+    const delta = counting.alloc_index - before;
+    if (tally.ok != receivers_max) return error.TestUnexpectedResult;
+    return delta;
+}
+
+test "batch waits allocate nothing after init" {
     if (!fibers_supported or !evented) return error.SkipZigTest;
     var counting = std.testing.FailingAllocator.init(std.testing.allocator, .{});
     var rt = try fixtures.init_runtime_sockets(counting.allocator(), .forward, 16, 2, 160);
     defer rt.deinit();
 
     try expect_native(&rt);
-    const before = counting.alloc_index;
     const io = rt.io();
-    for ([_]Mode{ .concurrent, .async }) |mode| {
-        const got = try harness.call_in_fiber(io, scenario_late, .{mode});
-        try std.testing.expectEqual(receivers_max, got.ok);
-    }
-    const idle = try harness.call_in_fiber(io, scenario_idle, .{});
-    try std.testing.expect(idle.timed_out);
-    try std.testing.expect(try harness.call_in_fiber(io, scenario_cancel, .{}));
-    try std.testing.expectEqual(before, counting.alloc_index);
+    const delta = try harness.call_in_fiber(io, scenario_flat, .{&counting});
+    try std.testing.expectEqual(@as(usize, 0), delta);
 }
