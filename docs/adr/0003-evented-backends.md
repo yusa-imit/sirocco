@@ -128,6 +128,31 @@ interrupted once submitted, as for every offloaded call). Off a fiber the callin
 `poll(2)`, as for sockets. Regular files never report would-block, so they never arm.
 `batchAwaitAsync`/`batchAwaitConcurrent` (item 8) will share the lease and the table.
 
+### 2c. Batches on fibers (item 8)
+
+`batchAwaitAsync`, `batchAwaitConcurrent` and `batchCancel` are native only for a batch every
+submitted operation of which is a one-message `net_receive` on a registered socket or a stream
+operation on a `flags.nonblocking` file, awaited on a fiber; every other batch goes whole to the
+embedded `Io.Threaded` (a `device_io_control`, a blocking file, an unregistered handle, a
+CPU-time clock timeout, a call off a fiber, `.threaded`). The decision is made before any syscall,
+because an operation that completed cannot be given back.
+
+Decision: the fiber does not park on the poller for a batch. `Registry` links a fiber into one
+waiter list (`Fiber.wait.prev/next`), so waiting on N sockets at once would need a waiter node per
+operation, held in `Operation.Storage.Pending.Userdata` and understood by `on_event`, `cancel` and
+the close protocol. That is a registry redesign, not an item. The batch instead sweeps (one
+non-blocking attempt per operation, results written through `Io.Operation.Storage`) and sleeps a
+wheel slice of 50 us doubling to 2 ms between sweeps, never past the `Io.Timeout` deadline. What
+this keeps is the contract that matters on one carrier: the carrier is never blocked, a cancel
+unparks the sleeper, and nothing is allocated or registered, so `ConcurrencyUnavailable` cannot
+come from here. What it costs: up to 2 ms of wake-up latency on an idle batch and one syscall per
+operation per slice. The follow-up that removes both is a per-operation waiter node.
+
+`Io.Threaded` 0.16.0 oracle bug: `batchAwaitConcurrent` completes a `net_receive` that is ready on
+entry without taking it off `submitted`, so a later await or `Batch.cancel` reads a `submitted`
+entry that is no longer one. The parity tests compare with `awaitAsync`, or with
+`awaitConcurrent` on operations idle at entry, and assert the other form on `rt.io()` alone.
+
 ### 3. Socket ownership, and the registry for foreign fds (item 4)
 
 - A socket that sirocco creates on a fiber (`netListenIp`, `netBindIp`, `netAccept`,

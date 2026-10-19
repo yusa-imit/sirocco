@@ -42,6 +42,7 @@ const submit = @import("submit.zig");
 const sys = @import("backend/sys.zig");
 
 const Io = std.Io;
+const posix = std.posix;
 const assert = stdx.assert;
 const assert_always = stdx.assert_always;
 const OptionalIndex = Io.Operation.OptionalIndex;
@@ -236,10 +237,10 @@ pub fn is_native(comptime name: []const u8) bool {
 }
 
 test "the sweep moves finished operations to completed in order and keeps the rest submitted" {
-    var fds: [2]std.c.fd_t = undefined;
-    try std.testing.expectEqual(@as(c_int, 0), std.c.pipe(&fds));
-    defer _ = std.c.close(fds[0]);
-    defer _ = std.c.close(fds[1]);
+    var fds: [2]sys.fd_t = undefined;
+    try std.testing.expectEqual(posix.E.SUCCESS, posix.errno(posix.system.pipe(&fds)));
+    defer sys.close(fds[0]);
+    defer sys.close(fds[1]);
 
     try sys.blocking_set(fds[0], false);
     const reader: Io.File = .{ .handle = fds[0], .flags = .{ .nonblocking = true } };
@@ -269,7 +270,7 @@ test "the sweep moves finished operations to completed in order and keeps the re
     try std.testing.expectEqual(@as(u32, 2), batch.next().?.index);
     try std.testing.expect(batch.next() == null);
 
-    try std.testing.expectEqual(@as(isize, 1), std.c.write(fds[1], "x", 1));
+    try std.testing.expect(posix.system.write(fds[1], "x", 1) == 1);
     sweep(&batch);
     try std.testing.expect(batch.submitted.head == .none);
     const done = batch.next().?;
