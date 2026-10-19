@@ -241,7 +241,21 @@ fn file_read(rt: *Runtime, r: net.Route, o: FileRead) Io.Cancelable!FileRead.Res
                 };
             },
             error.Interrupted => continue,
-            else => return @as(R, net.narrow(FileRead.Error, err)),
+            error.NotOpenForReading,
+            error.NotOpenForWriting,
+            error.InputOutput,
+            error.IsDir,
+            error.SystemResources,
+            error.SocketUnconnected,
+            error.ConnectionResetByPeer,
+            error.DiskQuota,
+            error.FileTooBig,
+            error.NoSpaceLeft,
+            error.PermissionDenied,
+            error.BrokenPipe,
+            error.DeviceBusy,
+            error.Unexpected,
+            => return @as(R, net.narrow(FileRead.Error, err)),
         }
     }
     return @as(R, net.narrow(FileRead.Error, error.WouldBlock));
@@ -271,7 +285,21 @@ fn file_write(rt: *Runtime, r: net.Route, o: FileWrite) Io.Cancelable!FileWrite.
                 };
             },
             error.Interrupted => continue,
-            else => return @as(R, net.narrow(FileWrite.Error, err)),
+            error.NotOpenForReading,
+            error.NotOpenForWriting,
+            error.InputOutput,
+            error.IsDir,
+            error.SystemResources,
+            error.SocketUnconnected,
+            error.ConnectionResetByPeer,
+            error.DiskQuota,
+            error.FileTooBig,
+            error.NoSpaceLeft,
+            error.PermissionDenied,
+            error.BrokenPipe,
+            error.DeviceBusy,
+            error.Unexpected,
+            => return @as(R, net.narrow(FileWrite.Error, err)),
         }
     }
     return @as(R, net.narrow(FileWrite.Error, error.WouldBlock));
@@ -299,7 +327,9 @@ const Overflow = struct {
 
 /// Runs a file call on an offload worker that waits in `poll(2)` where a fiber would park, so a
 /// full registry degrades to ADR 0002's offload path instead of leaking `WouldBlock`. The pending
-/// cancel was delivered before this; the call itself cannot be interrupted once submitted.
+/// cancel was delivered before this; the call itself cannot be interrupted once submitted, and it
+/// holds its worker until the peer is ready, exactly as v0.4.0 did for every call. That bound is
+/// the price of `sockets_max` being a hard limit: size it for the files expected to wait at once.
 fn overflow(rt: *Runtime, operation: Io.Operation) Io.Cancelable!Io.Operation.Result {
     assert(rt.sockets.enabled());
     assert(rt.sched.in_fiber());
