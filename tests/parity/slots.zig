@@ -32,7 +32,7 @@ pub const Divergence = struct {
 /// the seven socket-creating `net*` slots and `netClose`
 /// (the registry's bookkeeping, plan 004 item 4): `net.zig`; the data path (`netRead`,
 /// `netWrite`, `netSend`, `netShutdown`, plan 004 item 5): `net_data.zig`. `operate` is divergent
-/// (below): `operate.zig`.
+/// (below): `operate.zig`; the three `batch*` slots are divergent too: `batch.zig`.
 pub const native: []const []const u8 = &.{
     "async",
     "await",
@@ -64,9 +64,6 @@ pub const native: []const []const u8 = &.{
 
 /// Slots still forwarded to the embedded `Io.Threaded`.
 pub const delegated: []const []const u8 = &.{
-    "batchAwaitAsync",
-    "batchAwaitConcurrent",
-    "batchCancel",
     "dirCreateDir",
     "dirCreateDirPath",
     "dirCreateDirPathOpen",
@@ -158,6 +155,29 @@ pub const divergent: []const Divergence = &.{
             "returns that error; every other operation, handle and backend matches Io.Threaded.",
     },
     .{
+        .name = "batchAwaitAsync",
+        .contract = "Io.VTable.batchAwaitAsync doc comment: \"This function provides " ++
+            "opportunity for the implementation to introduce concurrency into the batched " ++
+            "operations\" (Io.Batch.awaitAsync). A batch of registered-socket `net_receive`s " ++
+            "and non-blocking file streams awaited on a fiber of an evented backend waits in " ++
+            "wheel slices that leave the carrier free (plan 004 item 8); any other batch is " ++
+            "Io.Threaded's.",
+    },
+    .{
+        .name = "batchAwaitConcurrent",
+        .contract = "Io.Batch.awaitConcurrent doc comment: \"requires the implementation to " ++
+            "perform the operations concurrently and therefore can fail with " ++
+            "error.ConcurrencyUnavailable\". The native path needs no allocation and no " ++
+            "registration, so it never refuses; it serves the same batches as batchAwaitAsync.",
+    },
+    .{
+        .name = "batchCancel",
+        .contract = "Io.Batch.cancel doc comment: \"Requests all pending operations to be " ++
+            "interrupted, then waits for all pending operations to complete.\" A natively " ++
+            "served batch has no pending operation or resource to release, so the slot " ++
+            "returns at once; a batch the baseline served is released by the baseline.",
+    },
+    .{
         .name = "groupConcurrent",
         .contract = "Io.ConcurrentError.ConcurrencyUnavailable doc comment: \"May occur due " ++
             "to a temporary condition such as resource exhaustion, or to the Io implementation " ++
@@ -239,7 +259,7 @@ test "the shipped table accounts for all 109 slots" {
 
 test "removing a name from the table is reported" {
     const problem = comptime audit(native, delegated[1..], divergent) orelse "";
-    try std.testing.expect(contains(problem, "`batchAwaitAsync`"));
+    try std.testing.expect(contains(problem, "`dirCreateDir`"));
     try std.testing.expect(contains(problem, "no list"));
 }
 
@@ -301,7 +321,7 @@ test "a divergence must cite its contract, and a cited one moves the slot out of
     const uncited = comptime audit(
         native,
         delegated[1..],
-        divergent ++ &[_]Divergence{.{ .name = "batchAwaitAsync", .contract = "" }},
+        divergent ++ &[_]Divergence{.{ .name = "dirCreateDir", .contract = "" }},
     ) orelse "";
     try std.testing.expect(contains(uncited, "cites no contract"));
 
@@ -309,7 +329,7 @@ test "a divergence must cite its contract, and a cited one moves the slot out of
         native,
         delegated[1..],
         divergent ++ &[_]Divergence{
-            .{ .name = "batchAwaitAsync", .contract = "Io.VTable.batchAwaitAsync doc comment" },
+            .{ .name = "dirCreateDir", .contract = "Io.VTable.dirCreateDir doc comment" },
         },
     );
     try std.testing.expect(cited == null);

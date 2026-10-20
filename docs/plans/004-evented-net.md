@@ -57,12 +57,20 @@ lets that number decide. kqueue first: the dev box is macOS arm64; epoll is CI-o
       and `device_io_control` keep the offload thunk. Verify: `tests/parity/operate.zig` covers
       UDP `net_receive` parity and a non-blocking pipe read that parks until the peer writes,
       with cancel parity.
-- [ ] 8. `batchAwaitAsync`, `batchAwaitConcurrent`, `batchCancel` in `src/submit.zig`, installed
+- [x] 8. `batchAwaitAsync`, `batchAwaitConcurrent`, `batchCancel` in `src/submit.zig`, installed
       together (they share the batch's lists). Ops are tried and armed on a would-block, and the
       fiber parks on poller + wheel (`Io.Timeout`). No allocation: out of registrations,
       `batchAwaitConcurrent` returns `ConcurrencyUnavailable` (Threaded would allocate) and
       `batchAwaitAsync` works in rounds. Verify: `tests/parity/batch.zig` (64 sockets give the
       same completion set; 10 ms idle -> `Timeout` on both; cancel mid-wait); allocations flat.
+      Landed as `src/batch.zig` (ADR 0003 section 2c): native for batches of one-message
+      registered-socket `net_receive`s and non-blocking file streams awaited on a fiber, whole
+      batch to `Io.Threaded` otherwise; the wait is wheel slices (50 us to 2 ms), not a poller
+      park, because a fiber sits on one waiter list only. It never needs a registration, so it
+      never returns `ConcurrencyUnavailable`.
+- [ ] 8b. Replace the wheel slices of item 8 with a per-operation waiter node in the registry, so
+      an idle batch wakes on the poller event (no 2 ms latency, no `recvmsg` per slice). Verify:
+      `tests/parity/batch.zig` idle-wake latency below one wheel tick; allocations flat.
 - [ ] 9. `concurrent`/`groupConcurrent` in `src/concurrency.zig` run on a free fiber once the
       scheduler is ready, and return `ConcurrencyUnavailable` when none is free. Why: plan 003
       deferred this to the backend plan, and the echo bench needs one server task per connection

@@ -90,6 +90,30 @@ fn receive(rt: *Runtime, r: net.Route, o: NetReceive) Io.Cancelable!NetReceive.R
     const E = Socket.ReceiveError;
     assert(o.message_buffer.len > 0); // `Io.Threaded` fills the first message as well.
     assert(o.socket_handle >= 0);
+    for (0..net.wakeups_max) |_| {
+        if (receive_once(o)) |result| {
+            return result;
+        } else |err| switch (err) {
+            error.WouldBlock => {
+                const closed = error.SocketUnconnected;
+                net.wait_for(E, rt, r, o.socket_handle, .read, closed) catch |wait_err| {
+                    switch (wait_err) {
+                        error.Canceled => return error.Canceled,
+                        else => return .{ wait_err, 0 }, // Any other member is the call's own.
+                    }
+                };
+            },
+        }
+    }
+    return .{ net.narrow(E, error.WouldBlock), 0 };
+}
+
+/// One non-blocking `recvmsg` into `message_buffer[0]`: the result `Io.Threaded` reports, or
+/// `error.WouldBlock` when nothing is ready (nothing was consumed). `src/batch.zig` shares it.
+pub fn receive_once(o: NetReceive) error{WouldBlock}!NetReceive.Result {
+    const E = Socket.ReceiveError;
+    assert(o.message_buffer.len > 0); // `Io.Threaded` fills the first message as well.
+    assert(o.socket_handle >= 0);
     const message = &o.message_buffer[0];
     var address: sys.Addr = .{ .storage = std.mem.zeroes(posix.sockaddr.storage), .len = 0 };
     var iov = [1]posix.iovec{.{ .base = o.data_buffer.ptr, .len = o.data_buffer.len }};
@@ -101,20 +125,12 @@ fn receive(rt: *Runtime, r: net.Route, o: NetReceive) Io.Cancelable!NetReceive.R
             message.* = message_from(&msg, &address, data, message.control);
             return .{ null, 1 };
         } else |err| switch (err) {
-            error.WouldBlock => {
-                const closed = error.SocketUnconnected;
-                net.wait_for(E, rt, r, o.socket_handle, .read, closed) catch |wait_err| {
-                    switch (wait_err) {
-                        error.Canceled => return error.Canceled,
-                        else => return .{ wait_err, 0 }, // Any other member is the call's own.
-                    }
-                };
-            },
+            error.WouldBlock => return error.WouldBlock,
             error.Interrupted => continue,
             else => return .{ net.narrow(E, err), 0 },
         }
     }
-    return .{ net.narrow(E, error.WouldBlock), 0 };
+    return error.WouldBlock;
 }
 
 fn msghdr_for(address: *sys.Addr, iov: *[1]posix.iovec, control: []u8) posix.msghdr {
@@ -222,14 +238,9 @@ fn file_read(rt: *Runtime, r: net.Route, o: FileRead) Io.Cancelable!FileRead.Res
     const E = Io.Cancelable || FileRead.Error;
     const R = FileRead.Result;
     assert(o.file.handle >= 0);
-    if (!any_nonempty(o.data)) return @as(R, 0); // As `Io.Threaded`: nothing to read, no syscall.
-
-    var iovecs: [sys.iovecs_max]posix.iovec = undefined; // `iovecs_read` fills what it returns.
-    const iov = net_data.iovecs_read(o.data, &iovecs);
     for (0..net.wakeups_max) |_| {
-        if (sys.file_readv(o.file.handle, iov)) |count| {
-            if (count == 0) return @as(R, error.EndOfStream);
-            return @as(R, count);
+        if (file_read_once(o)) |result| {
+            return result;
         } else |err| switch (err) {
             error.WouldBlock => {
                 const closed = error.SocketUnconnected;
@@ -240,6 +251,25 @@ fn file_read(rt: *Runtime, r: net.Route, o: FileRead) Io.Cancelable!FileRead.Res
                     }
                 };
             },
+        }
+    }
+    return @as(R, net.narrow(FileRead.Error, error.WouldBlock));
+}
+
+/// One `readv`: the result `Io.Threaded` reports, or `error.WouldBlock` when nothing is ready.
+pub fn file_read_once(o: FileRead) error{WouldBlock}!FileRead.Result {
+    const R = FileRead.Result;
+    assert(o.file.handle >= 0);
+    if (!any_nonempty(o.data)) return @as(R, 0); // As `Io.Threaded`: nothing to read, no syscall.
+
+    var iovecs: [sys.iovecs_max]posix.iovec = undefined; // `iovecs_read` fills what it returns.
+    const iov = net_data.iovecs_read(o.data, &iovecs);
+    for (0..net.wakeups_max) |_| {
+        if (sys.file_readv(o.file.handle, iov)) |count| {
+            if (count == 0) return @as(R, error.EndOfStream);
+            return @as(R, count);
+        } else |err| switch (err) {
+            error.WouldBlock => return error.WouldBlock,
             error.Interrupted => continue,
             error.NotOpenForReading,
             error.NotOpenForWriting,
@@ -258,11 +288,33 @@ fn file_read(rt: *Runtime, r: net.Route, o: FileRead) Io.Cancelable!FileRead.Res
             => return @as(R, net.narrow(FileRead.Error, err)),
         }
     }
-    return @as(R, net.narrow(FileRead.Error, error.WouldBlock));
+    return error.WouldBlock;
 }
 
 fn file_write(rt: *Runtime, r: net.Route, o: FileWrite) Io.Cancelable!FileWrite.Result {
     const E = Io.Cancelable || FileWrite.Error;
+    const R = FileWrite.Result;
+    assert(o.file.handle >= 0);
+    for (0..net.wakeups_max) |_| {
+        if (file_write_once(o)) |result| {
+            return result;
+        } else |err| switch (err) {
+            error.WouldBlock => {
+                const closed = error.BrokenPipe;
+                net.wait_for(E, rt, r, o.file.handle, .write, closed) catch |wait_err| {
+                    switch (wait_err) {
+                        error.Canceled => return error.Canceled,
+                        else => return @as(R, net.narrow(FileWrite.Error, wait_err)),
+                    }
+                };
+            },
+        }
+    }
+    return @as(R, net.narrow(FileWrite.Error, error.WouldBlock));
+}
+
+/// One `writev`: the result `Io.Threaded` reports, or `error.WouldBlock` when the file is full.
+pub fn file_write_once(o: FileWrite) error{WouldBlock}!FileWrite.Result {
     const R = FileWrite.Result;
     assert(o.file.handle >= 0);
     var iovecs: [sys.iovecs_max]posix.iovec_const = undefined; // `count` entries are filled.
@@ -275,15 +327,7 @@ fn file_write(rt: *Runtime, r: net.Route, o: FileWrite) Io.Cancelable!FileWrite.
         if (sys.file_writev(o.file.handle, iov)) |sent| {
             return @as(R, sent);
         } else |err| switch (err) {
-            error.WouldBlock => {
-                const closed = error.BrokenPipe;
-                net.wait_for(E, rt, r, o.file.handle, .write, closed) catch |wait_err| {
-                    switch (wait_err) {
-                        error.Canceled => return error.Canceled,
-                        else => return @as(R, net.narrow(FileWrite.Error, wait_err)),
-                    }
-                };
-            },
+            error.WouldBlock => return error.WouldBlock,
             error.Interrupted => continue,
             error.NotOpenForReading,
             error.NotOpenForWriting,
@@ -302,7 +346,7 @@ fn file_write(rt: *Runtime, r: net.Route, o: FileWrite) Io.Cancelable!FileWrite.
             => return @as(R, net.narrow(FileWrite.Error, err)),
         }
     }
-    return @as(R, net.narrow(FileWrite.Error, error.WouldBlock));
+    return error.WouldBlock;
 }
 
 fn any_nonempty(data: []const []u8) bool {

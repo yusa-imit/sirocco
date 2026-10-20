@@ -18,7 +18,10 @@
 //! (`src/net_data.zig`): sockets made on a fiber are non-blocking, entered in a `sockets_max`
 //! registry and parked on the poller. `operate` is native for `net_receive` on such a socket and
 //! for streaming file reads and writes on a file opened non-blocking (`src/submit.zig`); blocking
-//! files, `device_io_control`, everything else, and every `.threaded` call keep the thunk.
+//! files, `device_io_control`, everything else, and every `.threaded` call keep the thunk. The
+//! batch slots are native for a batch awaited on a fiber whose operations are all one-message
+//! `net_receive`s on registered sockets or non-blocking file streams (`src/batch.zig`); any other
+//! batch goes whole to `Io.Threaded`, which holds the carrier.
 //!
 //! Invariants: the vtable has exactly 109 slots (`slots_count`, a comptime guard against a std
 //! bump); no field of `Runtime` holds a pointer into `Runtime` — `io()` and `baselineIo()` are
@@ -63,6 +66,7 @@ const Offload = @import("offload.zig");
 const net = @import("net.zig");
 const net_data = @import("net_data.zig");
 const submit = @import("submit.zig");
+const batch = @import("batch.zig");
 const offload_slots = @import("offload_slots.zig");
 
 const assert = stdx.assert;
@@ -219,6 +223,7 @@ pub fn init(gpa: std.mem.Allocator, options: Options) InitError!Runtime {
                 net.install(&base);
                 net_data.install(&base);
                 submit.install(&base);
+                batch.install(&base);
             },
             .fail => {},
         }
@@ -349,7 +354,8 @@ test "forward mode installs every baseline slot except the native and offloaded 
         const forwarded = @field(native, field.name) == @field(baseline, field.name);
         const replaced = fibers_supported and
             (is_future_slot(field.name) or is_offloaded(field.name) or net.is_native(field.name) or
-                net_data.is_native(field.name) or submit.is_native(field.name));
+                net_data.is_native(field.name) or submit.is_native(field.name) or
+                batch.is_native(field.name));
         try std.testing.expectEqual(!replaced, forwarded);
     }
 }
