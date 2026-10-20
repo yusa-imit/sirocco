@@ -179,7 +179,7 @@ test "a canceled awaiter cancels its members and gets error.Canceled" {
     }
 }
 
-test "groupConcurrent reports ConcurrencyUnavailable and leaves the group empty" {
+test "groupConcurrent starts a member on a fiber and await waits for it" {
     if (!fibers_supported) return error.SkipZigTest;
     for (modes) |mode| {
         var rt = try fixtures.init_runtime(mode);
@@ -188,12 +188,73 @@ test "groupConcurrent reports ConcurrencyUnavailable and leaves the group empty"
         const io = rt.io();
         var counter: std.atomic.Value(u32) = .init(0);
         var group: Io.Group = .init;
+        try group.concurrent(io, bump, .{&counter});
+        try group.concurrent(io, bump, .{&counter});
+        try std.testing.expect(group.token.raw != null);
+        try group.await(io);
+        try std.testing.expectEqual(@as(u32, 2), counter.load(.monotonic));
+        try std.testing.expectEqual(@as(?*anyopaque, null), group.token.raw);
+    }
+}
+
+fn gated_bump(io: Io, counter: *std.atomic.Value(u32), gate: *u32) void {
+    while (@atomicLoad(u32, gate, .acquire) == 0) io.futexWaitUncancelable(u32, gate, 0);
+    bump(counter);
+}
+
+test "groupConcurrent refuses when no fiber is free and leaves the group as it was" {
+    if (!fibers_supported) return error.SkipZigTest;
+    for (modes) |mode| {
+        var rt = try fixtures.init_runtime_in(std.testing.allocator, mode, 2);
+        defer rt.deinit();
+
+        const io = rt.io();
+        var counter: std.atomic.Value(u32) = .init(0);
+        var gate: u32 = 0;
+        var empty: Io.Group = .init;
+        var group: Io.Group = .init;
+        try group.concurrent(io, gated_bump, .{ io, &counter, &gate });
+        try group.concurrent(io, gated_bump, .{ io, &counter, &gate });
+        // Both fibers are held by the members; running a third inline would not be concurrent.
+        try std.testing.expectError(
+            error.ConcurrencyUnavailable,
+            group.concurrent(io, bump, .{&counter}),
+        );
+        try std.testing.expectError(
+            error.ConcurrencyUnavailable,
+            empty.concurrent(io, bump, .{&counter}),
+        );
+        try std.testing.expectEqual(@as(?*anyopaque, null), empty.token.raw);
+        try std.testing.expectEqual(@as(u32, 0), counter.load(.monotonic));
+
+        @atomicStore(u32, &gate, 1, .release);
+        io.futexWake(u32, &gate, 2);
+        try group.await(io);
+        try std.testing.expectEqual(@as(u32, 2), counter.load(.monotonic));
+    }
+}
+
+test "groupConcurrent refuses without a group record when allocation fails" {
+    if (!fibers_supported) return error.SkipZigTest;
+    for (modes) |mode| {
+        var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{});
+        var rt = try fixtures.init_runtime_in(failing.allocator(), mode, 4);
+        defer rt.deinit();
+
+        const io = rt.io();
+        failing.fail_index = failing.alloc_index;
+        var counter: std.atomic.Value(u32) = .init(0);
+        var group: Io.Group = .init;
         try std.testing.expectError(
             error.ConcurrencyUnavailable,
             group.concurrent(io, bump, .{&counter}),
         );
         try std.testing.expectEqual(@as(?*anyopaque, null), group.token.raw);
         try std.testing.expectEqual(@as(u32, 0), counter.load(.monotonic));
+        failing.fail_index = std.math.maxInt(usize);
+        try group.concurrent(io, bump, .{&counter});
+        try group.await(io);
+        try std.testing.expectEqual(@as(u32, 1), counter.load(.monotonic));
     }
 }
 

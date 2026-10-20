@@ -35,12 +35,14 @@ pub const Divergence = struct {
 /// (below): `operate.zig`; the three `batch*` slots are divergent too: `batch.zig`.
 pub const native: []const []const u8 = &.{
     "async",
+    "concurrent",
     "await",
     "cancel",
     "checkCancel",
     "recancel",
     "swapCancelProtection",
     "groupAsync",
+    "groupConcurrent",
     "groupAwait",
     "groupCancel",
     "crashHandler",
@@ -176,19 +178,6 @@ pub const divergent: []const Divergence = &.{
             "interrupted, then waits for all pending operations to complete.\" A natively " ++
             "served batch has no pending operation or resource to release, so the slot " ++
             "returns at once; a batch the baseline served is released by the baseline.",
-    },
-    .{
-        .name = "groupConcurrent",
-        .contract = "Io.ConcurrentError.ConcurrencyUnavailable doc comment: \"May occur due " ++
-            "to a temporary condition such as resource exhaustion, or to the Io implementation " ++
-            "not supporting concurrency.\" Same single-carrier limit as `concurrent`.",
-    },
-    .{
-        .name = "concurrent",
-        .contract = "Io.ConcurrentError.ConcurrencyUnavailable doc comment: \"May occur due " ++
-            "to a temporary condition such as resource exhaustion, or to the Io implementation " ++
-            "not supporting concurrency.\" sirocco is single-carrier until plan 003, so it " ++
-            "always returns it where Io.Threaded succeeds.",
     },
 };
 

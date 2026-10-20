@@ -378,7 +378,13 @@ test "fail mode installs every Io.failing slot except the native future set" {
 
     // Behaviour, not just pointer identity: Io.failing reports an unusable environment.
     try std.testing.expectError(error.EntropyUnavailable, rt.io().randomSecure(&buffer));
-    try std.testing.expectError(error.ConcurrencyUnavailable, rt.io().concurrent(add, .{ 1, 2 }));
+    if (fibers_supported) {
+        var future = try rt.io().concurrent(add, .{ 1, 2 });
+        try std.testing.expectEqual(@as(u32, 3), future.await(rt.io()));
+    } else {
+        const refused = rt.io().concurrent(add, .{ 1, 2 });
+        try std.testing.expectError(error.ConcurrencyUnavailable, refused);
+    }
 }
 
 test "forwarded slots do real work" {

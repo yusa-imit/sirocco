@@ -3,18 +3,22 @@
 //!
 //! Value-returning calls run through `harness.expectSameResult` against the embedded
 //! `Io.Threaded`. Scheduling facts that `Io.Threaded` does not share (a started task runs at once
-//! on a fiber until it first parks, then in FIFO order; exhaustion runs a task inline;
-//! `concurrent` is unavailable) are asserted on `rt.io()` alone, because the contract permits
-//! either behaviour. Every test runs under both `.forward` and `.fail`: the future-producing
-//! slots are native, so `Io.failing`'s unreachable `await`/`cancel` must never be reached. The
-//! runtime's allocator is `std.testing.allocator` (or a `FailingAllocator` over it), so a leaked
-//! task record fails the test.
+//! on a fiber until it first parks, then in FIFO order; exhaustion runs a task inline, where
+//! `concurrent` refuses) are asserted on `rt.io()` alone, because the contract permits either
+//! behaviour. Every test runs under both `.forward` and `.fail`: the future-producing
+//! slots are native, so `Io.failing`'s unreachable `await`/`cancel` must never be reached.
+//! `concurrent` (plan 004 item 9) takes a fiber like `async` and refuses instead of running
+//! inline. The runtime's allocator is `std.testing.allocator` (or a `FailingAllocator` over it),
+//! so a leaked task record fails the test.
 
 const std = @import("std");
 const Io = std.Io;
 const Runtime = @import("sirocco").Runtime;
 const fixtures = @import("fixtures.zig");
 const harness = @import("harness.zig");
+const net_data = @import("net_data.zig");
+
+const Handle = Io.net.Socket.Handle;
 
 const modes = [_]Runtime.Unimplemented{ .forward, .fail };
 
@@ -305,17 +309,103 @@ fn concurrent_attempt(io: Io) Io.ConcurrentError!u32 {
     return future.await(io);
 }
 
-test "concurrent is unavailable on a single carrier" {
+test "concurrent runs on a fiber and returns the baseline's value" {
     if (!fibers_supported) return error.SkipZigTest;
     for (modes) |mode| {
         var rt = try fixtures.init_runtime(mode);
         defer rt.deinit();
 
-        // Permitted by `Io.ConcurrentError`: "to the Io implementation not supporting
-        // concurrency". `Io.Threaded` succeeds, hence the `divergent` entry in slots.zig.
-        try std.testing.expectError(error.ConcurrencyUnavailable, concurrent_attempt(rt.io()));
+        try std.testing.expectEqual(@as(u32, 5), try concurrent_attempt(rt.io()));
         try std.testing.expectEqual(@as(u32, 5), try concurrent_attempt(rt.baselineIo()));
     }
+}
+
+/// The server half: reads one message and answers it with the byte plus one.
+fn pong_serve(io: Io, handle: Handle) !u8 {
+    var buffer: [8]u8 = undefined;
+    var bufs = [_][]u8{&buffer};
+    const read_count = try net_data.raw_read(io, handle, &bufs);
+    try std.testing.expectEqual(@as(usize, 1), read_count);
+    const reply = [_]u8{buffer[0] + 1};
+    _ = try net_data.raw_write(io, handle, &reply);
+    return buffer[0];
+}
+
+/// The client half: sends a byte and waits for the answer.
+fn ping_call(io: Io, handle: Handle, byte: u8) !u8 {
+    _ = try net_data.raw_write(io, handle, &.{byte});
+    var buffer: [8]u8 = undefined;
+    var bufs = [_][]u8{&buffer};
+    const read_count = try net_data.raw_read(io, handle, &bufs);
+    try std.testing.expectEqual(@as(usize, 1), read_count);
+    return buffer[0];
+}
+
+test "two concurrent tasks ping-pong over a loopback pair" {
+    if (!fibers_supported) return error.SkipZigTest;
+    var rt = try net_data.init_rt();
+    defer rt.deinit();
+
+    const io = rt.io();
+    const pair = try net_data.connect_pair(io);
+    defer net_data.pair_close(io, pair);
+
+    // Run inline, the client would block in its read with the server not yet started.
+    var client = try io.concurrent(ping_call, .{ io, pair.client.socket.handle, 41 });
+    var server = try io.concurrent(pong_serve, .{ io, pair.served.socket.handle });
+    try std.testing.expectEqual(@as(u8, 42), try client.await(io));
+    try std.testing.expectEqual(@as(u8, 41), try server.await(io));
+}
+
+test "concurrent refuses when no fiber is free, then succeeds once one is" {
+    if (!fibers_supported) return error.SkipZigTest;
+    for (modes) |mode| {
+        var rt = try fixtures.init_runtime_in(std.testing.allocator, mode, 2);
+        defer rt.deinit();
+
+        const io = rt.io();
+        var trace = Trace.init();
+        var parker: Parker = .{ .trace = &trace, .flag = 0 };
+        var holders: [2]Io.Future(u32) = undefined;
+        for (&holders, 0..) |*future, id| {
+            future.* = try io.concurrent(parked_task, .{ io, &parker, @as(u32, @intCast(id)) });
+        }
+        // Both fibers are held: a third task would have to run inline, which `concurrent` forbids.
+        try std.testing.expectError(error.ConcurrencyUnavailable, concurrent_attempt(io));
+        try std.testing.expectEqualSlices(u32, &.{ 100, 101 }, trace.slice());
+
+        @atomicStore(u32, &parker.flag, 1, .release);
+        io.futexWake(u32, &parker.flag, 2);
+        for (&holders, 0..) |*future, id| {
+            try std.testing.expectEqual(@as(u32, @intCast(id)), future.await(io));
+        }
+        try std.testing.expectEqual(@as(u32, 5), try concurrent_attempt(io));
+    }
+}
+
+test "concurrent refuses without running the task when its record cannot be allocated" {
+    if (!fibers_supported) return error.SkipZigTest;
+    // `io()` takes the scheduler's, the offload pool's and (evented) the registry's blocks; the
+    // first task record follows them.
+    const init_blocks: usize = if (fixtures.backend == .threaded) 4 else 7;
+    var failing = std.testing.FailingAllocator.init(
+        std.testing.allocator,
+        .{ .fail_index = init_blocks },
+    );
+    var rt = try fixtures.init_runtime_in(failing.allocator(), .forward, 4);
+    defer rt.deinit();
+
+    const io = rt.io();
+    try std.testing.expectEqual(Runtime.SchedState.ready, rt.sched_state);
+    var trace = Trace.init();
+    try std.testing.expectError(
+        error.ConcurrencyUnavailable,
+        io.concurrent(traced_leaf, .{ &trace, 5 }),
+    );
+    try std.testing.expectEqual(@as(u32, 0), trace.len);
+    failing.fail_index = std.math.maxInt(usize);
+    var future = try io.concurrent(traced_leaf, .{ &trace, 5 });
+    try std.testing.expectEqual(@as(u32, 10), future.await(io));
 }
 
 test "cancel completes the task and delivers its result" {

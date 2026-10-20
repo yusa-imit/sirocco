@@ -16,8 +16,10 @@
 //! Fallbacks, all permitted by `Io.VTable.async` ("if it returns `null` ... `result` has been
 //! already populated"): with no free fiber (`fibers_max` alive), a failed task allocation, or a
 //! scheduler that could not be allocated, `async` runs `start` inline in the caller and returns
-//! `null`. `concurrent` always returns `error.ConcurrencyUnavailable` (`Io.ConcurrentError`: the
-//! implementation does not support concurrency) while there is a single carrier.
+//! `null`. `concurrent` takes a fiber exactly like `async` (eager start, one task record) but may
+//! not run inline, so in those three cases it returns `error.ConcurrencyUnavailable`
+//! (`Io.ConcurrentError`: "resource exhaustion"). On one carrier a fiber is the concurrency: two
+//! `concurrent` tasks that wait on each other make progress as each parks.
 //!
 //! `cancel` is "set the request flag, then `await`". The flag lives in the task record and is
 //! observed by `checkCancel` on the task's fiber (`recancel` and `swapCancelProtection` act on the
@@ -31,7 +33,8 @@
 //! the one parked awaiter) made by the first `groupAsync` that gets a fiber; each member is a
 //! `Task` whose fiber frees its own record when it ends. Like `async`, a member runs inline when
 //! no fiber, task record or group record is available (then the token stays null, which `Group`
-//! documents as "no resources"), and `groupConcurrent` is `ConcurrencyUnavailable`.
+//! documents as "no resources"); `groupConcurrent` starts a member the same way and returns
+//! `ConcurrencyUnavailable` instead of running it inline, leaving the group untouched.
 //! `groupCancel` requests cancelation on every live member and waits; `groupAwait` does the same
 //! when the awaiting task itself has a pending unprotected request, and then reports
 //! `error.Canceled` after the group finished; a request that arrives while the awaiter is parked
@@ -53,8 +56,8 @@
 //! carrier thread, now inside the `async` call that started the task, not at `await`; a futex
 //! wait or a wall-clock `sleep` does not (`src/futex.zig` and `src/sleep.zig` park the fiber), so
 //! `io.async(producer)` followed by `queue.getOne` completes. Called from outside a fiber, a
-//! futex wait or sleep still blocks the carrier. Under
-//! `.forward`, `concurrent` is `ConcurrencyUnavailable` where Threaded would succeed.
+//! futex wait or sleep still blocks the carrier. `concurrent` is bounded by `fibers_max`, where
+//! `Io.Threaded` is bounded by its thread limit.
 //!
 //! Threads: every slot runs on the carrier thread, the one that first calls `async` or `await`
 //! outside a fiber. The `Io` contract calls these slots thread-safe; this implementation is not
@@ -230,16 +233,22 @@ fn slot_async(
     if (rt.sched_state != .ready or !rt.sched.has_free_fiber()) {
         return run_inline(result, context, start);
     }
-    assert(rt.sched_pin == @intFromPtr(&rt.sched));
     const body: Body = .{ .future = start };
     const task = task_create(rt, result.len, result_alignment, context, context_alignment, body);
     const task_ok = task orelse return run_inline(result, context, start);
-    // Eager start: the body runs now, until it first parks or ends (`Io.async` permits it).
-    rt.sched.spawn_first(rt.baselineIo(), task_entry, task_ok) catch |err| switch (err) {
+    return task_start(rt, task_ok);
+}
+
+/// Eager start: the body runs now, until it first parks or ends (`Io.async` permits it).
+/// Precondition: the scheduler is `.ready` and a fiber is free.
+fn task_start(rt: *Runtime, task: *Task) *Io.AnyFuture {
+    assert(rt.sched_state == .ready);
+    assert(rt.sched_pin == @intFromPtr(&rt.sched));
+    rt.sched.spawn_first(rt.baselineIo(), task_entry, task) catch |err| switch (err) {
         // `has_free_fiber` held on this thread a moment ago and nothing ran in between.
         error.FibersExhausted => unreachable,
     };
-    return @ptrCast(task_ok);
+    return @ptrCast(task);
 }
 
 fn run_inline(
@@ -264,8 +273,13 @@ fn slot_concurrent(
     const rt = runtime_of(userdata);
     if (context.len != 0) assert(@intFromPtr(context.ptr) != 0);
     assert(rt.sched_state != .pending);
-    _ = .{ result_len, result_alignment, context_alignment, start };
-    return error.ConcurrencyUnavailable;
+    // The contract forbids the inline fallback of `async`: refuse instead.
+    if (rt.sched_state != .ready or !rt.sched.has_free_fiber()) {
+        return error.ConcurrencyUnavailable;
+    }
+    const body: Body = .{ .future = start };
+    const task = task_create(rt, result_len, result_alignment, context, context_alignment, body);
+    return task_start(rt, task orelse return error.ConcurrencyUnavailable);
 }
 
 fn slot_await(
@@ -496,15 +510,27 @@ fn slot_group_async(
     start: *const fn (context: *const anyopaque) void,
 ) void {
     const rt = runtime_of(userdata);
-    if (rt.sched_state != .ready or !rt.sched.has_free_fiber()) return start(context.ptr);
+    if (group_member_start(rt, group, context, context_alignment, start)) return;
+    start(context.ptr);
+}
+
+/// Starts `start` as a member on a fiber (lazily: it first runs when the carrier next
+/// schedules). False, with the group untouched, when the scheduler, a fiber, the task record or
+/// the group record is missing.
+fn group_member_start(
+    rt: *Runtime,
+    group: *Io.Group,
+    context: []const u8,
+    context_alignment: std.mem.Alignment,
+    start: *const fn (context: *const anyopaque) void,
+) bool {
+    if (rt.sched_state != .ready or !rt.sched.has_free_fiber()) return false;
     assert(rt.sched_pin == @intFromPtr(&rt.sched));
     const body: Body = .{ .member = start };
-    const task = task_create(rt, 0, .@"1", context, context_alignment, body) orelse {
-        return start(context.ptr);
-    };
+    const task = task_create(rt, 0, .@"1", context, context_alignment, body) orelse return false;
     const rec = group_rec_ensure(rt, group) orelse {
         task_free(rt, task);
-        return start(context.ptr);
+        return false;
     };
     assert(rec.sched == &rt.sched);
     task.group = rec;
@@ -520,6 +546,7 @@ fn slot_group_async(
     };
     assert(fiber.state == .ready);
     assert(group.token.raw == @as(?*anyopaque, rec));
+    return true;
 }
 
 /// The group's record, created on the first member that gets a fiber; null on out-of-memory.
@@ -552,7 +579,8 @@ fn slot_group_concurrent(
     const rt = runtime_of(userdata);
     if (context.len != 0) assert(@intFromPtr(context.ptr) != 0);
     assert(rt.sched_state != .pending);
-    _ = .{ group, context_alignment, start };
+    // As `concurrent`: a member that would run inline is not concurrent, so refuse.
+    if (group_member_start(rt, group, context, context_alignment, start)) return;
     return error.ConcurrencyUnavailable;
 }
 
