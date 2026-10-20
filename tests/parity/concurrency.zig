@@ -385,18 +385,13 @@ test "concurrent refuses when no fiber is free, then succeeds once one is" {
 
 test "concurrent refuses without running the task when its record cannot be allocated" {
     if (!fibers_supported) return error.SkipZigTest;
-    // `io()` takes the scheduler's, the offload pool's and (evented) the registry's blocks; the
-    // first task record follows them.
-    const init_blocks: usize = if (fixtures.backend == .threaded) 4 else 7;
-    var failing = std.testing.FailingAllocator.init(
-        std.testing.allocator,
-        .{ .fail_index = init_blocks },
-    );
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{});
     var rt = try fixtures.init_runtime_in(failing.allocator(), .forward, 4);
     defer rt.deinit();
 
-    const io = rt.io();
+    const io = rt.io(); // The scheduler, the offload pool and the registry are built here.
     try std.testing.expectEqual(Runtime.SchedState.ready, rt.sched_state);
+    failing.fail_index = failing.alloc_index;
     var trace = Trace.init();
     try std.testing.expectError(
         error.ConcurrencyUnavailable,

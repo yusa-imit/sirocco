@@ -137,7 +137,8 @@ pub const Options = struct {
     environ: std.process.Environ,
     /// Program name for `processExecutablePath` on OpenBSD and Haiku; `.empty` elsewhere.
     argv0: Io.Threaded.Argv0,
-    /// Fibers that may be alive at once (async tasks in flight); past it `async` runs inline.
+    /// Fibers that may be alive at once (async tasks in flight); past it `async` runs inline and
+    /// `concurrent` refuses.
     /// Positive. One stack of `fiber_stack_size` bytes is allocated per fiber at the first `io()`.
     fibers_max: u32,
     /// Bytes per fiber stack: a multiple of 16, at least `Sched.stack_size_min`. std's `Io` call

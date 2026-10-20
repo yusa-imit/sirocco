@@ -234,7 +234,7 @@ test "groupConcurrent refuses when no fiber is free and leaves the group as it w
     }
 }
 
-test "groupConcurrent refuses without a group record when allocation fails" {
+test "groupConcurrent refuses cleanly when the task or group record cannot be allocated" {
     if (!fibers_supported) return error.SkipZigTest;
     for (modes) |mode| {
         var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{});
@@ -242,15 +242,19 @@ test "groupConcurrent refuses without a group record when allocation fails" {
         defer rt.deinit();
 
         const io = rt.io();
-        failing.fail_index = failing.alloc_index;
         var counter: std.atomic.Value(u32) = .init(0);
         var group: Io.Group = .init;
-        try std.testing.expectError(
-            error.ConcurrencyUnavailable,
-            group.concurrent(io, bump, .{&counter}),
-        );
-        try std.testing.expectEqual(@as(?*anyopaque, null), group.token.raw);
-        try std.testing.expectEqual(@as(u32, 0), counter.load(.monotonic));
+        // The task record is the next allocation, the group record the one after it: the second
+        // case frees the task record again (the testing allocator reports a leak otherwise).
+        for ([_]usize{ 0, 1 }) |offset| {
+            failing.fail_index = failing.alloc_index + offset;
+            try std.testing.expectError(
+                error.ConcurrencyUnavailable,
+                group.concurrent(io, bump, .{&counter}),
+            );
+            try std.testing.expectEqual(@as(?*anyopaque, null), group.token.raw);
+            try std.testing.expectEqual(@as(u32, 0), counter.load(.monotonic));
+        }
         failing.fail_index = std.math.maxInt(usize);
         try group.concurrent(io, bump, .{&counter});
         try group.await(io);
