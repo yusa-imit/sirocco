@@ -9,6 +9,11 @@ exemption recorded in `citadel/protocol/VERSIONING.md`.
 
 ### Added
 
+- `concurrent` and `groupConcurrent` now run the task on a free fiber (plan `004` item 9)
+  instead of always returning `error.ConcurrencyUnavailable`. They refuse, as before, only
+  when `async` would have run inline: no scheduler, `fibers_max` fibers alive, or a failed
+  allocation; the group is left untouched then. Two `concurrent` tasks that wait on each other
+  (a loopback ping-pong) make progress.
 - `src/batch.zig`: the native `batchAwaitAsync`, `batchAwaitConcurrent` and `batchCancel` slots
   (plan `004` item 8). A batch of one-message `net_receive`s on registered sockets and
   `file_read_streaming` / `file_write_streaming` on `flags.nonblocking` files, awaited on a fiber
