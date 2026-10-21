@@ -76,11 +76,13 @@ lets that number decide. kqueue first: the dev box is macOS arm64; epoll is CI-o
       deferred this to the backend plan, and the echo bench needs one server task per connection
       on both `Io`s. Verify: two `concurrent` tasks ping-pong over a socketpair in
       `tests/parity/concurrency.zig` (hangs if inline); refusal at `fibers_max`; group parity.
-- [ ] 10. `bench/echo.zig` + `zig build bench-echo`: clients echo 64-byte messages through one
+- [x] 10. `bench/echo.zig` + `zig build bench-echo`: clients echo 64-byte messages through one
       loopback server, on `rt.io()` and `rt.baselineIo()` of one `Runtime`, 5 s each. Verify: PRD
       §5 rows, ReleaseFast on the dev box, for gate 1 (1000 connections, >= 2.0x) and gate 2 (1,
       >= 0.9x). A gate-2 miss is fixed here. A gate-1 miss and its profile go into ADR 0003, and
       multi-carrier becomes plan 005.
+      Landed: gate 2 passes at 0.91x, gate 1 misses at 0.83x-0.87x (ADR 0003 section 4a,
+      PRD §5 rows); plan 005 is multi-carrier and starts with a profile.
 - [ ] 11. `bench/latency.zig` + `zig build bench-latency`: accept-to-first-byte p99 at 1000
       connections (gate 3), then RSS delta / 10k over 10k idle connections (gate 4). It raises
       `RLIMIT_NOFILE` (macOS: 256) and records a refusal, never a smaller N. Verify: PRD §5 rows.

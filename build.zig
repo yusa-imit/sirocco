@@ -158,6 +158,21 @@ pub fn build(b: *std.Build) void {
     const bench_timer_step = b.step("bench-timer", "Run the timer wake-error benchmark (gate 7)");
     bench_timer_step.dependOn(&run_bench_timer.step);
 
+    const bench_echo = b.addExecutable(.{
+        .name = "sirocco-bench-echo",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("bench/echo.zig"),
+            .target = target,
+            .optimize = .ReleaseFast,
+            .imports = &.{
+                .{ .name = "sirocco", .module = mod },
+            },
+        }),
+    });
+    const run_bench_echo = b.addRunArtifact(bench_echo);
+    const bench_echo_step = b.step("bench-echo", "Run the loopback echo benchmark (gates 1, 2)");
+    bench_echo_step.dependOn(&run_bench_echo.step);
+
     // Docs
     const docs = b.addInstallDirectory(.{
         .source_dir = mod_tests.getEmittedDocs(),

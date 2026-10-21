@@ -220,6 +220,30 @@ at 1) on one carrier. Both `Io`s come from one `Runtime`, built ReleaseFast on t
   own `Sched` and `Poller` (rule 1). Work stealing and cross-carrier wake are designed there.
   The gate is never lowered, and N is never cut to make a number pass.
 
+### 4a. Gate 1 on one carrier: measured (2026-10-21)
+
+`zig build bench-echo`, ReleaseFast, Apple arm64 (Mac16,10, 10 cores), kqueue, 5 s per row, three
+runs. Echoes per second, 64-byte messages, one `Runtime`:
+
+| connections | `Io.Threaded` | sirocco kqueue | ratio |
+|---|---|---|---|
+| 1 | 71.1k-71.3k | 64.8k-65.2k | 0.91x (gate 2: pass, by 0.01) |
+| 1000 | 184k | 152k-161k | 0.83x-0.87x (gate 1: **miss**) |
+
+Gate 1 is missed on one carrier. Reading: one carrier completes an echo in about 6.6 us, and
+each echo is four socket syscalls (client write and read, server read and write) plus the
+poller turns that park the two readers; the process spent 28.8 s in the kernel against
+3.4 s in user code over the whole run (`/usr/bin/time -l`, all four rows together, so it is a
+bound on the split, not a per-`Io` figure). `Io.Threaded` spends the same syscalls on all ten
+cores. A single carrier cannot pass 2.0x unless the per-echo cost drops below about 2.7 us,
+which the syscall count forbids; the ceiling is the core, not the scheduler.
+
+The per-function profile the section above asks for is not in this record: `sample(1)` hung
+attaching to the bench on the dev box. Plan 005 therefore starts with the profile (Instruments
+or `dtrace`), then multi-carrier: N carriers, each with its own `Sched` and `Poller` (rule 1).
+Gate 2 at 0.91x has no margin; any change that adds a syscall to the single-connection path
+must re-run `zig build bench-echo` before it merges.
+
 ## Rejected alternatives
 
 - **A `Poller` vtable for runtime backend choice.** Only one evented backend compiles per
