@@ -7,6 +7,8 @@ exemption recorded in `citadel/protocol/VERSIONING.md`.
 
 ## [Unreleased]
 
+## [0.5.0] - 2026-10-27
+
 ### Added
 
 - `concurrent` and `groupConcurrent` now run the task on a free fiber (plan `004` item 9)
@@ -38,20 +40,6 @@ exemption recorded in `citadel/protocol/VERSIONING.md`.
   a millisecond. `.auto` resolves to `.epoll` on Linux where fibers exist and `.epoll` is no
   longer refused there; the conformance suite (`poller_test.zig`) and the parity suite run on
   it in the Linux CI job, and `poller_test.zig` no longer needs libc.
-
-### Changed
-
-- **Breaking:** `Runtime.Options.sockets_max` is required (plan `004` item 3). `.auto` resolves to
-  `.kqueue` on Darwin and `.threaded` elsewhere; under `.kqueue` the carrier idles in the kqueue
-  poller and foreign wakes reach it through `Poller.wake`. `.kqueue` is refused with
-  `BackendUnavailable` where kqueue does not exist.
-
-### Fixed
-
-- `sleep.fire` trapped when every sleeping fiber's deadline came due in one pass.
-
-### Added
-
 - Native socket creation on the evented poller (plan `004` item 4, ADR 0003 section 3): on
   `.kqueue`, `netListenIp`, `netBindIp`, `netAccept`, `netConnectIp`, `netListenUnix`,
   `netConnectUnix` and `netSocketCreatePair` called on a fiber create `O_NONBLOCK | O_CLOEXEC`
@@ -69,14 +57,28 @@ exemption recorded in `citadel/protocol/VERSIONING.md`.
   cancel or a close ends the park (`src/net_data.zig`). `header`, `data` and a `splat` pattern
   reach the kernel as iovecs of the caller's buffers; a write returns the bytes the kernel took.
   Foreign handles and `.threaded` keep the offload path. The native-path parity tests run on the
-  kqueue build only; Linux CI covers them once epoll lands (item 6).
+  kqueue build at that point; the epoll build (item 6) runs them in the Linux CI job.
 - `src/backend/poller.zig` and `src/backend/kqueue.zig`: a one-shot readiness `Poller` on kqueue
   (fixed registration table allocated in `init`, thread-safe latched `wake`) and the contract
-  epoll will share, with ADR 0003 (plan `004` item 2). Internal; nothing uses it yet.
+  epoll shares, with ADR 0003 (plan `004` item 2). Internal.
+- `bench/echo.zig` and `bench/latency.zig` with `zig build bench-echo` and `zig build bench-latency`
+  (plan `004` items 10 and 11): loopback echo throughput and accept-to-first-byte p99 plus RSS per
+  idle connection, each run on `rt.io()` and `rt.baselineIo()` of one `Runtime`. They raise
+  `RLIMIT_NOFILE` and refuse rather than shrink N. Recorded in PRD §5 and ADR 0003 sections 4a
+  and 4b: gates 2 and 3 pass on kqueue, gate 1 (0.83x-0.87x of `Io.Threaded`, target 2.0x) and
+  gate 4 (29.2 KB vs 24.7 KB per idle task) miss, so v0.5.0 ships with those two open.
 
 ### Changed
 
+- **Breaking:** `Runtime.Options.sockets_max` is required (plan `004` item 3). `.auto` resolves to
+  `.kqueue` on Darwin, `.epoll` on Linux and `.threaded` elsewhere; under `.kqueue` the carrier idles in the kqueue
+  poller and foreign wakes reach it through `Poller.wake`. `.kqueue` is refused with
+  `BackendUnavailable` where kqueue does not exist.
 - `src/sched.zig` tests moved to `src/sched_test.zig` (plan `004` item 1).
+
+### Fixed
+
+- `sleep.fire` trapped when every sleeping fiber's deadline came due in one pass.
 
 ## [0.4.0] - 2026-10-11
 

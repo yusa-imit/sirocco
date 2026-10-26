@@ -103,7 +103,7 @@ sirocco는 소비자가 올라타는 탑이 아니라, std가 이미 만든 탑 
 const std = @import("std");
 const Io = std.Io;
 
-pub const version: std.SemanticVersion = .{ .major = 0, .minor = 2, .patch = 0 };
+pub const version: std.SemanticVersion = .{ .major = 0, .minor = 5, .patch = 0 };
 
 /// Compile-time guard: sirocco's vtable is exhaustive against the pinned std.
 comptime {
@@ -126,30 +126,30 @@ pub const Runtime = struct {
     /// `.fail` installs `Io.failing`'s stub so a test cannot pass by accident.
     pub const Unimplemented = enum { forward, fail };
 
+    /// As shipped in v0.5.0: every field is required, there are no defaults.
     pub const Options = struct {
-        backend: Backend = .auto,
-        unimplemented: Unimplemented = .forward,
-        /// 0 selects one carrier thread per CPU.
-        carrier_threads: u16 = 0,
+        backend: Backend,
+        unimplemented: Unimplemented,
+        environ: std.process.Environ,
+        argv0: Io.Threaded.Argv0,
         /// Limits are part of the signature. All storage is reserved at init.
-        fibers_max: u32 = 4096,
-        fiber_stack_bytes: u32 = 64 * 1024,
-        pending_ops_max: u32 = 4096,
-        sockets_max: u32 = 4096,
-        timers_max: u32 = 4096,
+        fibers_max: u32,
+        fiber_stack_size: u32,
         /// Worker threads that run forwarded blocking calls (`dir*`, `file*`, `net*`) while
         /// their fiber parks (ADR 0002). Positive. A call holds a worker until it returns, so
-        /// calls that wait on each other (accept on connect) need that many workers. In the
-        /// shipped v0.4.0 this field is required and the sketch's defaults are not.
-        offload_threads: u32 = 4,
+        /// calls that wait on each other (accept on connect) need that many workers.
+        offload_threads: u32,
+        /// Sockets the poller tracks at once (ADR 0003); a socket past it is served by the
+        /// offload pool. Positive, also under `.threaded`.
+        sockets_max: u32,
     };
+    // Not shipped: `carrier_threads` (one carrier until plan 005), `pending_ops_max` and
+    // `timers_max` (the wheel and `Io.Operation.Storage` need no limit of their own).
 
+    /// As shipped in v0.5.0 `init` returns only `BackendUnavailable`; the scheduler and the
+    /// pools are created at the first `io()`.
     pub const InitError = error{
-        OutOfMemory,
         BackendUnavailable,
-        FibersUnsupported,
-        SystemResources,
-        Unexpected,
     };
 
     /// Allocates every fiber stack, timer slot and op slot here; never after.
@@ -206,8 +206,12 @@ pub fn main(init: std.process.Init) !void {
 - **P3 — 제출 엔진 (4)**: `Io.Operation`이 `file_read_streaming`, `file_write_streaming`,
   `device_io_control`, `net_receive`를 포함한다 — 즉 모든 스트리밍 read/write와 모든
   데이터그램 수신은 `file*`/`net*`가 아니라 여기를 지난다. `operate` · `batchAwaitAsync` ·
-  `batchAwaitConcurrent` · `batchCancel`
-- **P4 — 네트워킹 (16)**: sirocco를 링크할 가치가 있게 만드는 마일스톤.
+  `batchAwaitConcurrent` · `batchCancel` (v0.5.0: 등록된 소켓의 `net_receive`와 논블로킹
+  파일 스트림은 폴러에서 네이티브, 그 외 배치는 `Io.Threaded`로 통째로 위임; 유휴 배치는
+  최대 2 ms 휠 슬라이스로 깨어난다 — ADR 0003 2c)
+- **P4 — 네트워킹 (16)**: sirocco를 링크할 가치가 있게 만드는 마일스톤. (v0.5.0: 12개가
+  kqueue/epoll 폴러 위에서 네이티브; `netWriteFile` · `netInterfaceNameResolve` ·
+  `netInterfaceName` · `netLookup`은 위임 유지)
   `netListenIp` · `netAccept` · `netBindIp` · `netConnectIp` · `netListenUnix` ·
   `netConnectUnix` · `netSocketCreatePair` · `netSend` · `netRead` · `netWrite` ·
   `netWriteFile` · `netClose` · `netShutdown` · `netInterfaceNameResolve` ·

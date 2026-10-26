@@ -9,8 +9,9 @@ sirocco는 Zig 0.16의 `std.Io.VTable`을 구현하는 것을 목표로 하는 �
 epoll(Linux) 백엔드로 109개 vtable 슬롯을 채우고, 아직 네이티브로 구현하지 않은 슬롯
 (`dir*`, `process*`/`child*`, `random`/`randomSecure`, `progressParentFile`)은 내장된
 `Io.Threaded`로 명시적으로 위임하도록 되어 있다 (아래 Status 참고 — 현재는 파이버 기반
-동시성·futex 슬롯까지만 네이티브다; kqueue/epoll 백엔드는 아직 없다). 완성되면 silica·zoltraak 서버, zr의 다운로더·원격 캐시, sailor의 네트워크
-위젯, synod의 Transport가 이 위에서 `main()`의 한 줄만 바꿔 동작하는 것이 목표다.
+동시성·futex·`sleep`·소켓 슬롯이 네이티브다). 완성되면 silica·zoltraak 서버, zr의
+다운로더·원격 캐시, sailor의 네트워크 위젯, synod의 Transport가 이 위에서 `main()`의 한
+줄만 바꿔 동작하는 것이 목표다.
 
 [![CI](https://github.com/yusa-imit/sirocco/workflows/CI/badge.svg)](https://github.com/yusa-imit/sirocco/actions)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
@@ -20,21 +21,28 @@ epoll(Linux) 백엔드로 109개 vtable 슬롯을 채우고, 아직 네이티브
 
 ## Status
 
-**v0.4.0 — 내부 마일스톤, 소비자용 아님.** 설계는 `docs/adr/0001-std-io-vtable.md`로
-확정되었고, 109개 슬롯 중 `Runtime`이 네이티브로 구현한 것은 파이버 위의
-동시성·취소·futex·`sleep` 슬롯(`async`/`await`/`cancel`, `group*`, `checkCancel`/`recancel`/
-`swapCancelProtection`, `futexWait`/`futexWake`, `sleep`, `crashHandler`)이고 `concurrent`는
-항상 `error.ConcurrencyUnavailable`을 반환한다. 나머지 슬롯은 내장 `Io.Threaded`로 위임된다
-(`Options.unimplemented`). 위임된 블로킹 슬롯(파일, 디렉터리, 네트워크)은 오프로드 풀
-(`Options.offload_threads`)의 워커 스레드에서 실행되고 호출한 파이버만 멈추므로 캐리어는
-막히지 않는다 (`docs/adr/0002-offload-before-multi-carrier.md`; 캐리어는 아직 하나이고
-`close`/`shutdown` 등 가벼운 호출은 캐리어에서 실행된다). silica/zoltraak에 쓸 준비는
-아직 되지 않았다. 파이버 스케줄러는 aarch64/x86_64에서만 동작하며
-(`Runtime.fibers_supported`), 그 외 타깃에서는 슬롯이 위임 상태로 남는다.
-(미출시, plan 004) `Options.sockets_max`는 필수이며, `Options.backend = .auto`는 macOS에서
-`.kqueue`, Linux에서는 `.epoll`(캐리어가 폴러에서 대기, `docs/adr/0003-evented-backends.md`),
-그 외에서는 `.threaded`로 해석된다. 소켓 슬롯은 아직 네이티브가 아니다. 작업 순서는
-`docs/plans/`가 기준이다. 안정 릴리즈 전까지 API는 변경될 수 있다.
+**v0.5.0 — 내부 마일스톤, 소비자용 아님.** 설계는 `docs/adr/0001-std-io-vtable.md`로
+확정되었고, 109개 슬롯 중 `Runtime`이 네이티브로 구현한 것은 32개다: 파이버 위의
+동시성·취소(`async`/`concurrent`/`await`/`cancel`, `group*`, `checkCancel`/`recancel`/
+`swapCancelProtection`, `crashHandler`), `futexWait`/`futexWake`, `sleep`, 소켓(`netListenIp`,
+`netAccept`, `netBindIp`, `netConnectIp`, `netListenUnix`, `netConnectUnix`,
+`netSocketCreatePair`, `netRead`, `netWrite`, `netSend`, `netShutdown`, `netClose`), 그리고
+제출 엔진(`operate`, `batchAwaitAsync`, `batchAwaitConcurrent`, `batchCancel`)이다.
+`Options.backend = .auto`는 macOS에서 `.kqueue`, Linux에서 `.epoll`(캐리어가 폴러에서
+대기, `docs/adr/0003-evented-backends.md`), 그 외에서는 `.threaded`로 해석되며
+`Options.sockets_max`는 필수다. 폴러에 등록된 소켓(`sockets_max`개까지)과 논블로킹 파일
+스트림은 호출한 파이버만 멈추고, 등록 한도를 넘거나 외부 핸들이거나 파이버 밖에서 만든
+소켓은 오프로드 풀(`Options.offload_threads`)로 간다. 나머지 슬롯은 내장 `Io.Threaded`로
+위임된다(`Options.unimplemented`). `concurrent`는 빈 파이버가 있으면 그 위에서 실행하고
+`async`가 인라인으로 돌 상황(스케줄러 없음, `fibers_max` 소진)에서만
+`error.ConcurrencyUnavailable`을 반환한다. 캐리어는 아직 하나다. 유휴 `batchAwait*`는 폴러
+이벤트가 아니라 최대 2 ms의 휠 슬라이스로 깨어난다(`docs/adr/0003-evented-backends.md`
+2c). 성능 게이트(PRD §5, macOS kqueue): 2·3은 통과(0.91x, p99 127 ms 대 162 ms; 3은 8회
+중 7회), 1(1000 연결 0.83x–0.87x, 목표 2.0x)과 4(유휴 태스크당 29.2 KB 대 24.7 KB)는 미달이며
+다음 플랜(멀티 캐리어)이 다룬다. silica/zoltraak에 쓸 준비는 아직 되지 않았다. 파이버
+스케줄러는 aarch64/x86_64에서만 동작하며(`Runtime.fibers_supported`), 그 외 타깃에서는 슬롯이
+위임 상태로 남는다. 작업 순서는 `docs/plans/`가 기준이다. 안정 릴리즈 전까지 API는 변경될 수
+있다.
 
 ## Design
 
@@ -68,7 +76,7 @@ pub fn main(init: std.process.Init) !void {
 ## Install
 
 ```
-zig fetch --save https://github.com/yusa-imit/sirocco/archive/refs/tags/v0.4.0.tar.gz
+zig fetch --save https://github.com/yusa-imit/sirocco/archive/refs/tags/v0.5.0.tar.gz
 ```
 
 ```zig
