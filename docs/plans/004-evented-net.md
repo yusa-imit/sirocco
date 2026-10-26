@@ -83,9 +83,11 @@ lets that number decide. kqueue first: the dev box is macOS arm64; epoll is CI-o
       multi-carrier becomes plan 005.
       Landed: gate 2 passes at 0.91x, gate 1 misses at 0.83x-0.87x (ADR 0003 section 4a,
       PRD §5 rows); plan 005 is multi-carrier and starts with a profile.
-- [ ] 11. `bench/latency.zig` + `zig build bench-latency`: accept-to-first-byte p99 at 1000
+- [x] 11. `bench/latency.zig` + `zig build bench-latency`: accept-to-first-byte p99 at 1000
       connections (gate 3), then RSS delta / 10k over 10k idle connections (gate 4). It raises
       `RLIMIT_NOFILE` (macOS: 256) and records a refusal, never a smaller N. Verify: PRD §5 rows.
+      Landed: gate 3 passes in 7 of 8 runs (p99 127k us vs 162k us), gate 4 misses (29.2 KB vs 24.7 KB per
+      task); ADR 0003 section 4b, PRD §5 rows. Bug #58 was the bench, not the runtime.
 - [ ] 12. Bring README, CHANGELOG `[0.5.0]`, PRD §4.1/§4.3/§5 and the `Options` docs in line with
       what shipped; bump to 0.5.0 and release. Verify: `gh release view v0.5.0`.
 

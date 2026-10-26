@@ -173,6 +173,24 @@ pub fn build(b: *std.Build) void {
     const bench_echo_step = b.step("bench-echo", "Run the loopback echo benchmark (gates 1, 2)");
     bench_echo_step.dependOn(&run_bench_echo.step);
 
+    const bench_latency = b.addExecutable(.{
+        .name = "sirocco-bench-latency",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("bench/latency.zig"),
+            .target = target,
+            .optimize = .ReleaseFast,
+            .imports = &.{
+                .{ .name = "sirocco", .module = mod },
+            },
+        }),
+    });
+    const run_bench_latency = b.addRunArtifact(bench_latency);
+    const bench_latency_step = b.step(
+        "bench-latency",
+        "Run the accept latency and idle memory benchmark (gates 3, 4)",
+    );
+    bench_latency_step.dependOn(&run_bench_latency.step);
+
     // Docs
     const docs = b.addInstallDirectory(.{
         .source_dir = mod_tests.getEmittedDocs(),
