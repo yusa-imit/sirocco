@@ -244,6 +244,30 @@ or `dtrace`), then multi-carrier: N carriers, each with its own `Sched` and `Pol
 Gate 2 at 0.91x has no margin; any change that adds a syscall to the single-connection path
 must re-run `zig build bench-echo` before it merges.
 
+### 4b. Gates 3 and 4: measured (2026-10-26)
+
+`bench/latency.zig` (`zig build bench-latency`), ReleaseFast, the same Apple arm64 machine,
+kqueue, eight full runs.
+
+| gate | `Io.Threaded` | sirocco kqueue | result |
+|---|---|---|---|
+| 3: accept to first byte, 1000 connections, p99 | 160.8k-166.0k us (one run 377.6k) | 126.2k-129.8k us (one run 422.5k) | pass in 7 of 8 runs |
+| 3: same, p50 | 40.1k-70.6k us | 62.1k-67.0k us | |
+| 4: resident bytes per idle task, 10000 connections | 24.7 KB at the 4089 it holds | 29.2 KB at 10000 | **miss** |
+
+`Io.Threaded` refuses a thread at 4089 idle tasks, so gate 4 compares a per-task figure taken
+at different N; sirocco holds all 10000. Per task sirocco costs 18% more than a thread here: a
+fiber's touched stack is a whole 16 KB page on arm64 macOS, and each connection adds two
+registry entries. One run in eight measured a sirocco p99 of 422.5k us with a normal p50; it is not
+explained, so gate 3 passes with a flaky tail that plan 005 must look at. A 2000-connection run in an earlier cycle gave 14.4 KB against 14.9 KB, so
+the figure is not flat in N; the cause is not profiled. Gate 4 is not lowered and N is not cut.
+
+The first bench hung at 5000 or more idle connections (bug #58). It was the bench: the clients
+close first and keep their ephemeral port in TIME_WAIT for about 30 s, macOS hands out 16384
+ports, so after the latency rounds a `connect` was refused, and `run_idle` then awaited an
+acceptor still parked in `accept`. The clients now close with a reset (`SO_LINGER` 0), and a
+scenario that connected fewer streams than planned cancels the acceptor.
+
 ## Rejected alternatives
 
 - **A `Poller` vtable for runtime backend choice.** Only one evented backend compiles per

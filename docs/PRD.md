@@ -272,6 +272,8 @@ Loop.init < 1ms)은 측정된 적이 없고 그중 둘은 더 이상 출하하�
 | 2026-10-10 | threaded + fibers | Apple arm64, macOS, ReleaseFast | 7 | sirocco p50 311 us, p99 400 us late vs `Io.Threaded` p50 7.32 ms, p99 8.04 ms: pass (native sleep on the wheel, plan 003 item 4; the Threaded figure was not investigated, it is stable across runs) |
 | 2026-10-21 | kqueue | Apple arm64 (Mac16,10, 10 cores), macOS, ReleaseFast | 2 | sirocco 65.0k echoes/s vs `Io.Threaded` 71.2k: 0.91x, pass (margin 0.01; `bench/echo.zig`, 64-byte messages, 5 s) |
 | 2026-10-21 | kqueue | Apple arm64 (Mac16,10, 10 cores), macOS, ReleaseFast | 1 | sirocco 152k-161k echoes/s vs `Io.Threaded` 184k at 1000 connections: 0.83x-0.87x, **fail** (one carrier is core-bound, ADR 0003 section 4a; plan 005 is multi-carrier) |
+| 2026-10-26 | kqueue | Apple arm64 (Mac16,10, 10 cores), macOS, ReleaseFast | 3 | sirocco p99 126.2k-129.8k us vs `Io.Threaded` 160.8k-166.0k us at 1000 connections: pass in 7 of 8 runs (one run 422.5k us, unexplained) (`bench/latency.zig`, ADR 0003 section 4b) |
+| 2026-10-26 | kqueue | Apple arm64 (Mac16,10, 10 cores), macOS, ReleaseFast | 4 | sirocco 29.2 KB per idle task at 10000 vs `Io.Threaded` 24.7 KB at its 4089 limit: **fail** (cause not profiled; ADR 0003 section 4b) |
 
 v1에서 명시적으로 타겟하지 않음: HTTP req/s(std가 파서를 소유), TLS 핸드셰이크 속도(std가
 암호화를 소유), `zig build bench`로 kingdom CI 머신에서 재현 불가능한 수치.
