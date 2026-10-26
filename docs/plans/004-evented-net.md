@@ -68,9 +68,10 @@ lets that number decide. kqueue first: the dev box is macOS arm64; epoll is CI-o
       batch to `Io.Threaded` otherwise; the wait is wheel slices (50 us to 2 ms), not a poller
       park, because a fiber sits on one waiter list only. It never needs a registration, so it
       never returns `ConcurrencyUnavailable`.
-- [ ] 8b. Replace the wheel slices of item 8 with a per-operation waiter node in the registry, so
-      an idle batch wakes on the poller event (no 2 ms latency, no `recvmsg` per slice). Verify:
-      `tests/parity/batch.zig` idle-wake latency below one wheel tick; allocations flat.
+- [~] 8b. Moved to plan 005, not done. It was added to this plan by the item 8 PR (#55), not by
+      the approved plan PR, and it needs a per-operation waiter node in `src/net_registry.zig`:
+      the waiter lists, `cancel`, both closes and `closing_finish` are keyed on one `Fiber`. The
+      wheel slices of item 8 stay (ADR 0003 section 2c); an idle batch wakes within 2 ms.
 - [x] 9. `concurrent`/`groupConcurrent` in `src/concurrency.zig` run on a free fiber once the
       scheduler is ready, and return `ConcurrencyUnavailable` when none is free. Why: plan 003
       deferred this to the backend plan, and the echo bench needs one server task per connection
@@ -88,7 +89,7 @@ lets that number decide. kqueue first: the dev box is macOS arm64; epoll is CI-o
       `RLIMIT_NOFILE` (macOS: 256) and records a refusal, never a smaller N. Verify: PRD §5 rows.
       Landed: gate 3 passes in 7 of 8 runs (p99 127k us vs 162k us), gate 4 misses (29.2 KB vs 24.7 KB per
       task); ADR 0003 section 4b, PRD §5 rows. Bug #58 was the bench, not the runtime.
-- [ ] 12. Bring README, CHANGELOG `[0.5.0]`, PRD §4.1/§4.3/§5 and the `Options` docs in line with
+- [x] 12. Bring README, CHANGELOG `[0.5.0]`, PRD §4.1/§4.3/§5 and the `Options` docs in line with
       what shipped; bump to 0.5.0 and release. Verify: `gh release view v0.5.0`.
 
 `blocked_by`: none. Zero-dependency foundation, and no kingdom repo pins sirocco yet.
