@@ -34,7 +34,7 @@ and then multi-carrier as plan 005. No consumer pins sirocco yet and zoltraak is
       `close_off_carrier`, `closing_finish` and `on_event`.
       Why one ADR: both change who owns `src/net_registry.zig`'s waiter lists. Verify: the ADR
       is merged and names one construction path, the item 1 numbers, and a gate-5 argument.
-- [ ] 3. Bring `src/sched.zig` (695 lines) and `src/concurrency.zig` (725) well under the
+- [x] 3. Bring `src/sched.zig` (695 lines) and `src/concurrency.zig` (725) well under the
       800-line tidy cap, by moving tests or a cohesive helper module the way plan 004 item 1 did.
       Why here: items 4-6 grow both files. Verify: `zig build tidy`; `wc -l src/*.zig` all
       < 650; the `zig build test --summary all` test count is unchanged.

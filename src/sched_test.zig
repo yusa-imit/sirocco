@@ -2,8 +2,8 @@
 //! allocation contract of `init`.
 //!
 //! Split out of `sched.zig` to keep that file under the 800-line cap; everything here goes through
-//! its public surface. The two white-box tests (canary, `init_checked`) stay beside the private
-//! helpers they cover.
+//! its public surface. The two white-box tests (canary in `sched_fiber.zig`, `init_checked` in
+//! `sched.zig`) stay beside the private helpers they cover.
 
 const std = @import("std");
 const Sched = @import("sched.zig");
