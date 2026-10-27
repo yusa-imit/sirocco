@@ -40,6 +40,8 @@
 //! x30), pushed on the old stack; zero syscalls on the ready path, one futex wait (or one
 //! `kevent`) per idle period.
 //! Eager start (`spawn_first`) puts the new fiber at the queue front and runs it before returning.
+//! The first context of a fiber, its entry trampoline, exit path and the stack canary live in
+//! `src/sched_fiber.zig`.
 
 const std = @import("std");
 const builtin = @import("builtin");
@@ -49,6 +51,7 @@ const Wheel = @import("timer.zig");
 const sleep = @import("sleep.zig");
 const evented = @import("backend/poller.zig");
 const sched_io = @import("sched_io.zig");
+const sched_fiber = @import("sched_fiber.zig");
 
 const Io = std.Io;
 const assert = stdx.assert;
@@ -196,17 +199,7 @@ pub const Fiber = struct {
     const State = enum { free, ready, running, parked };
 };
 
-const stack_align = 16;
-const canary_value: u64 = 0x5afe_c0de_0ddf_00d5;
-const canary_size = @sizeOf(u64);
-
-/// Lives at the top of a fiber's stack; the entry trampoline hands its address to `fiber_main`.
-const Start = struct {
-    sched: *Sched,
-    fiber: *Fiber,
-    entry: Entry,
-    arg: ?*anyopaque,
-};
+pub const stack_align = 16;
 
 /// Fills `target` in place. Precondition: `options.fibers_max > 0`, `options.stack_size` is a
 /// multiple of 16 and at least `stack_size_min`. Runs nothing; allocates the fiber table and the
@@ -358,17 +351,8 @@ fn spawn_placed(sched: *Sched, entry: Entry, arg: ?*anyopaque, place: Placement)
     assert(fiber.arg == null);
     sched.free_head = fiber.queue_next;
 
-    const top = @intFromPtr(fiber.stack.ptr) + fiber.stack.len;
-    assert(top % stack_align == 0);
-    const start_address = std.mem.alignBackward(usize, top - @sizeOf(Start), stack_align);
-    const start: *Start = @ptrFromInt(start_address);
-    start.* = .{ .sched = sched, .fiber = fiber, .entry = entry, .arg = arg };
+    fiber.context = sched_fiber.context_prepare(sched, fiber, entry, arg);
     fiber.arg = arg;
-    std.mem.writeInt(u64, fiber.stack[0..canary_size], canary_value, .little);
-    // x86_64 enters `fiber_main` through a `jmp`, so the word below `Start` plays the return
-    // address; zero ends a stack walk (aarch64 zeroes `x30` in `fiber_entry`).
-    @as(*usize, @ptrFromInt(start_address - @sizeOf(usize))).* = 0;
-    fiber.context = initial_context(start_address);
 
     sched.live_count += 1;
     if (place == .front) sched.push_front(fiber) else sched.push_ready(fiber);
@@ -603,84 +587,18 @@ fn inbox_drain(sched: *Sched) void {
     assert(ordered == null);
 }
 
-fn switch_to_carrier(sched: *Sched, fiber: *Fiber) void {
+/// Leaves `fiber` for the carrier loop. Precondition: `fiber` is the running fiber; also the exit
+/// path of `src/sched_fiber.zig`'s `fiber_main`.
+pub fn switch_to_carrier(sched: *Sched, fiber: *Fiber) void {
     assert(sched.current == fiber);
     // Checked on every switch-out, so an overflow is caught while the fiber is still parked.
-    assert_always(canary_intact(fiber.stack));
+    assert_always(sched_fiber.canary_intact(fiber.stack));
     sched.current = null;
     switch_context(&fiber.context, &sched.carrier_context);
 }
 
-fn canary_intact(stack: []const u8) bool {
-    return std.mem.readInt(u64, stack[0..canary_size], .little) == canary_value;
-}
-
-/// Runs on the fiber's own stack; never returns, it switches to the carrier for good.
-fn fiber_main(start: *Start) callconv(.withStackAlign(.c, @alignOf(Start))) noreturn {
-    const sched = start.sched;
-    const fiber = start.fiber;
-    assert(sched.current == fiber);
-    start.entry(start.arg);
-
-    assert_always(canary_intact(fiber.stack));
-    assert(fiber.state == .running);
-    fiber.state = .free;
-    fiber.arg = null;
-    fiber.queue_next = sched.free_head;
-    sched.free_head = fiber;
-    sched.live_count -= 1;
-    sched.switch_to_carrier(fiber);
-    // A free fiber is never made ready again, so its context is never resumed.
-    unreachable;
-}
-
-fn initial_context(start_address: usize) Io.fiber.Context {
-    return switch (builtin.cpu.arch) {
-        .x86_64 => .{
-            .rsp = start_address - @sizeOf(usize),
-            .rbp = 0,
-            .rip = @intFromPtr(&fiber_entry),
-        },
-        .aarch64 => .{
-            .sp = start_address,
-            .fp = 0,
-            .pc = @intFromPtr(&fiber_entry),
-        },
-        else => unreachable, // `supported` is false and `init` refused.
-    };
-}
-
-/// First instruction of a new fiber: turns the stack-top `Start` record into `fiber_main`'s
-/// only argument.
-fn fiber_entry() callconv(.naked) void {
-    switch (builtin.cpu.arch) {
-        .x86_64 => asm volatile (
-            \\ leaq 8(%%rsp), %%rdi
-            \\ jmp %[fiber_main:P]
-            :
-            : [fiber_main] "X" (&fiber_main),
-        ),
-        .aarch64 => asm volatile (
-            \\ mov x0, sp
-            \\ mov x30, xzr
-            \\ b %[fiber_main]
-            :
-            : [fiber_main] "X" (&fiber_main),
-        ),
-        else => unreachable, // `supported` is false and `init` refused.
-    }
-}
-
 fn test_options(fibers_max: u32, stack_size: u32) Options {
     return .{ .fibers_max = fibers_max, .stack_size = stack_size, .now_ns = 0, .idle = .futex };
-}
-
-test "canary detects a clobbered stack base" {
-    var stack: [64]u8 = @splat(0);
-    std.mem.writeInt(u64, stack[0..canary_size], canary_value, .little);
-    try std.testing.expect(canary_intact(&stack));
-    stack[3] ^= 0x01;
-    try std.testing.expect(!canary_intact(&stack));
 }
 
 test "init reports FibersUnsupported before allocating" {
