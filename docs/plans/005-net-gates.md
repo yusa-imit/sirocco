@@ -3,10 +3,9 @@
 ## Goal
 
 Close the two PRD §5 gates v0.5.0 missed: gate 1 (echo throughput at 1000 connections) and
-gate 4 (memory per idle connection). Each fix follows a profile. Run sirocco on N carriers, each
-with its own `Sched`, `Poller` and wheel (ADR 0003 rule 1). Land item 8b, carried over from plan
-004: a waiter node per operation, so an idle batch parks on the poller instead of polling in
-wheel slices. Finish the review leftovers from plan 004.
+gate 4 (memory per idle connection), each fix following a profile. Run sirocco on N carriers
+(ADR 0003 rule 1). Land item 8b from plan 004: a waiter node per operation, so an idle batch
+parks on the poller instead of polling in wheel slices. Finish plan 004's review leftovers.
 
 ## Why now
 
@@ -81,21 +80,21 @@ and then multi-carrier as plan 005. No consumer pins sirocco yet and zoltraak is
 - [ ] 12. Bring README, CHANGELOG `[0.6.0]`, PRD §4.1 (`Options`) and §5 into line with what
       shipped; bump to 0.6.0 and release. Verify: `gh release view v0.6.0`.
 
-`blocked_by`: none. sirocco is a zero-dependency foundation repo.
+`blocked_by`: none.
 
 ## Out of scope
 
 - The consumer swap (ADR 0001 rule 5, ROADMAP Phase 2: swap `Io` at zoltraak's `main`).
   zoltraak has not finished its `001` migration, so it is a zoltraak plan.
 - io_uring, IOCP and Windows; moving a fiber that holds armed sockets to another carrier.
-- Changelist batching of arms. Item 2 adopts it only if item 1 shows arm syscalls dominate.
+- Changelist batching of arms, unless item 1 shows arm syscalls dominate.
 - A cancel for the overflow worker's `poll(2)` (ADR 0002 lets a submitted call complete) and
   `poll_block`'s infinite timeout (off a fiber only, as in `Io.Threaded`).
 
 ## Risks
 
-- Item 1 may show the carrier is not core-bound, so items 6-8 rest on a wrong premise. Then
-  item 2 records it and asks the owner on the milestone issue before item 6 starts.
+- Item 1 may show the carrier is not core-bound; then item 2 records it and asks the owner
+  on the milestone issue before item 6 starts.
 - Cross-carrier races hide behind single-carrier tests. Mitigations: the seeded model test,
   serial stress of the built binary (item 7), the parity suite at several carrier counts.
 - Gate 2 has a margin of 0.01: items 4-6 re-run `bench-echo` before they merge.
