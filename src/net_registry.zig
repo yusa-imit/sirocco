@@ -161,9 +161,10 @@ pub const Registry = struct {
         return insert_locked(registry, fd);
     }
 
-    /// What `lease` found: `.held` when the caller now owes a `lease_release`, `.socket` when
-    /// `fd` belongs to a socket sirocco made (or is closing), which needs no release.
-    pub const Lease = enum { held, socket };
+    /// What `lease` found: `.held` when the caller now owes a `lease_release` with the slot
+    /// generation it carries, `.socket` when `fd` belongs to a socket sirocco made (or is
+    /// closing), which needs no release.
+    pub const Lease = union(enum) { held: u32, socket };
 
     /// Enters `fd`, a file declared non-blocking, for one `operate` call, or joins the lease of
     /// another fiber on the same file. `error.Full` when no slot is free. Carrier-only in
@@ -177,23 +178,27 @@ pub const Registry = struct {
             const slot = &registry.slots[@intCast(found)];
             if (slot.leases == 0) return .socket;
             slot.leases += 1;
-            return .held;
+            return .{ .held = slot.generation };
         }
         const index = try insert_locked(registry, fd);
-        registry.slots[index].leases = 1;
-        return .held;
+        const slot = &registry.slots[index];
+        assert(slot.leases == 0);
+        slot.leases = 1;
+        return .{ .held = slot.generation };
     }
 
-    /// Ends one `lease`; the last one frees the slot. Tolerates an entry that is gone or no
-    /// longer a lease (the file was closed and its number reused under the call, a caller bug
-    /// that must not corrupt a socket's slot). The leaser has left every waiter list by now.
-    pub fn lease_release(registry: *Registry, fd: fd_t) void {
+    /// Ends one `lease`, given the generation it returned; the last one frees the slot. Does
+    /// nothing for an entry that is gone, no longer a lease, or of another generation (the file
+    /// was closed and its number reused under the call, a caller bug that must not corrupt the
+    /// slot of the file that now owns the number). The leaser has left every waiter list by now.
+    pub fn lease_release(registry: *Registry, fd: fd_t, generation: u32) void {
         assert(fd >= 0);
         registry.lock();
         defer registry.mutex.unlock();
 
         const found = registry.table.get(poller.key(fd, .read)) orelse return;
         const slot = &registry.slots[@intCast(found)];
+        if (slot.generation != generation) return;
         if (slot.leases == 0) return;
         slot.leases -= 1;
         if (slot.leases > 0) return;
@@ -553,20 +558,41 @@ test "registry: leases share one slot, the last release frees it, a socket is ne
     try registry.init(std.testing.allocator, 2);
     defer registry.deinit(std.testing.allocator);
 
-    try std.testing.expectEqual(Registry.Lease.held, try registry.lease(20));
-    try std.testing.expectEqual(Registry.Lease.held, try registry.lease(20));
+    const first = try registry.lease(20);
+    const joined = try registry.lease(20);
+    try std.testing.expectEqual(first, joined);
     try std.testing.expectEqual(@as(u32, 1), registry.count());
-    registry.lease_release(20);
+    registry.lease_release(20, first.held);
     try std.testing.expectEqual(@as(u32, 1), registry.count());
-    registry.lease_release(20);
+    registry.lease_release(20, joined.held);
     try std.testing.expectEqual(@as(u32, 0), registry.count());
-    registry.lease_release(20); // Already gone: tolerated.
+    registry.lease_release(20, joined.held); // Already gone: tolerated.
 
-    _ = try registry.register(21);
+    const socket_index = try registry.register(21);
     try std.testing.expectEqual(Registry.Lease.socket, try registry.lease(21));
-    registry.lease_release(21); // Not a lease: the socket's slot survives.
+    const generation = registry.generation_of(socket_index);
+    registry.lease_release(21, generation); // Not a lease: the socket's slot survives.
     try std.testing.expect(registry.lookup(21) != null);
     try std.testing.expect(registry.unregister(21));
+}
+
+test "registry: a stale lease_release cannot drop the lease of a file that reused the fd" {
+    var registry: Registry = .empty;
+    try registry.init(std.testing.allocator, 2);
+    defer registry.deinit(std.testing.allocator);
+
+    const stale = (try registry.lease(20)).held;
+    // A foreign close frees the slot behind the leaser; the number is reused by another file.
+    try std.testing.expect(registry.unregister(20));
+    const current = (try registry.lease(20)).held;
+    try std.testing.expect(current != stale);
+
+    registry.lease_release(20, stale);
+    try std.testing.expectEqual(@as(u32, 1), registry.count());
+    const index = registry.lookup(20).?;
+    try std.testing.expectEqual(@as(u32, 1), registry.slots[index].leases);
+    registry.lease_release(20, current);
+    try std.testing.expectEqual(@as(u32, 0), registry.count());
 }
 
 test "registry: a lease on a full registry says so and leaves the registry alone" {
@@ -578,7 +604,7 @@ test "registry: a lease on a full registry says so and leaves the registry alone
     try std.testing.expectError(error.Full, registry.lease(31));
     try std.testing.expectEqual(@as(u32, 1), registry.count());
     try std.testing.expect(registry.unregister(30));
-    try std.testing.expectEqual(Registry.Lease.held, try registry.lease(31));
-    registry.lease_release(31);
+    const held = (try registry.lease(31)).held;
+    registry.lease_release(31, held);
     try std.testing.expectEqual(@as(u32, 0), registry.count());
 }

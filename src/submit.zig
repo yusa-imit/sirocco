@@ -99,7 +99,17 @@ fn receive(rt: *Runtime, r: net.Route, o: NetReceive) Io.Cancelable!NetReceive.R
                 net.wait_for(E, rt, r, o.socket_handle, .read, closed) catch |wait_err| {
                     switch (wait_err) {
                         error.Canceled => return error.Canceled,
-                        else => return .{ wait_err, 0 }, // Any other member is the call's own.
+                        // Every other member is the call's own; a new one must be placed here.
+                        error.SystemResources,
+                        error.ProcessFdQuotaExceeded,
+                        error.SystemFdQuotaExceeded,
+                        error.SocketUnconnected,
+                        error.MessageOversize,
+                        error.ConnectionResetByPeer,
+                        error.NetworkDown,
+                        error.PortUnreachable,
+                        error.Unexpected,
+                        => return .{ wait_err, 0 },
                     }
                 };
             },
@@ -208,7 +218,10 @@ fn serve_file(
     const held = rt.sockets.lease(fd) catch |err| switch (err) {
         error.Full => return overflow(rt, operation),
     };
-    defer if (held == .held) rt.sockets.lease_release(fd);
+    defer switch (held) {
+        .held => |generation| rt.sockets.lease_release(fd, generation),
+        .socket => {}, // A socket's slot belongs to its creator.
+    };
 
     return file_run(rt, r, operation);
 }
@@ -247,7 +260,19 @@ fn file_read(rt: *Runtime, r: net.Route, o: FileRead) Io.Cancelable!FileRead.Res
                 net.wait_for(E, rt, r, o.file.handle, .read, closed) catch |wait_err| {
                     switch (wait_err) {
                         error.Canceled => return error.Canceled,
-                        else => return @as(R, net.narrow(FileRead.Error, wait_err)),
+                        // Every other member is the call's own; a new one must be placed here.
+                        error.InputOutput,
+                        error.SystemResources,
+                        error.IsDir,
+                        error.ConnectionResetByPeer,
+                        error.NotOpenForReading,
+                        error.SocketUnconnected,
+                        error.WouldBlock,
+                        error.AccessDenied,
+                        error.LockViolation,
+                        error.Unexpected,
+                        error.EndOfStream,
+                        => return @as(R, net.narrow(FileRead.Error, wait_err)),
                     }
                 };
             },
@@ -304,7 +329,23 @@ fn file_write(rt: *Runtime, r: net.Route, o: FileWrite) Io.Cancelable!FileWrite.
                 net.wait_for(E, rt, r, o.file.handle, .write, closed) catch |wait_err| {
                     switch (wait_err) {
                         error.Canceled => return error.Canceled,
-                        else => return @as(R, net.narrow(FileWrite.Error, wait_err)),
+                        // Every other member is the call's own; a new one must be placed here.
+                        error.DiskQuota,
+                        error.FileTooBig,
+                        error.InputOutput,
+                        error.NoSpaceLeft,
+                        error.DeviceBusy,
+                        error.AccessDenied,
+                        error.PermissionDenied,
+                        error.BrokenPipe,
+                        error.SystemResources,
+                        error.NotOpenForWriting,
+                        error.LockViolation,
+                        error.WouldBlock,
+                        error.NoDevice,
+                        error.FileBusy,
+                        error.Unexpected,
+                        => return @as(R, net.narrow(FileWrite.Error, wait_err)),
                     }
                 };
             },
