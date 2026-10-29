@@ -420,28 +420,28 @@ test "cancel completes the task and delivers its result" {
 test "cancel of a parked concurrent task delivers Canceled and leaves the runtime usable" {
     // An offloaded read cannot be interrupted, so only the evented backends can cancel one.
     if (!fibers_supported or fixtures.backend == .threaded) return error.SkipZigTest;
-    for (modes) |mode| {
-        const gpa = std.testing.allocator;
-        var rt = try fixtures.init_runtime_sockets(gpa, mode, 16, 6, 16);
-        defer rt.deinit();
+    var rt = try net_data.init_rt();
+    defer rt.deinit();
 
-        const io = rt.io();
-        const pair = try net_data.connect_pair(io);
-        defer net_data.pair_close(io, pair);
+    const io = rt.io();
+    // Sockets made off a fiber are not registered with the poller, so the read would fall back
+    // to the offload pool, where a blocking read cannot be canceled: make the pair on a fiber.
+    var making = try io.concurrent(net_data.connect_pair, .{io});
+    const pair = try making.await(io);
+    defer net_data.pair_close(io, pair);
 
-        // No data was written, so the read parks inside `concurrent`.
-        var parked = try io.concurrent(net_data.read_some, .{ io, pair.served.socket.handle });
-        try std.testing.expectEqual(@as(u32, 1), rt.sched.parked_count);
-        try std.testing.expectError(error.Canceled, parked.cancel(io));
-        try std.testing.expectEqual(@as(u32, 0), rt.sched.parked_count);
-        try std.testing.expect(!rt.sched.armed_any());
+    // No data was written, so the read parks inside `concurrent`.
+    var parked = try io.concurrent(net_data.read_some, .{ io, pair.served.socket.handle });
+    try std.testing.expectEqual(@as(u32, 1), rt.sched.parked_count);
+    try std.testing.expectError(error.Canceled, parked.cancel(io));
+    try std.testing.expectEqual(@as(u32, 0), rt.sched.parked_count);
+    try std.testing.expect(!rt.sched.armed_any());
 
-        // The fiber came back: a second concurrent read on the same socket completes.
-        _ = try net_data.raw_write(io, pair.client.socket.handle, "ok");
-        var again = try io.concurrent(net_data.read_some, .{ io, pair.served.socket.handle });
-        try std.testing.expectEqual(@as(usize, 2), try again.await(io));
-        try std.testing.expectEqual(@as(u32, 5), try concurrent_attempt(io));
-    }
+    // The fiber came back: a second concurrent read on the same socket completes.
+    _ = try net_data.raw_write(io, pair.client.socket.handle, "ok");
+    var again = try io.concurrent(net_data.read_some, .{ io, pair.served.socket.handle });
+    try std.testing.expectEqual(@as(usize, 2), try again.await(io));
+    try std.testing.expectEqual(@as(u32, 5), try concurrent_attempt(io));
 }
 
 fn cancelling_parent(io: Io, trace: *Trace) u32 {

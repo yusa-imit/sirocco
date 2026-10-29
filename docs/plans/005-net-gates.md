@@ -71,7 +71,7 @@ and then multi-carrier as plan 005. No consumer pins sirocco yet and zoltraak is
       the cause is sirocco's. Why: 14.4 KB at 2000 against 29.2 KB at 10000 is not flat in N.
       Verify: ADR 0003 section 4b gets the breakdown and the PRD §5 gate-4 row is re-measured.
       A fix too big for one cycle opens an issue naming the cause, for plan 006.
-- [ ] 11. Leftovers, each with a test that fails first: a test cancels a parked `concurrent`
+- [x] 11. Leftovers, each with a test that fails first: a test cancels a parked `concurrent`
       future (`tests/parity/concurrency.zig`); the three `wait_err` switches in
       `src/submit.zig` list every member instead of `else`; `lease_release` checks the slot
       generation `lease` returned, so a release after a foreign close and fd reuse cannot drop
