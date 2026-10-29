@@ -11,6 +11,9 @@ pub const version = std.SemanticVersion{ .major = 0, .minor = 5, .patch = 0 };
 
 pub const stdx = @import("stdx.zig");
 
+/// Bench-only counters; compiled out unless the program's root declares `sirocco_profile`.
+pub const profile = @import("profile.zig");
+
 pub const Runtime = @import("runtime.zig");
 
 test {

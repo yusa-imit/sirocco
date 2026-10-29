@@ -14,6 +14,7 @@
 const std = @import("std");
 const stdx = @import("../stdx.zig");
 const shared = @import("poller.zig");
+const profile = @import("../profile.zig");
 
 const assert = stdx.assert;
 const assert_always = stdx.assert_always;
@@ -135,7 +136,9 @@ pub fn wait(poller: *Poller, timeout_ns: ?u64, out: []Event) u32 {
     else
         null;
 
+    const stamp = profile.begin();
     const rc = c.kevent(poller.kq, &no_changes, 0, &raw, @intCast(out_max), timeout_ptr);
+    profile.end(.kevent_wait, stamp);
     if (rc < 0) switch (c.errno(rc)) {
         .INTR => return 0,
         else => trap(),
@@ -205,7 +208,9 @@ fn interest_of(filter: anytype) Interest {
 fn change_apply(kq: fd_t, change: *const c.Kevent) c.E {
     var unused: [1]c.Kevent = undefined;
     for (0..attempts_max) |_| {
+        const stamp = profile.begin();
         const rc = c.kevent(kq, @ptrCast(change), 1, &unused, 0, null);
+        profile.end(.kevent_arm, stamp);
         if (rc >= 0) return .SUCCESS;
         const errno = c.errno(rc);
         if (errno != .INTR) return errno;

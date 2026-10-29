@@ -215,6 +215,70 @@ fn rate_per_s(result: Result) f64 {
     return echoes / seconds;
 }
 
+/// Counters and process CPU time around one native scenario, printed only by the profile build
+/// (`bench/echo_profile.zig`): the share of wall time per syscall class, and user against system
+/// CPU of the whole process (the carrier is the only busy thread of a native row).
+const Probe = struct {
+    counters: sirocco.profile.Snapshot,
+    wall_ns: u64,
+    user_us: u64,
+    system_us: u64,
+
+    fn take(io: Io) Probe {
+        const usage = posix.getrusage(0);
+        return .{
+            .counters = sirocco.profile.snapshot(),
+            .wall_ns = now_ns(io),
+            .user_us = timeval_us(usage.utime),
+            .system_us = timeval_us(usage.stime),
+        };
+    }
+
+    fn timeval_us(value: posix.timeval) u64 {
+        assert(value.sec >= 0);
+        assert(value.usec >= 0);
+        return @as(u64, @intCast(value.sec)) * std.time.us_per_s + @as(u64, @intCast(value.usec));
+    }
+
+    fn delta(later: Probe, earlier: Probe) Probe {
+        return .{
+            .counters = later.counters.delta(earlier.counters),
+            .wall_ns = later.wall_ns - earlier.wall_ns,
+            .user_us = later.user_us - earlier.user_us,
+            .system_us = later.system_us - earlier.system_us,
+        };
+    }
+
+    fn print(probe: Probe, out: *Io.Writer, connections: u32) !void {
+        assert(probe.wall_ns > 0);
+        const wall: f64 = @floatFromInt(probe.wall_ns);
+        const header = "profile, {d} conns: wall {d:.0} ms, process user {d:.0} ms, " ++
+            "system {d:.0} ms\n";
+        try out.print(header, .{
+            connections,
+            wall / std.time.ns_per_ms,
+            @as(f64, @floatFromInt(probe.user_us)) / std.time.us_per_ms,
+            @as(f64, @floatFromInt(probe.system_us)) / std.time.us_per_ms,
+        });
+        var timed_ns: u64 = 0;
+        inline for (@typeInfo(sirocco.profile.Counter).@"enum".fields) |field| {
+            const index = field.value;
+            const elapsed = probe.counters.elapsed_ns[index];
+            timed_ns += elapsed;
+            const share = 100.0 * @as(f64, @floatFromInt(elapsed)) / wall;
+            try out.print("  {s:<13} {d:>12} calls {d:>10.0} ms {d:>6.1}% of wall\n", .{
+                field.name,
+                probe.counters.calls[index],
+                @as(f64, @floatFromInt(elapsed)) / std.time.ns_per_ms,
+                share,
+            });
+        }
+        const rest = 100.0 * @as(f64, @floatFromInt(probe.wall_ns -| timed_ns)) / wall;
+        try out.print("  {s:<13} {d:>41.1}% of wall\n", .{ "untimed", rest });
+        try out.flush();
+    }
+};
+
 fn nofile_raise(need: u64) error{NofileRefused}!void {
     var limit = posix.getrlimit(.NOFILE) catch return error.NofileRefused;
     if (limit.cur >= need) return;
@@ -252,7 +316,9 @@ pub fn main(init: std.process.Init) !void {
     var ratios: [2]f64 = undefined;
     for ([_]u32{ connections_one, connections_many }, 0..) |connections, row| {
         const baseline = try measure(init.gpa, rt.baselineIo(), connections);
+        const probe_before = Probe.take(rt.io());
         const native = try measure(init.gpa, rt.io(), connections);
+        const probe_change = Probe.take(rt.io()).delta(probe_before);
         try out.print(
             "{s:<10} {d:>6} {d:>14.0} {d:>8}\n",
             .{ "threaded", connections, rate_per_s(baseline), baseline.failures },
@@ -261,6 +327,7 @@ pub fn main(init: std.process.Init) !void {
             "{s:<10} {d:>6} {d:>14.0} {d:>8}\n",
             .{ @tagName(rt.backend), connections, rate_per_s(native), native.failures },
         );
+        if (sirocco.profile.enabled) try probe_change.print(out, connections);
         const clean = baseline.failures == 0 and native.failures == 0;
         ratios[row] = if (clean) rate_per_s(native) / rate_per_s(baseline) else 0;
     }

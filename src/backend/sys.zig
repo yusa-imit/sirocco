@@ -16,6 +16,7 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const stdx = @import("../stdx.zig");
+const profile = @import("../profile.zig");
 
 const posix = std.posix;
 const system = posix.system;
@@ -276,7 +277,9 @@ pub fn readv(fd: fd_t, iov: []const posix.iovec) DataError!usize {
     assert(iov.len >= 1);
     assert(iov.len <= iovecs_max);
     const count: IovCount(system.readv) = @intCast(iov.len);
+    const stamp = profile.begin();
     const rc = retried(system.readv, .{ fd, iov.ptr, count });
+    profile.end(.socket_read, stamp);
     if (posix.errno(rc) != .SUCCESS) return data_fail(posix.errno(rc));
     return @intCast(rc);
 }
@@ -286,7 +289,9 @@ pub fn readv(fd: fd_t, iov: []const posix.iovec) DataError!usize {
 pub fn sendmsg(fd: fd_t, msg: *const posix.msghdr_const, flags: u32) DataError!usize {
     assert(fd >= 0);
     assert(msg.iovlen <= iovecs_max);
+    const stamp = profile.begin();
     const rc = retried(system.sendmsg, .{ fd, msg, flags | posix.MSG.NOSIGNAL });
+    profile.end(.socket_write, stamp);
     if (posix.errno(rc) != .SUCCESS) return data_fail(posix.errno(rc));
     return @intCast(rc);
 }
@@ -308,7 +313,9 @@ pub fn shutdown(fd: fd_t, how: ShutdownHow) DataError!void {
 pub fn recvmsg(fd: fd_t, msg: *posix.msghdr, flags: u32) DataError!usize {
     assert(fd >= 0);
     assert(msg.iovlen == 1);
+    const stamp = profile.begin();
     const rc = retried(system.recvmsg, .{ fd, msg, flags | posix.MSG.NOSIGNAL });
+    profile.end(.socket_read, stamp);
     if (posix.errno(rc) != .SUCCESS) return data_fail(posix.errno(rc));
     return @intCast(rc);
 }
