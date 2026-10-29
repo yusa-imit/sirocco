@@ -18,7 +18,7 @@ and then multi-carrier as plan 005. No consumer pins sirocco yet and zoltraak is
 
 ## Scope
 
-- [ ] 1. Profile `zig build bench-echo` at 1000 connections, ReleaseFast, kqueue. Use
+- [x] 1. Profile `zig build bench-echo` at 1000 connections, ReleaseFast, kqueue. Use
       `xctrace record --template 'Time Profiler'`, or `dtrace -n profile-997` as the fallback.
       Never use `sample(1)`, which hangs the bench. Record the carrier's time share in `kevent`
       (arm and wait), socket syscalls, fiber switches, offload and std's `Io` call chain.

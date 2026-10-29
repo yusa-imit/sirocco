@@ -46,6 +46,7 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const stdx = @import("stdx.zig");
+const profile = @import("profile.zig");
 const switch_context = @import("fiber_switch.zig").switch_context;
 const Wheel = @import("timer.zig");
 const sleep = @import("sleep.zig");
@@ -497,6 +498,7 @@ fn run_loop(sched: *Sched, io: Io, stop: ?*const bool) void {
         };
         fiber.state = .running;
         sched.current = fiber;
+        profile.count(.fiber_switch);
         switch_context(&sched.carrier_context, &fiber.context);
         assert(sched.current == null);
         sched.since_poll += 1;
@@ -594,6 +596,7 @@ pub fn switch_to_carrier(sched: *Sched, fiber: *Fiber) void {
     // Checked on every switch-out, so an overflow is caught while the fiber is still parked.
     assert_always(sched_fiber.canary_intact(fiber.stack));
     sched.current = null;
+    profile.count(.fiber_switch);
     switch_context(&fiber.context, &sched.carrier_context);
 }
 

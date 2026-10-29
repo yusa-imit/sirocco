@@ -268,6 +268,46 @@ ports, so after the latency rounds a `connect` was refused, and `run_idle` then 
 acceptor still parked in `accept`. The clients now close with a reset (`SO_LINGER` 0), and a
 scenario that connected fewer streams than planned cancels the acceptor.
 
+### 4c. Gate 1 on one carrier: profiled (2026-10-30)
+
+No sampling profiler works on the dev box (`xctrace` is the `/usr/bin` shim without Xcode, no
+`dtrace`, `sample(1)` hangs the bench), so the profile is in-process: `src/profile.zig` counts
+and times the carrier's calls when the program's root declares `sirocco_profile`. Only
+`bench/echo_profile.zig` does, so the library, the tests and the gate runs compile it to nothing.
+It times `kevent` (arm and wait), `readv`/`recvmsg` and `sendmsg`, and counts fiber switches
+(the switch is a few instructions and is not timed; it lands in "untimed" with user code).
+
+Command: `zig build bench-echo-profile` (ReleaseFast, same machine as 4a, kqueue, 5 s window).
+Two runs, native row at 1000 connections, share of the scenario's wall time:
+
+| class | calls per echo | us per call | share of wall |
+|---|---|---|---|
+| `readv`/`recvmsg` | 4.0 | 0.82 | 43.5%-46.6% |
+| `sendmsg` | 2.0 | 1.16 | 30.8%-32.6% |
+| `kevent` arm (changelist of one) | 2.0 | 0.29 | 7.6%-8.0% |
+| `kevent` wait | 0.03 | 8-18 | 4.2%-8.6% |
+| fiber switches (counted) | 4.5 | | in "untimed" |
+| untimed: fiber switches, scheduler, std's `Io` chain, user code | | | 8.7%-9.4% |
+
+The process used 1.08-1.14 s of user time and 3.93-3.95 s of system time over the window, so the
+carrier spends about 78% of its CPU in the kernel and 90% of its wall time inside the five timed
+calls. That is above the plan's 60% line: **there is no user-space hot spot**, and the inference
+in 4a holds. A single carrier cannot pass gate 1 by trimming scheduler code.
+
+What the numbers do show is waste inside the syscall budget. An echo needs two reads that return
+data and two writes. The carrier issues four reads and two one-shot arms: each parked reader
+first tries `readv`, gets `EAGAIN`, arms, parks, and reads again. The two `EAGAIN` reads and the
+two arms are about 23% and 8% of the wall time. Removing both would put one carrier near 1.3x
+of `Io.Threaded`, still short of 2.0x, so multi-carrier stays on the plan. Two ways to remove
+them are for ADR 0004 to weigh, because both change the registry's waiter bookkeeping that
+item 8b rewrites: a persistent (`EV_CLEAR`) registration that records readiness, so a reader
+whose last event was consumed parks without the speculative read; and a changelist that batches
+the arms of one poll turn into the `kevent` call that waits (the plan's out-of-scope item,
+which this profile reopens at 8% of wall).
+
+The profile build is a reading, not a gate figure: it adds two `clock_gettime` calls per timed
+syscall, and its gate-1 and gate-2 ratios (0.90x and 0.86x) are not the gate runs.
+
 ## Rejected alternatives
 
 - **A `Poller` vtable for runtime backend choice.** Only one evented backend compiles per

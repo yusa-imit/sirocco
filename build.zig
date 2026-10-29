@@ -173,6 +173,25 @@ pub fn build(b: *std.Build) void {
     const bench_echo_step = b.step("bench-echo", "Run the loopback echo benchmark (gates 1, 2)");
     bench_echo_step.dependOn(&run_bench_echo.step);
 
+    // Same scenario as bench-echo, compiled with the carrier's time counters (ADR 0003 4c).
+    const bench_echo_profile = b.addExecutable(.{
+        .name = "sirocco-bench-echo-profile",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("bench/echo_profile.zig"),
+            .target = target,
+            .optimize = .ReleaseFast,
+            .imports = &.{
+                .{ .name = "sirocco", .module = mod },
+            },
+        }),
+    });
+    const run_bench_echo_profile = b.addRunArtifact(bench_echo_profile);
+    const bench_echo_profile_step = b.step(
+        "bench-echo-profile",
+        "Run the echo benchmark with time counters (not a gate run)",
+    );
+    bench_echo_profile_step.dependOn(&run_bench_echo_profile.step);
+
     const bench_latency = b.addExecutable(.{
         .name = "sirocco-bench-latency",
         .root_module = b.createModule(.{
