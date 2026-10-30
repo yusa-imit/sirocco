@@ -25,7 +25,7 @@ and then multi-carrier as plan 005. No consumer pins sirocco yet and zoltraak is
       Why first: items 6-8 rest on section 4a's inference. Verify: ADR 0003 gets a section 4c
       with the table and the trace command. If kernel time is under 60% of the carrier's time,
       4c names the hot spot, and item 2 decides whether to fix it before multi-carrier.
-- [ ] 2. `docs/adr/0004-multi-carrier.md` (architect, opus). Contents:
+- [x] 2. `docs/adr/0004-multi-carrier.md` (architect, opus). Contents:
       `Options.carriers` and its validation; placement (a fiber stays on the carrier whose
       poller holds its sockets); cross-carrier futex wake, `await`, cancel and close on
       `unpark_foreign`; registry per carrier or shared; work stealing (never-started fibers
