@@ -267,29 +267,36 @@ fn init_checked(
         .events = null,
         .since_poll = 0,
     };
-    // Reverse order so the first `spawn` takes fiber 0 and the free list stays address-ordered.
-    for (0..fibers.len) |offset| {
-        const index = fibers.len - 1 - offset;
-        const stack_offset = index * options.stack_size;
-        fibers[index] = .{
+    fibers_init(target);
+    assert(target.free_head == &fibers[0]);
+}
+
+/// Fills the free list and the waiter pool from `target`'s tables. Reverse order so the first
+/// `spawn` takes fiber 0 and the free list stays address-ordered.
+fn fibers_init(target: *Sched) void {
+    assert(target.fibers.len == target.waiters.len);
+    assert(target.free_head == null);
+    for (0..target.fibers.len) |offset| {
+        const index = target.fibers.len - 1 - offset;
+        const stack_offset = index * target.stack_size;
+        target.fibers[index] = .{
             .context = std.mem.zeroes(Io.fiber.Context),
             .queue_next = target.free_head,
             .state = .free,
-            .stack = stacks[stack_offset..][0..options.stack_size],
+            .stack = target.stacks[stack_offset..][0..target.stack_size],
             .arg = null,
             .wait = .none,
         };
-        target.free_head = &fibers[index];
-        waiters[index] = .{
+        target.free_head = &target.fibers[index];
+        target.waiters[index] = .{
             .prev = null,
             .next = null,
-            .fiber = &fibers[index],
+            .fiber = &target.fibers[index],
             .interest = .read,
             .slot = 0,
             .generation = 0,
         };
     }
-    assert(target.free_head == &fibers[0]);
 }
 
 fn idle_init(gpa: std.mem.Allocator, options: IdleOptions) InitError!Idle {
