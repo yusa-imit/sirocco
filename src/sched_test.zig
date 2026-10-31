@@ -203,8 +203,8 @@ test "init allocates, spawn and run do not" {
     var sched: Sched = undefined;
     try sched.init(gpa, test_options(4, 32 * 1024));
     defer sched.deinit(gpa);
-    // Fiber table, stack arena and wheel nodes; nothing else.
-    try std.testing.expectEqual(@as(usize, 3), failing.alloc_index);
+    // Fiber table, stack arena, wheel nodes and the waiter pool; nothing else.
+    try std.testing.expectEqual(@as(usize, 4), failing.alloc_index);
 
     var log: TestLog = .{ .sched = &sched, .ids = @splat(0), .len = 0, .fiber = null, .flag = 0 };
     var slots: [4]TestSlot = undefined;
@@ -213,13 +213,13 @@ test "init allocates, spawn and run do not" {
         _ = try sched.spawn(test_yielder, slot);
     }
     sched.run(std.testing.io);
-    try std.testing.expectEqual(@as(usize, 3), failing.alloc_index);
+    try std.testing.expectEqual(@as(usize, 4), failing.alloc_index);
     try std.testing.expectEqual(@as(u32, 8), log.len);
 }
 
 test "init reports allocation failure at every block and frees the earlier ones" {
     if (!supported) return error.SkipZigTest;
-    for (0..3) |fail_index| {
+    for (0..4) |fail_index| {
         var failing = std.testing.FailingAllocator.init(
             std.testing.allocator,
             .{ .fail_index = fail_index },
@@ -363,8 +363,8 @@ test "poller idle: init adds the poller table and nothing allocates afterwards" 
     var sched: Sched = undefined;
     try sched.init(gpa, test_options_poller(2, stack_size_clock));
     defer sched.deinit(gpa);
-    // Fiber table, stack arena, wheel nodes and the poller table.
-    try std.testing.expectEqual(@as(usize, 4), failing.alloc_index);
+    // Fiber table, stack arena, wheel nodes, the waiter pool and the poller table.
+    try std.testing.expectEqual(@as(usize, 5), failing.alloc_index);
 
     var probe: SleepProbe = .{
         .sched = &sched,
@@ -375,12 +375,12 @@ test "poller idle: init adds the poller table and nothing allocates afterwards" 
     _ = try sched.spawn(test_sleeper, &probe);
     sched.run(std.testing.io);
     try std.testing.expect(probe.elapsed_ns >= ns_per_ms);
-    try std.testing.expectEqual(@as(usize, 4), failing.alloc_index);
+    try std.testing.expectEqual(@as(usize, 5), failing.alloc_index);
 }
 
 test "poller idle: init reports allocation failure at every block and frees the others" {
     if (!supported or !poller_supported) return error.SkipZigTest;
-    for (0..4) |fail_index| {
+    for (0..5) |fail_index| {
         var failing = std.testing.FailingAllocator.init(
             std.testing.allocator,
             .{ .fail_index = fail_index },
@@ -426,4 +426,21 @@ test "in_fiber and has_free_fiber track the carrier and the fiber budget" {
     try std.testing.expectEqualSlices(u32, &.{ 1, 0 }, log.ids[0..log.len]);
     try std.testing.expect(!sched.in_fiber());
     try std.testing.expect(sched.has_free_fiber());
+}
+
+test "every fiber owns one waiter node, allocated in init" {
+    if (!supported) return error.SkipZigTest;
+    var sched: Sched = undefined;
+    try sched.init(std.testing.allocator, test_options(5, 32 * 1024));
+    defer sched.deinit(std.testing.allocator);
+
+    try std.testing.expectEqual(sched.fibers.len, sched.waiters.len);
+    try std.testing.expectEqual(@as(usize, 5), sched.waiters.len);
+    for (sched.fibers, 0..) |*fiber, index| {
+        const node = sched.waiter_of(fiber);
+        try std.testing.expect(node.fiber == fiber);
+        try std.testing.expect(node == &sched.waiters[index]);
+        try std.testing.expect(node.prev == null);
+        try std.testing.expect(node.next == null);
+    }
 }

@@ -2,7 +2,8 @@
 //!
 //! Purpose: `src/net.zig` enters every socket it creates here (`Options.sockets_max` slots, keyed
 //! by fd, allocated with the scheduler). A slot holds one waiter list per interest, linked through
-//! `Fiber.wait.prev/next`, and the poller registration is armed exactly while a list is non-empty.
+//! the fibers' `Sched.Waiter` nodes, and the poller registration is armed exactly while a list is
+//! non-empty.
 //!
 //! Threads: one spin lock guards the slots, the free list, the key table and every waiter list.
 //! Any thread may `lookup`, `register`, `unregister` and close; the carrier joins lists
@@ -35,6 +36,7 @@ const sys = @import("backend/sys.zig");
 
 const Io = std.Io;
 const Fiber = Sched.Fiber;
+const Waiter = Sched.Waiter;
 const assert = stdx.assert;
 const assert_always = stdx.assert_always;
 const fd_t = sys.fd_t;
@@ -45,8 +47,8 @@ const index_none: u32 = std.math.maxInt(u32);
 const Slot = struct {
     fd: fd_t,
     next_free: u32,
-    /// Head of the doubly linked waiters per interest (`Fiber.wait.prev/next`).
-    waiters: [2]?*Fiber,
+    /// Head of the doubly linked waiters per interest.
+    waiters: [2]?*Waiter,
     /// Set by a close from another thread; the slot lives until `closing_pending` waiters finish.
     closing: bool,
     closing_pending: u32,
@@ -244,16 +246,20 @@ pub const Registry = struct {
 
     /// Joins the waiter list of `(fd, interest)` and arms the poller when the list was empty,
     /// in one lock hold. `.gone` when `fd` is unknown or closing, `.resources` when the poller
-    /// refused (the fiber is not left on the list). Carrier-only.
+    /// refused (the node is not left on the list). Records the slot and its generation in `node`,
+    /// which is the running fiber's own (`Sched.waiter_of`). Carrier-only.
     pub fn waiter_enter(
         registry: *Registry,
         sched: *Sched,
         fd: fd_t,
         interest: poller.Interest,
-        fiber: *Fiber,
+        node: *Waiter,
     ) Enter {
+        const fiber = node.fiber;
         assert(fiber.wait.outcome == .idle);
         assert(fiber.state == .running);
+        assert(node.prev == null);
+        assert(node.next == null);
         registry.lock();
         defer registry.mutex.unlock();
 
@@ -263,27 +269,19 @@ pub const Registry = struct {
         assert_always(slot.fd == fd);
         if (slot.closing) return .gone;
         const list_empty = slot.waiters[interest_index(interest)] == null;
-        waiter_push(slot, index, interest, fiber);
+        waiter_push(slot, index, interest, node);
         if (list_empty) sched_io.arm(sched, fd, interest, index) catch {
-            waiter_remove(slot, fiber);
+            waiter_remove(slot, node);
             fiber.wait = .none;
             return .resources;
         };
         return .parked;
     }
 
-    /// The generation of slot `index`, to be compared later by `still_open`. Any thread.
-    pub fn generation_of(registry: *Registry, index: u32) u32 {
-        registry.lock();
-        defer registry.mutex.unlock();
-
-        assert(index < registry.slots.len);
-        return registry.slots[index].generation;
-    }
-
     /// True while slot `index` still holds `fd` as the same, not closing, socket it held when
-    /// `generation` was read. A fiber woken by an event checks it before retrying its syscall:
-    /// a close in the window between wake and run left the fd closed or reused. Any thread.
+    /// `generation` was recorded in the waiter's node by `waiter_enter`. A fiber woken by an event
+    /// checks it before retrying its syscall: a close in the window between wake and run left the
+    /// fd closed or reused. Any thread.
     pub fn still_open(registry: *Registry, index: u32, generation: u32, fd: fd_t) bool {
         registry.lock();
         defer registry.mutex.unlock();
@@ -305,9 +303,11 @@ pub const Registry = struct {
 
         if (fiber.wait.outcome != .waiting) return;
         assert(fiber.state == .parked);
-        const slot = &registry.slots[@intCast(fiber.wait.addr)];
-        const interest = interest_of(fiber);
-        waiter_remove(slot, fiber);
+        const node = sched.waiter_of(fiber);
+        const slot = &registry.slots[node.slot];
+        const interest = node.interest;
+        assert(fiber.wait.addr == node.slot);
+        waiter_remove(slot, node);
         if (slot.waiters[interest_index(interest)] == null) {
             sched_io.disarm(sched, slot.fd, interest);
         }
@@ -333,12 +333,12 @@ pub const Registry = struct {
             sched_io.disarm(sched, fd, if (side == 0) .read else .write);
             var waiter = head;
             for (0..sched.fibers.len + 1) |_| {
-                const fiber = waiter orelse break;
-                waiter = fiber.wait.next;
-                fiber.wait.prev = null;
-                fiber.wait.next = null;
-                fiber.wait.outcome = .closed;
-                sched.unpark(fiber);
+                const node = waiter orelse break;
+                waiter = node.next;
+                node.prev = null;
+                node.next = null;
+                node.fiber.wait.outcome = .closed;
+                sched.unpark(node.fiber);
             }
             assert_always(waiter == null); // More waiters than fibers: the list is corrupt.
         }
@@ -362,8 +362,8 @@ pub const Registry = struct {
         for (slot.waiters) |head| {
             var waiter = head;
             for (0..sched.fibers.len + 1) |_| {
-                const fiber = waiter orelse break;
-                waiter = fiber.wait.next;
+                const node = waiter orelse break;
+                waiter = node.next;
                 pending += 1;
             }
             assert_always(waiter == null); // More waiters than fibers: the list is corrupt.
@@ -379,12 +379,12 @@ pub const Registry = struct {
         for (heads) |head| {
             var waiter = head;
             for (0..sched.fibers.len + 1) |_| {
-                const fiber = waiter orelse break;
-                waiter = fiber.wait.next; // Read before the hand-off: the carrier may reuse it.
-                fiber.wait.prev = null;
-                fiber.wait.next = null;
-                fiber.wait.outcome = .closing;
-                sched.unpark_foreign(io, fiber);
+                const node = waiter orelse break;
+                waiter = node.next; // Read before the hand-off: the carrier may reuse it.
+                node.prev = null;
+                node.next = null;
+                node.fiber.wait.outcome = .closing;
+                sched.unpark_foreign(io, node.fiber);
             }
             assert_always(waiter == null); // Counted above: the list is intact.
         }
@@ -443,17 +443,12 @@ fn interest_index(interest: poller.Interest) usize {
     return @intFromEnum(interest);
 }
 
-fn interest_of(fiber: *const Fiber) poller.Interest {
-    assert(fiber.wait.socket != .none);
-    return if (fiber.wait.socket == .read) .read else .write;
-}
-
-fn waiter_push(slot: *Slot, index: u32, interest: poller.Interest, fiber: *Fiber) void {
+fn waiter_push(slot: *Slot, index: u32, interest: poller.Interest, node: *Waiter) void {
     const head = &slot.waiters[interest_index(interest)];
-    fiber.wait = .{
+    node.fiber.wait = .{
         .addr = index,
         .prev = null,
-        .next = head.*,
+        .next = null,
         .sleeping = false,
         .outcome = .waiting,
         .socket = switch (interest) {
@@ -461,16 +456,24 @@ fn waiter_push(slot: *Slot, index: u32, interest: poller.Interest, fiber: *Fiber
             .write => .write,
         },
     };
-    if (head.*) |first| first.wait.prev = fiber;
-    head.* = fiber;
+    node.* = .{
+        .prev = null,
+        .next = head.*,
+        .fiber = node.fiber,
+        .interest = interest,
+        .slot = index,
+        .generation = slot.generation,
+    };
+    if (head.*) |first| first.prev = node;
+    head.* = node;
 }
 
-fn waiter_remove(slot: *Slot, fiber: *Fiber) void {
-    const head = &slot.waiters[interest_index(interest_of(fiber))];
-    if (fiber.wait.prev) |prev| prev.wait.next = fiber.wait.next else head.* = fiber.wait.next;
-    if (fiber.wait.next) |next| next.wait.prev = fiber.wait.prev;
-    fiber.wait.prev = null;
-    fiber.wait.next = null;
+fn waiter_remove(slot: *Slot, node: *Waiter) void {
+    const head = &slot.waiters[interest_index(node.interest)];
+    if (node.prev) |prev| prev.next = node.next else head.* = node.next;
+    if (node.next) |next| next.prev = node.prev;
+    node.prev = null;
+    node.next = null;
 }
 
 /// The handler `Sched` calls for each event: wake every fiber waiting on the slot and interest.
@@ -490,12 +493,12 @@ pub fn on_event(ctx: *anyopaque, sched: *Sched, event: poller.Event) void {
     var waiter = head.*;
     head.* = null;
     for (0..sched.fibers.len + 1) |_| {
-        const fiber = waiter orelse break;
-        waiter = fiber.wait.next;
-        fiber.wait.prev = null;
-        fiber.wait.next = null;
-        fiber.wait.outcome = .woken;
-        sched.unpark(fiber);
+        const node = waiter orelse break;
+        waiter = node.next;
+        node.prev = null;
+        node.next = null;
+        node.fiber.wait.outcome = .woken;
+        sched.unpark(node.fiber);
     }
     assert_always(waiter == null); // More waiters than fibers: the list is corrupt.
 }
@@ -541,14 +544,14 @@ test "registry: a freed slot changes generation, so a woken waiter sees the clos
     defer registry.deinit(std.testing.allocator);
 
     const index = try registry.register(9);
-    const generation = registry.generation_of(index);
+    const generation = registry.slots[index].generation;
     try std.testing.expect(registry.still_open(index, generation, 9));
     try std.testing.expect(registry.unregister(9));
     // The same fd number registered again lands in the same slot, yet is not the same socket.
     try std.testing.expectEqual(index, try registry.register(9));
     try std.testing.expect(!registry.still_open(index, generation, 9));
     registry.slots[index].closing = true;
-    try std.testing.expect(!registry.still_open(index, registry.generation_of(index), 9));
+    try std.testing.expect(!registry.still_open(index, registry.slots[index].generation, 9));
     registry.slots[index].closing = false;
     try std.testing.expect(registry.unregister(9));
 }
@@ -570,7 +573,7 @@ test "registry: leases share one slot, the last release frees it, a socket is ne
 
     const socket_index = try registry.register(21);
     try std.testing.expectEqual(Registry.Lease.socket, try registry.lease(21));
-    const generation = registry.generation_of(socket_index);
+    const generation = registry.slots[socket_index].generation;
     registry.lease_release(21, generation); // Not a lease: the socket's slot survives.
     try std.testing.expect(registry.lookup(21) != null);
     try std.testing.expect(registry.unregister(21));

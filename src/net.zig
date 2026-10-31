@@ -70,13 +70,14 @@ fn park(
     // A cancel that arrived while this fiber was woken (not parked) found nothing to unpark, so
     // every re-park after a spurious wake looks at the request again, as `futex` does.
     if (concurrency.task_acknowledge_cancel(task)) return error.Canceled;
-    switch (rt.sockets.waiter_enter(&rt.sched, fd, interest, fiber)) {
+    const node = rt.sched.waiter_of(fiber);
+    switch (rt.sockets.waiter_enter(&rt.sched, fd, interest, node)) {
         .parked => {},
         .gone => return error.Closed,
         .resources => return error.SystemResources,
     }
-    const index: u32 = @intCast(fiber.wait.addr);
-    const generation = rt.sockets.generation_of(index);
+    const index = node.slot;
+    const generation = node.generation;
     concurrency.task_cancel_wake(task, fiber);
     rt.sched.park();
     concurrency.task_cancel_wake(task, null);
