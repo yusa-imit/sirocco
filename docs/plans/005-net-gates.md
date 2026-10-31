@@ -38,7 +38,7 @@ and then multi-carrier as plan 005. No consumer pins sirocco yet and zoltraak is
       800-line tidy cap, by moving tests or a cohesive helper module the way plan 004 item 1 did.
       Why here: items 4-6 grow both files. Verify: `zig build tidy`; `wc -l src/*.zig` all
       < 650; the `zig build test --summary all` test count is unchanged.
-- [ ] 4. 8b part 1: the registry's waiter lists hold `Waiter` nodes from the ADR 0004 pool
+- [x] 4. 8b part 1: the registry's waiter lists hold `Waiter` nodes from the ADR 0004 pool
       instead of `*Fiber`. Behaviour does not change. Verify: the full suite is green under
       `.kqueue` and `.threaded`; `tests/parity/net_close.zig` and the cancel-after-wake test
       from #49 pass; allocations are flat after init (gate 5); the ubuntu CI job (epoll) is

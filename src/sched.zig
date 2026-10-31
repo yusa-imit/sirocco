@@ -16,9 +16,9 @@
 //! neighbouring stack, and there are no guard pages yet. The `Sched` must not move after `init`
 //! (fibers hold a pointer to it), so `init` fills the caller's storage in place.
 //!
-//! Allocation: `init` allocates three blocks (fiber table, stack arena, wheel nodes) from `gpa`,
-//! plus the poller's table under `.poller`; `Sched` stores no allocator, so nothing allocates
-//! afterwards, and `deinit` takes the same `gpa` back.
+//! Allocation: `init` allocates four blocks (fiber table, stack arena, wheel nodes, waiter pool)
+//! from `gpa`, plus the poller's table under `.poller`; `Sched` stores no allocator, so nothing
+//! allocates afterwards, and `deinit` takes the same `gpa` back.
 //!
 //! Idling (`Options.idle`): with nothing ready the carrier sleeps until the wheel's next deadline
 //! or a foreign wake. Under `.futex` it blocks in the baseline futex on `inbox_version`. Under
@@ -62,6 +62,8 @@ const Sched = @This();
 
 fibers: []Fiber,
 stacks: []align(stack_align) u8,
+/// One socket-wait node per fiber (ADR 0004 section 6); node `i` belongs to fiber `i`.
+waiters: []Waiter,
 stack_size: u32,
 free_head: ?*Fiber,
 ready_head: ?*Fiber,
@@ -200,6 +202,9 @@ pub const Fiber = struct {
     const State = enum { free, ready, running, parked };
 };
 
+/// A fiber's node in a socket slot's waiter list; see `src/waiter.zig`.
+pub const Waiter = @import("waiter.zig").Waiter;
+
 pub const stack_align = 16;
 
 /// Fills `target` in place. Precondition: `options.fibers_max > 0`, `options.stack_size` is a
@@ -230,6 +235,9 @@ fn init_checked(
     const stacks = try gpa.alignedAlloc(u8, .@"16", arena_size);
     errdefer gpa.free(stacks);
 
+    const waiters = try gpa.alloc(Waiter, options.fibers_max);
+    errdefer gpa.free(waiters);
+
     var wheel: Wheel = undefined; // Filled by `Wheel.init` on the next line, before any read.
     try wheel.init(gpa, .{ .nodes_max = options.fibers_max, .now_ns = options.now_ns });
     errdefer wheel.deinit(gpa);
@@ -240,6 +248,7 @@ fn init_checked(
     target.* = .{
         .fibers = fibers,
         .stacks = stacks,
+        .waiters = waiters,
         .stack_size = options.stack_size,
         .free_head = null,
         .ready_head = null,
@@ -271,6 +280,14 @@ fn init_checked(
             .wait = .none,
         };
         target.free_head = &fibers[index];
+        waiters[index] = .{
+            .prev = null,
+            .next = null,
+            .fiber = &fibers[index],
+            .interest = .read,
+            .slot = 0,
+            .generation = 0,
+        };
     }
     assert(target.free_head == &fibers[0]);
 }
@@ -299,18 +316,28 @@ fn idle_deinit(idle: *Idle, gpa: std.mem.Allocator) void {
     }
 }
 
-/// Frees the fiber table, stack arena, wheel and poller. Precondition: `gpa` is the allocator
-/// given to `init`, no fiber is alive (every spawned fiber ran to completion), and nothing is
-/// armed in the poller.
+/// Frees the fiber table, stack arena, waiter pool, wheel and poller. Precondition: `gpa` is the
+/// allocator given to `init`, no fiber is alive (every spawned fiber ran to completion), and
+/// nothing is armed in the poller.
 pub fn deinit(sched: *Sched, gpa: std.mem.Allocator) void {
     assert(sched.live_count == 0);
     assert(sched.current == null);
     assert(!sched.running);
     idle_deinit(&sched.idle, gpa);
     sched.wheel.deinit(gpa);
+    gpa.free(sched.waiters);
     gpa.free(sched.stacks);
     gpa.free(sched.fibers);
     sched.* = undefined;
+}
+
+/// The waiter node of `fiber`: node `i` for fiber `i`, so a socket wait never needs to allocate.
+pub fn waiter_of(sched: *Sched, fiber: *Fiber) *Waiter {
+    const first = @intFromPtr(sched.fibers.ptr);
+    assert(@intFromPtr(fiber) >= first);
+    const index = @divExact(@intFromPtr(fiber) - first, @sizeOf(Fiber));
+    assert(index < sched.fibers.len);
+    return &sched.waiters[index];
 }
 
 /// Makes `entry(arg)` runnable on a free fiber; it first runs inside `run`. Precondition: called

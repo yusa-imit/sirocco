@@ -471,10 +471,10 @@ test "no allocation beyond the runtime's, and nothing leaks, after await or canc
     defer rt.deinit();
 
     const io = rt.io();
-    // `io()` initialises the scheduler (fiber table, stack arena, the wheel's nodes, and the
-    // poller's table, and the socket registry's slots and table, on an evented backend) and the
-    // offload pool's thread handles.
-    const init_blocks: usize = if (fixtures.backend == .threaded) 4 else 7;
+    // `io()` initialises the scheduler (fiber table, stack arena, the wheel's nodes, the waiter
+    // pool, and the poller's table, and the socket registry's slots and table, on an evented
+    // backend) and the offload pool's thread handles.
+    const init_blocks: usize = if (fixtures.backend == .threaded) 5 else 8;
     try std.testing.expectEqual(init_blocks, failing.alloc_index);
     const live_after_init = failing.allocated_bytes - failing.freed_bytes;
     var trace = Trace.init();
@@ -489,8 +489,8 @@ test "no allocation beyond the runtime's, and nothing leaks, after await or canc
 
 test "a failed task allocation runs the task inline" {
     if (!fibers_supported) return error.SkipZigTest;
-    // Scheduler init takes allocations 0 to 2, the offload pool 3; the first task record is 4.
-    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 4 });
+    // Scheduler init takes allocations 0 to 3, the offload pool 4; the first task record is 5.
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 5 });
     var rt = try fixtures.init_runtime_in(failing.allocator(), .forward, 4);
     defer rt.deinit();
 
@@ -504,7 +504,7 @@ test "a failed task allocation runs the task inline" {
 
 test "a failed offload pool allocation degrades to inline async like a failed scheduler" {
     if (!fibers_supported) return error.SkipZigTest;
-    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 3 });
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 4 });
     var rt = try fixtures.init_runtime_in(failing.allocator(), .forward, 4);
     defer rt.deinit();
 
