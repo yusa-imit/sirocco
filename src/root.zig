@@ -37,4 +37,6 @@ test {
     _ = @import("net_registry_batch_test.zig");
     _ = @import("net_data.zig");
     _ = @import("submit.zig");
+    _ = @import("batch_sweep.zig");
+    _ = @import("batch_park_test.zig");
 }

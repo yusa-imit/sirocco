@@ -307,12 +307,17 @@ pub fn shutdown(fd: fd_t, how: ShutdownHow) DataError!void {
     if (posix.errno(rc) != .SUCCESS) return data_fail(posix.errno(rc));
 }
 
+/// Calls to `recvmsg` made by test builds (never touched otherwise): a test reads it before and
+/// after a wait to prove the wait made no receive syscall in between (plan 005 item 5).
+pub var recvmsg_calls: std.atomic.Value(u32) = .init(0);
+
 /// One `recvmsg` with `MSG_NOSIGNAL` added to `flags`: the bytes received (0 is an empty
 /// datagram or end of stream). The caller fills `msg` (name, iovec, control) and reads the kernel's
 /// updates (`namelen`, `controllen`, `flags`) afterwards. Precondition: `msg.iovlen == 1`.
 pub fn recvmsg(fd: fd_t, msg: *posix.msghdr, flags: u32) DataError!usize {
     assert(fd >= 0);
     assert(msg.iovlen == 1);
+    if (builtin.is_test) _ = recvmsg_calls.fetchAdd(1, .monotonic);
     const stamp = profile.begin();
     const rc = retried(system.recvmsg, .{ fd, msg, flags | posix.MSG.NOSIGNAL });
     profile.end(.socket_read, stamp);

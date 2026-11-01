@@ -148,6 +148,16 @@ unparks the sleeper, and nothing is allocated or registered, so `ConcurrencyUnav
 come from here. What it costs: up to 2 ms of wake-up latency on an idle batch and one syscall per
 operation per slice. The follow-up that removes both is a per-operation waiter node.
 
+**Amended by ADR 0004 section 6 / plan 005 item 5.** The paragraph above, from "Decision: the
+fiber does not park" to "per-operation waiter node", is superseded for a batch of `net_receive`s
+only. Such a batch (at most `batch_park.ops_max` = 128 operations, and no more than the fiber's
+own node plus the free spares) parks on the poller and the wheel through one `Sched.Waiter` per
+operation (`src/batch_park.zig`): the 50 us to 2 ms slices and their `recvmsg` per slice are gone,
+and an idle batch makes no syscall between arming and its first event. A batch that holds a file
+operation keeps the slice-sleep wait (`wait_sliced` in `src/batch.zig`), because a nonblocking
+file is not a registry socket and the poller has nothing to hold for it. A batch that needs more
+nodes than the pool has goes whole to `Io.Threaded`, decided before any syscall as above.
+
 `Io.Threaded` 0.16.0 oracle bug: `batchAwaitConcurrent` completes a `net_receive` that is ready on
 entry without taking it off `submitted`, so a later await or `Batch.cancel` reads a `submitted`
 entry that is no longer one. The parity tests compare with `awaitAsync`, or with

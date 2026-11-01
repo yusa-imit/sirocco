@@ -103,7 +103,8 @@ fn park(
     }
 }
 
-fn close_baseline(rt: *Runtime, fd: fd_t) void {
+/// Closes `fd` through the baseline: the last waiter of a socket another thread closed does it.
+pub fn close_baseline(rt: *Runtime, fd: fd_t) void {
     assert(fd >= 0);
     const baseline = rt.baselineIo();
     baseline.vtable.netClose(baseline.userdata, &.{fd});
