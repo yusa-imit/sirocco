@@ -52,7 +52,7 @@ pub fn enter(
     assert(node.next == null);
     assert(node.outcome == .idle);
     registry.lock();
-    defer registry.mutex.unlock();
+    defer registry.unlock();
 
     const found = registry.table.get(poller.key(fd, .read)) orelse return .gone;
     const index: u32 = @intCast(found);
@@ -79,7 +79,7 @@ pub fn leave(registry: *Registry, sched: *Sched, node: *Waiter) Waiter.Outcome {
     assert(node.fiber.wait.socket == .batch);
     assert(node.fiber.state == .running);
     registry.lock();
-    defer registry.mutex.unlock();
+    defer registry.unlock();
 
     switch (node.outcome) {
         // Nothing of the slot is left to touch, and it may be gone or reused already.

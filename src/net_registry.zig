@@ -444,6 +444,11 @@ pub const Registry = struct {
         }
         assert_always(false); // The lock is held for a hash lookup; this is a deadlock.
     }
+
+    /// Releases the lock `lock` took; the caller holds it.
+    pub fn unlock(registry: *Registry) void {
+        registry.mutex.unlock();
+    }
 };
 
 pub fn interest_index(interest: poller.Interest) usize {

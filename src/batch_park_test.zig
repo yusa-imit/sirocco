@@ -15,6 +15,9 @@ const std = @import("std");
 const Runtime = @import("runtime.zig");
 const stdx = @import("stdx.zig");
 const sys = @import("backend/sys.zig");
+const Sched = @import("sched.zig");
+const concurrency = @import("concurrency.zig");
+const batch_park = @import("batch_park.zig");
 
 const Io = std.Io;
 const assert = stdx.assert;
@@ -103,7 +106,8 @@ const Rig = struct {
     buffers: [receivers_max][16]u8,
 
     fn open(rig: *Rig, io: Io, count: u32) !void {
-        assert(count >= 1 and count <= receivers_max);
+        assert(count >= 1);
+        assert(count <= receivers_max);
         const any_port: Address = .{ .ip4 = .loopback(0) };
         rig.count = 0;
         rig.closed_mask = 0;
@@ -404,4 +408,90 @@ test "a batch that needs more nodes than the pool holds goes whole to the baseli
     try std.testing.expectEqual(probe.calls_start, probe.calls_end);
     try std.testing.expectEqual(@as(u32, 4), probe.free_end);
     try std.testing.expectEqual(@as(u32, 0), probe.linked_end);
+}
+
+// ---------------------------------------------------------------- pool short during the wait
+
+const spares_max: u32 = 4;
+
+/// Spare nodes the test holds so that the pool is short when the wait starts.
+const Hoard = struct {
+    nodes: [spares_max]*Sched.Waiter,
+    count: u32,
+
+    fn take_all(hoard: *Hoard, sched: *Sched) void {
+        hoard.count = 0;
+        for (0..spares_max) |_| {
+            const node = sched.waiter_acquire() orelse break;
+            hoard.nodes[hoard.count] = node;
+            hoard.count += 1;
+        }
+        assert(hoard.count == spares_max);
+        assert(sched.waiters_free() == 0);
+    }
+
+    fn give_back(hoard: *Hoard, sched: *Sched) void {
+        assert(hoard.count == spares_max);
+        for (hoard.nodes[0..hoard.count]) |node| sched.waiter_release(node);
+        hoard.count = 0;
+    }
+};
+
+/// While the waiter naps on a short pool: reads the counter, gives the nodes back, lets the wait
+/// park on them, reads the pool, then sends the datagram that completes the wait.
+fn restock_then_send(io: Io, rig: *Rig, probe: *Probe, hoard: *Hoard, target: u32) void {
+    io.sleep(.fromMilliseconds(idle_ms), .awake) catch return;
+    probe.calls_event = Probe.calls();
+    hoard.give_back(&probe.rt.sched);
+    io.sleep(.fromMilliseconds(idle_ms), .awake) catch return;
+    probe.look(true);
+    rig.send_to(io, target);
+}
+
+fn scenario_pool_short(io: Io, probe: *Probe) !void {
+    const target: u32 = 1;
+    const count: u32 = 3; // The fiber's own node and two spares.
+    var rig: Rig = undefined;
+    try rig.open(io, count);
+    defer rig.close(io);
+
+    var batch = Io.Batch.init(rig.storage[0..rig.count]);
+    defer batch.cancel(io);
+
+    rig.arm_all(&batch);
+    var hoard: Hoard = undefined;
+    hoard.take_all(&probe.rt.sched);
+    var restocking = io.async(restock_then_send, .{ io, &rig, probe, &hoard, target });
+    defer restocking.cancel(io);
+
+    // `served_task` would send this batch to the baseline, so the parked wait is called directly:
+    // the pool is short at the start of its first round, as when another batch fiber took the
+    // spares since the await began.
+    const task = concurrency.current_task(probe.rt).?;
+    probe.calls_start = Probe.calls();
+    try batch_park.wait(probe.rt, task, &batch, .none);
+    probe.calls_end = Probe.calls();
+    probe.look(false);
+    take_first(&rig, &batch, probe);
+    assert(batch.next() == null);
+}
+
+test "a wait that finds the node pool short naps and sweeps, then parks once nodes return" {
+    var rt = try init_rt(spares_max);
+    defer rt.deinit();
+
+    try runtime_ready(&rt);
+    var probe: Probe = .init(&rt);
+    try call_in_fiber(rt.io(), scenario_pool_short, .{&probe});
+    // The entry sweep reads 3 sockets; the naps of the 20 ms that follow read them again.
+    try std.testing.expect(probe.calls_event - probe.calls_start > 3);
+    // After the restock the wait parked: own node and two spares out, three nodes linked.
+    try std.testing.expectEqual(spares_max - 2, probe.free_parked);
+    try std.testing.expectEqual(@as(u32, 3), probe.linked_parked);
+    try std.testing.expectEqual(@as(u32, 1), probe.index);
+    try std.testing.expect(!probe.failed);
+    try std.testing.expectEqual(spares_max, probe.free_end);
+    try std.testing.expectEqual(@as(u32, 0), probe.linked_end);
+    try std.testing.expect(!rt.sched.armed_any());
+    try std.testing.expectEqual(@as(u32, 0), rt.sockets.count());
 }

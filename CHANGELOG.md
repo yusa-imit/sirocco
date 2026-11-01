@@ -7,6 +7,18 @@ exemption recorded in `citadel/protocol/VERSIONING.md`.
 
 ## [Unreleased]
 
+### Changed
+
+- A batch of only `net_receive`s on registered sockets, awaited on a fiber, now parks on the
+  poller and the wheel (one `Waiter` node per operation) instead of sleeping 50 us to 2 ms
+  slices with a `recvmsg` sweep per slice; an idle batch makes no syscall until its first
+  event (plan `005` item 5). A batch with a file operation keeps the slice wait, and a batch
+  that needs more nodes than the pool holds goes whole to `Io.Threaded`.
+- **Breaking (0.x):** `Runtime.Options` and `Sched.Options` gain the required `batch_ops_max`:
+  spare socket-wait nodes per scheduler for fibers that wait on several sockets at once. Size
+  it to the sum of the largest concurrent batches; 0 serves no parked batch (every batch goes to
+  the baseline). Parked batches are limited to 128 operations.
+
 ## [0.5.0] - 2026-10-27
 
 ### Added

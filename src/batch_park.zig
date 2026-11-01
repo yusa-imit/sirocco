@@ -48,6 +48,9 @@ pub const ops_max: u32 = 128;
 /// Rounds (parks) per await; every round ends in a wake, so 2^32 of them is a hang, not a wait.
 const rounds_max: u64 = 1 << 32;
 
+/// Nap in nanoseconds of a round that finds the node pool short.
+const pool_short_nap_ns: i96 = 100_000;
+
 /// The nodes one round holds. `nodes[0..taken]` were taken (the first is the fiber's own, the rest
 /// spares); `nodes[0..bound]` are joined to a socket's list, one per pending operation in order.
 const Held = struct {
@@ -79,6 +82,15 @@ pub fn wait(
         // A cancel that arrived while the fiber was woken, not parked, found nothing to unpark.
         if (concurrency.task_acknowledge_cancel(task)) return error.Canceled;
         if (expired(rt, limit)) return error.Timeout;
+        if (pending_count(b) > rt.sched.waiters_free() + 1) {
+            // Another batch fiber holds the spares it took since this await began. Wait a slice
+            // and sweep, as `batch.wait_sliced` does, until they are given back.
+            const nap: Io.Duration = .fromNanoseconds(pool_short_nap_ns);
+            rt.io().sleep(nap, .awake) catch return error.Canceled;
+            batch_sweep.sweep(rt, b);
+            if (b.completed.head != .none or b.submitted.head == .none) return;
+            continue;
+        }
 
         const outcome = park_round(rt, task, b, limit);
         switch (outcome) {
@@ -94,6 +106,19 @@ pub fn wait(
         if (outcome == .timed_out) return error.Timeout;
     }
     assert_always(false); // 2^32 wakes that completed nothing is a hang.
+}
+
+/// Submitted operations of `b`; each needs a node to park.
+fn pending_count(b: *const Io.Batch) u32 {
+    var count: u32 = 0;
+    var index = b.submitted.head;
+    for (0..b.storage.len) |_| {
+        if (index == .none) break;
+        count += 1;
+        index = b.storage[index.toIndex()].submission.node.next;
+    }
+    assert_always(index == .none); // A longer list than the storage is corrupt.
+    return count;
 }
 
 fn expired(rt: *Runtime, limit: sleep.Limit) bool {
@@ -128,7 +153,7 @@ fn park_round(
         .socket = .batch,
     };
     var held: Held = .{ .nodes = undefined, .taken = 0, .bound = 0 };
-    if (!enter_all(rt, fiber, b, &held)) {
+    if (enter_all(rt, fiber, b, &held)) {
         if (limit == .at) {
             fiber.wait.sleeping = true;
             sleep.arm(&rt.sched, fiber, limit);
@@ -155,9 +180,10 @@ fn park_round(
 
 /// Joins the read list of every pending operation's socket, in order. Stops at the first socket
 /// that cannot be joined (closed, or the poller refused), completes that operation with the
-/// error `submit.receive` would report and claims the fiber itself: true means the caller must
+/// error `submit.receive` would report and claims the fiber itself: false means the caller must
 /// not park. When another thread's close already claimed the fiber the claim here is lost and the
-/// caller parks, to be woken at once (its `unpark_foreign` is on the way).
+/// caller parks (true), to be woken at once: that close's `unpark_foreign` is on the way and
+/// needs the fiber to park, or it would hand a running fiber to the ready queue.
 fn enter_all(rt: *Runtime, fiber: *Sched.Fiber, b: *Io.Batch, held: *Held) bool {
     assert(held.taken == 0);
     assert(held.bound == 0);
@@ -183,13 +209,13 @@ fn enter_all(rt: *Runtime, fiber: *Sched.Fiber, b: *Io.Batch, held: *Held) bool 
         };
         batch_sweep.unlink_submitted(b, prev, index, next);
         batch_sweep.complete(b, index, .{ .net_receive = failure });
-        _ = Sched.claim(fiber, .woken);
+        if (!Sched.claim(fiber, .woken)) return true; // A foreign close won; park for its wake.
         assert(fiber.wait.outcome != .waiting);
-        return true;
+        return false;
     }
     assert_always(index == .none); // A longer list than the storage is corrupt.
     assert(held.bound > 0); // `wait` returned on an empty list.
-    return false;
+    return true;
 }
 
 /// The node for the next operation: the one `enter_all` left idle after a failure, or a new one.
@@ -198,7 +224,7 @@ fn node_for(rt: *Runtime, fiber: *Sched.Fiber, held: *Held) *Waiter {
     assert(held.taken <= held.bound + 1);
     if (held.taken == held.bound) {
         const node = if (held.taken == 0) rt.sched.waiter_of(fiber) else spare: {
-            // `served_task` counted the pool; a null here is a counting bug.
+            // `wait` checked the pool before this round and nothing ran since; null is a bug.
             const lent = rt.sched.waiter_acquire().?;
             lent.fiber = fiber;
             break :spare lent;
