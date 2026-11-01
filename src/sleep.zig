@@ -106,11 +106,16 @@ pub fn fire(sched: *Sched, io: Io) ?i96 {
             expiry.futex_timeout(expiry.ctx, sched, fiber);
             continue;
         }
-        // Only the wheel and `cancel` end a sleep, and `cancel` unlinks the node.
+        // The wheel and `cancel` end a plain sleep, and `cancel` unlinks the node, so the claim
+        // is the wheel's. A batch fiber is also claimed by socket events and by a close from
+        // another thread, which cannot touch the wheel: when one got there first, the resumed
+        // fiber disarms and clears `sleeping` itself.
+        if (!Sched.claim(fiber, .timed_out)) {
+            assert(fiber.wait.socket == .batch);
+            continue;
+        }
         assert(fiber.state == .parked);
-        assert(fiber.wait.outcome == .waiting);
         fiber.wait.sleeping = false;
-        fiber.wait.outcome = .timed_out;
         sched.unpark(fiber);
     } else assert_always(false); // More due nodes than fibers: the wheel is corrupt.
     const next_ns = sched.wheel.next_deadline() orelse return null;

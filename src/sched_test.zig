@@ -52,6 +52,7 @@ fn test_stopper(arg: ?*anyopaque) void {
 fn test_options(fibers_max: u32, stack_size: u32) Options {
     return .{
         .fibers_max = fibers_max,
+        .batch_ops_max = 0,
         .stack_size = stack_size,
         .now_ns = now_ns(std.testing.io),
         .idle = .futex,
@@ -62,6 +63,7 @@ fn test_options(fibers_max: u32, stack_size: u32) Options {
 fn test_options_poller(fibers_max: u32, stack_size: u32) Options {
     return .{
         .fibers_max = fibers_max,
+        .batch_ops_max = 0,
         .stack_size = stack_size,
         .now_ns = now_ns(std.testing.io),
         .idle = .{ .poller = .{ .registrations_max = 8 } },

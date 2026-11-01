@@ -79,6 +79,7 @@ pub fn main(init: std.process.Init) !void {
         .environ = init.minimal.environ,
         .argv0 = .empty,
         .fibers_max = in_flight_max,
+        .batch_ops_max = 0,
         .fiber_stack_size = 64 * 1024,
         .offload_threads = 1,
         .sockets_max = 1,

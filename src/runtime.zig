@@ -89,6 +89,7 @@ sched_state: SchedState,
 /// `@intFromPtr(&sched)` when it was built, else 0; asserts the `Runtime` has not moved.
 sched_pin: usize,
 fibers_max: u32,
+batch_ops_max: u32,
 fiber_stack_size: u32,
 offload_threads: u32,
 sockets_max: u32,
@@ -141,6 +142,10 @@ pub const Options = struct {
     /// `concurrent` refuses.
     /// Positive. One stack of `fiber_stack_size` bytes is allocated per fiber at the first `io()`.
     fibers_max: u32,
+    /// Socket-wait nodes per carrier beyond the one each fiber owns, for fibers that wait on
+    /// several sockets at once (ADR 0004 section 6); 0 is valid and serves no such wait.
+    /// Allocated with the scheduler, in the same block as the per-fiber nodes.
+    batch_ops_max: u32,
     /// Bytes per fiber stack: a multiple of 16, at least `Sched.stack_size_min`. std's `Io` call
     /// chain runs on these stacks, so Debug builds want well over the minimum.
     fiber_stack_size: u32,
@@ -239,6 +244,7 @@ pub fn init(gpa: std.mem.Allocator, options: Options) InitError!Runtime {
         .sched_state = if (fibers_supported) .pending else .unsupported,
         .sched_pin = 0,
         .fibers_max = options.fibers_max,
+        .batch_ops_max = options.batch_ops_max,
         .fiber_stack_size = options.fiber_stack_size,
         .offload_threads = options.offload_threads,
         .sockets_max = options.sockets_max,
@@ -300,6 +306,7 @@ fn test_options(backend: Backend, unimplemented: Unimplemented) Options {
         .environ = .empty,
         .argv0 = .empty,
         .fibers_max = 4,
+        .batch_ops_max = 64,
         .fiber_stack_size = 64 * 1024,
         .offload_threads = 2,
         .sockets_max = 8,

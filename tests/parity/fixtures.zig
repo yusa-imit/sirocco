@@ -63,6 +63,7 @@ pub fn init_runtime_sockets(
         .environ = .empty,
         .argv0 = .empty,
         .fibers_max = fibers_max,
+        .batch_ops_max = 64,
         .fiber_stack_size = fiber_stack_size_default,
         .offload_threads = offload_threads,
         .sockets_max = sockets_max,
