@@ -35,6 +35,7 @@ fn init_rt(batch_ops_max: u32) !Runtime {
         .unimplemented = .forward,
         .environ = .empty,
         .argv0 = .empty,
+        .carriers = 1,
         .fibers_max = 16,
         .batch_ops_max = batch_ops_max,
         .fiber_stack_size = 256 * 1024,

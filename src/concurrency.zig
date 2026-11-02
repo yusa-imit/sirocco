@@ -70,6 +70,7 @@ const stdx = @import("stdx.zig");
 const Sched = @import("sched.zig");
 const Runtime = @import("runtime.zig");
 const futex = @import("futex.zig");
+const carriers = @import("carriers.zig");
 const net = @import("net.zig");
 const concurrency_group = @import("concurrency_group.zig");
 
@@ -142,7 +143,8 @@ pub fn install(vtable: *Io.VTable) void {
     vtable.crashHandler = slot_crash_handler;
 }
 
-/// Brings `rt.sched` into existence on the first `Runtime.io()`. The `Runtime` is pinned from
+/// Brings `rt.sched` and the peer carriers (`src/carriers.zig`) into existence on the first
+/// `Runtime.io()`. The `Runtime` is pinned from
 /// that call on, which is what makes the `*Sched` inside every fiber stable; the recorded address
 /// is re-checked on every later call. Allocation failure, or a kernel that will not give the
 /// backend's poller, is not an error: it leaves the runtime `.unavailable`, where `async` runs
@@ -154,49 +156,61 @@ pub fn sched_ensure(rt: *Runtime) void {
         .ready => assert(rt.sched_pin == @intFromPtr(&rt.sched)),
         .pending => {
             assert(Sched.supported);
-            const options: Sched.Options = .{
-                .fibers_max = rt.fibers_max,
-                .batch_ops_max = rt.batch_ops_max,
-                .stack_size = rt.fiber_stack_size,
-                .now_ns = std.math.lossyCast(u64, Io.Clock.awake.now(rt.baselineIo()).nanoseconds),
-                .idle = rt.idle_options(),
-            };
-            rt.sched.init(rt.threaded.allocator, options) catch |err| switch (err) {
-                error.OutOfMemory,
-                error.FibersUnsupported,
-                error.PollerUnsupported,
-                error.ProcessFdQuotaExceeded,
-                error.SystemFdQuotaExceeded,
-                error.SystemResources,
-                => {
-                    rt.sched_state = .unavailable;
-                    return;
-                },
-            };
-            rt.offload.init(rt.threaded.allocator, rt.baselineIo(), &rt.sched, .{
-                .threads_count = rt.offload_threads,
-                .queued_max = rt.fibers_max,
-            }) catch |err| switch (err) {
-                error.OutOfMemory, error.ThreadSpawnFailed => {
-                    rt.sched.deinit(rt.threaded.allocator);
-                    rt.sched_state = .unavailable;
-                    return;
-                },
-            };
-            if (rt.backend != .threaded) {
-                rt.sockets.init(rt.threaded.allocator, rt.sockets_max) catch {
-                    rt.offload.deinit(rt.threaded.allocator);
-                    rt.sched.deinit(rt.threaded.allocator);
-                    rt.sched_state = .unavailable;
-                    return;
-                };
-                rt.sched.events = .{ .ctx = &rt.sockets, .ready = net.on_event };
-            }
-            rt.sched.expiry = futex.expiry(&rt.waits);
-            rt.sched_pin = @intFromPtr(&rt.sched);
-            rt.sched_state = .ready;
+            rt.sched_state = if (sched_build(rt)) .ready else .unavailable;
+            if (rt.sched_state == .ready) rt.sched_pin = @intFromPtr(&rt.sched);
         },
     }
+}
+
+/// Builds carrier 0, the offload pool, the socket registry and the peer carriers, in that order;
+/// on a failure it undoes what it built and returns false. Allocation failure, a kernel that
+/// will not give a poller, or a thread that will not start, are all the same outcome.
+fn sched_build(rt: *Runtime) bool {
+    assert(rt.sched_state == .pending);
+    assert(rt.sched_pin == 0);
+    const gpa = rt.threaded.allocator;
+    const options: Sched.Options = .{
+        .fibers_max = rt.fibers_max,
+        .batch_ops_max = rt.batch_ops_max,
+        .stack_size = rt.fiber_stack_size,
+        .now_ns = std.math.lossyCast(u64, Io.Clock.awake.now(rt.baselineIo()).nanoseconds),
+        .idle = rt.idle_options(),
+    };
+    rt.sched.init(gpa, options) catch |err| switch (err) {
+        error.OutOfMemory,
+        error.FibersUnsupported,
+        error.PollerUnsupported,
+        error.ProcessFdQuotaExceeded,
+        error.SystemFdQuotaExceeded,
+        error.SystemResources,
+        => return false,
+    };
+    rt.offload.init(gpa, rt.baselineIo(), &rt.sched, .{
+        .threads_count = rt.offload_threads,
+        .queued_max = rt.fibers_max,
+    }) catch |err| switch (err) {
+        error.OutOfMemory, error.ThreadSpawnFailed => {
+            rt.sched.deinit(gpa);
+            return false;
+        },
+    };
+    const sockets_built = rt.backend != .threaded;
+    if (sockets_built) {
+        rt.sockets.init(gpa, rt.sockets_max) catch {
+            rt.offload.deinit(gpa);
+            rt.sched.deinit(gpa);
+            return false;
+        };
+        rt.sched.events = .{ .ctx = &rt.sockets, .ready = net.on_event };
+    }
+    if (!carriers.start(rt, options)) {
+        if (sockets_built) rt.sockets.deinit(gpa);
+        rt.offload.deinit(gpa);
+        rt.sched.deinit(gpa);
+        return false;
+    }
+    rt.sched.expiry = futex.expiry(&rt.waits);
+    return true;
 }
 
 pub fn runtime_of(userdata: ?*anyopaque) *Runtime {

@@ -39,4 +39,5 @@ test {
     _ = @import("submit.zig");
     _ = @import("batch_sweep.zig");
     _ = @import("batch_park_test.zig");
+    _ = @import("runtime_carriers_test.zig");
 }

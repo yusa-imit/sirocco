@@ -27,16 +27,24 @@
 //! bump); no field of `Runtime` holds a pointer into `Runtime` — `io()` and `baselineIo()` are
 //! the only places that take an address, so a `Runtime` may be moved until the first `io()`
 //! call and must stay put afterwards. sirocco state is recovered from `Io.userdata` with
-//! `@fieldParentPtr("threaded", t)`. The fiber scheduler is the one self-referential part (fibers
-//! point at their `Sched`), so it is built in place by the first `io()` call, never in `init`;
-//! `sched_pin` records its address and every later `io()` asserts it did not move.
+//! `@fieldParentPtr("threaded", t)`. Carrier 0, `sched`, is the one self-referential part
+//! (fibers point at their `Sched`), so it is built in place by the first `io()` call, never in
+//! `init`; `sched_pin` records its address and every later `io()` asserts it did not move.
 //!
-//! Allocation: `init` allocates nothing itself; `gpa` is handed to `Io.Threaded`, which uses it
-//! lazily for `groupAsync`/`groupConcurrent` closures, thread stacks and process spawn. The first
-//! `io()` allocates the fiber table, stacks and wheel nodes plus the offload pool's thread handles
-//! (four blocks) from the same `gpa` and spawns `offload_threads` workers, and the native
-//! `async` still allocates one task record per started task, as Threaded does; "no allocation
-//! after init" becomes true per slot group in later plan-002 items.
+//! Carriers: `Options.carriers` is the number of schedulers (ADR 0004 section 1). Carrier 0 is
+//! `sched`, driven by the thread that calls `async`/`await`; carriers `1..carriers-1` are
+//! `peers`, each a `Sched` and a thread started by the first `io()` (`src/carriers.zig`) and
+//! stopped by `deinit`. Placement is not built yet: every task runs on carrier 0 and the peers
+//! idle, so `carriers = 1` behaves exactly as a single-carrier runtime always did and spawns no
+//! thread.
+//!
+//! Allocation: `init` allocates only the peers block (`carriers - 1` entries, from `gpa`);
+//! `gpa` is handed to `Io.Threaded`, which uses it lazily for `groupAsync`/`groupConcurrent`
+//! closures, thread stacks and process spawn. The first `io()` allocates the fiber table, stacks
+//! and wheel nodes of every carrier plus the offload pool's thread handles from the same `gpa`
+//! and spawns `offload_threads` workers and the peer threads, and the native `async` still
+//! allocates one task record per started task, as Threaded does; "no allocation after init"
+//! becomes true per slot group in later plan items.
 //!
 //! Backends: `.threaded` idles the carrier in a futex; `.kqueue` (Darwin) and `.epoll` (Linux),
 //! where fibers exist, give the scheduler one poller (`src/backend/kqueue.zig`,
@@ -68,6 +76,7 @@ const net_data = @import("net_data.zig");
 const submit = @import("submit.zig");
 const batch = @import("batch.zig");
 const offload_slots = @import("offload_slots.zig");
+const carriers = @import("carriers.zig");
 
 const assert = stdx.assert;
 
@@ -83,6 +92,12 @@ backend: Backend,
 unimplemented: Unimplemented,
 /// Fiber scheduler; valid only while `sched_state == .ready`, built in place by the first `io()`.
 sched: Sched,
+/// Peer carriers `1..carriers-1` (`src/carriers.zig`): `carriers - 1` entries allocated by
+/// `init`, built and started by the first `io()`, empty when `carriers == 1`. Nothing is placed
+/// on them yet, so they only idle.
+peers: []Peer,
+/// Set (release) by `deinit` to end the peer threads; read (acquire) by their loops.
+stop: std.atomic.Value(bool),
 /// The futex wait table (`src/futex.zig`); its records live in the scheduler's fibers.
 waits: futex.Table,
 sched_state: SchedState,
@@ -103,6 +118,13 @@ pub const fibers_supported = Sched.supported;
 
 /// True when the slot called `name` runs on the offload pool where fibers exist (`.forward` mode).
 pub const is_offloaded = offload_slots.is_offloaded;
+
+/// A peer carrier: its scheduler and its thread (`src/carriers.zig`).
+pub const Peer = carriers.Peer;
+
+/// Most carriers one runtime may have: the width of the registry's armed mask (ADR 0004
+/// section 4). A caller that derives the count from `std.Thread.getCpuCount` clamps it first.
+pub const carriers_max: u32 = 64;
 
 /// Life cycle of `sched`; `.unsupported` is a comptime fact of the target, `.unavailable` is the
 /// outcome of an out-of-memory scheduler build (async then runs inline, concurrent refuses).
@@ -138,8 +160,16 @@ pub const Options = struct {
     environ: std.process.Environ,
     /// Program name for `processExecutablePath` on OpenBSD and Haiku; `.empty` elsewhere.
     argv0: Io.Threaded.Argv0,
-    /// Fibers that may be alive at once (async tasks in flight); past it `async` runs inline and
-    /// `concurrent` refuses.
+    /// Carrier threads that run fibers: `1 <= carriers <= carriers_max`, asserted, not a returned
+    /// error (a constant of the program, like `sockets_max`). Carrier 0 is the thread that
+    /// drives `async`/`await`; carriers `1..carriers-1` get a thread each at the first `io()`.
+    /// `carriers = 1` spawns nothing and schedules exactly as before. Today every task still
+    /// runs on carrier 0 and the peers idle; placement lands with ADR 0004 sections 2 and 3.
+    /// Memory: `carriers * fibers_max * fiber_stack_size` bytes of stack, plus the per-carrier
+    /// tables.
+    carriers: u32,
+    /// Fibers that may be alive at once on each carrier (async tasks in flight); past it `async`
+    /// runs inline and `concurrent` refuses.
     /// Positive. One stack of `fiber_stack_size` bytes is allocated per fiber at the first `io()`.
     fibers_max: u32,
     /// Socket-wait nodes per carrier beyond the one each fiber owns, for fibers that wait on
@@ -165,6 +195,8 @@ pub const InitError = error{
     /// The requested backend is not available here: `.kqueue` needs Darwin and fibers, `.epoll`
     /// needs Linux and fibers, and `.uring` does not exist yet.
     BackendUnavailable,
+    /// The peers block (`carriers - 1` entries) could not be allocated.
+    OutOfMemory,
 };
 
 // kqueue is compiled for Darwin only and epoll for Linux (ADR 0003); both need the fiber
@@ -192,19 +224,26 @@ fn backend_resolve(requested: Backend) InitError!Backend {
     return resolved;
 }
 
-/// Builds a runtime. Precondition: `options` is fully specified; no default is implied, the
+/// Builds a runtime. Allocates the peers block (`carriers - 1` entries) and nothing else.
+/// Precondition: `options` is fully specified; no default is implied, the
 /// fiber limits satisfy `Sched.Options`, and `gpa` is thread-safe (offload workers and the
 /// embedded `Io.Threaded` allocate from it on their own threads). The result becomes
 /// self-referential at the first `io()`/`baselineIo()` call (std stores `Threaded.io()` inside
 /// `Threaded` itself) and, through the scheduler, at the first `io()`; do not move it after that.
 pub fn init(gpa: std.mem.Allocator, options: Options) InitError!Runtime {
     const backend = try backend_resolve(options.backend);
+    assert(options.carriers >= 1);
+    assert(options.carriers <= carriers_max);
     assert(options.sockets_max > 0);
     assert(options.sockets_max <= @divExact(evented.registrations_max_limit, 2));
     assert(options.fibers_max > 0);
     assert(options.fiber_stack_size >= Sched.stack_size_min);
     assert(options.fiber_stack_size % 16 == 0);
     assert(options.offload_threads > 0);
+
+    // First, so a failure here has nothing to undo; the block is the only allocation of `init`.
+    const peers = try carriers.alloc(gpa, options.carriers);
+    errdefer carriers.free(gpa, peers);
 
     var threaded: Io.Threaded = .init(gpa, .{
         .stack_size = std.Thread.SpawnConfig.default_stack_size,
@@ -240,6 +279,8 @@ pub fn init(gpa: std.mem.Allocator, options: Options) InitError!Runtime {
         .backend = backend,
         .unimplemented = options.unimplemented,
         .sched = undefined,
+        .peers = peers,
+        .stop = .init(false),
         .waits = .init(options.fibers_max),
         .sched_state = if (fibers_supported) .pending else .unsupported,
         .sched_pin = 0,
@@ -253,7 +294,8 @@ pub fn init(gpa: std.mem.Allocator, options: Options) InitError!Runtime {
     };
 }
 
-/// Releases the scheduler and the embedded `Io.Threaded` (joins its worker threads).
+/// Releases the schedulers (joining the peer carrier threads) and the embedded `Io.Threaded`
+/// (joins its worker threads).
 /// Preconditions: no `Io` value obtained from this runtime is used afterwards, and every future
 /// from `async` was awaited or cancelled (no fiber is alive).
 pub fn deinit(rt: *Runtime) void {
@@ -261,10 +303,13 @@ pub fn deinit(rt: *Runtime) void {
     assert(rt.sockets_max > 0);
     if (rt.sched_state == .ready) {
         assert(rt.sched_pin == @intFromPtr(&rt.sched));
+        assert(rt.sched.live_count == 0);
+        carriers.halt(rt, rt.peers.len);
         rt.sockets.deinit(rt.threaded.allocator);
         rt.offload.deinit(rt.threaded.allocator);
         rt.sched.deinit(rt.threaded.allocator);
     }
+    carriers.free(rt.threaded.allocator, rt.peers);
     rt.threaded.deinit();
     // Poison so a use-after-deinit through a stale `Io` trips safety checks in Debug.
     rt.* = undefined;
@@ -305,6 +350,7 @@ fn test_options(backend: Backend, unimplemented: Unimplemented) Options {
         .unimplemented = unimplemented,
         .environ = .empty,
         .argv0 = .empty,
+        .carriers = 1,
         .fibers_max = 4,
         .batch_ops_max = 64,
         .fiber_stack_size = 64 * 1024,

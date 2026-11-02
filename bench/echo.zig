@@ -305,6 +305,7 @@ pub fn main(init: std.process.Init) !void {
         .unimplemented = .forward,
         .environ = init.minimal.environ,
         .argv0 = .empty,
+        .carriers = 1,
         .fibers_max = fibers_max,
         .batch_ops_max = 0,
         .fiber_stack_size = fiber_stack_size,

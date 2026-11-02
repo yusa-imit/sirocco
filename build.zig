@@ -70,20 +70,25 @@ pub fn build(b: *std.Build) void {
         if (!std.mem.eql(u8, backend, "threaded") and arch != .aarch64 and arch != .x86_64) {
             continue;
         }
-        const config = b.addOptions();
-        config.addOption([]const u8, "backend", backend);
-        const parity_tests = b.addTest(.{
-            .root_module = b.createModule(.{
-                .root_source_file = b.path("tests/parity/root.zig"),
-                .target = target,
-                .optimize = optimize,
-                .imports = &.{
-                    .{ .name = "sirocco", .module = mod },
-                    .{ .name = "parity_config", .module = config.createModule() },
-                },
-            }),
-        });
-        test_step.dependOn(&b.addRunArtifact(parity_tests).step);
+        // Peer carriers idle until placement lands; 2 puts one peer thread under every test.
+        const parity_carriers = [_]u32{ 1, 2 };
+        for (parity_carriers) |carriers| {
+            const config = b.addOptions();
+            config.addOption([]const u8, "backend", backend);
+            config.addOption(u32, "carriers", carriers);
+            const parity_tests = b.addTest(.{
+                .root_module = b.createModule(.{
+                    .root_source_file = b.path("tests/parity/root.zig"),
+                    .target = target,
+                    .optimize = optimize,
+                    .imports = &.{
+                        .{ .name = "sirocco", .module = mod },
+                        .{ .name = "parity_config", .module = config.createModule() },
+                    },
+                }),
+            });
+            test_step.dependOn(&b.addRunArtifact(parity_tests).step);
+        }
     }
 
     // Tidy — Tiger Style mechanical checks (tools/tidy.zig), run over src/bench/tests.
