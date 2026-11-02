@@ -372,6 +372,7 @@ const test_options: Runtime.Options = .{
     .environ = .empty,
     .argv0 = .empty,
     .fibers_max = 4,
+    .batch_ops_max = 64,
     .fiber_stack_size = 128 * 1024,
     .offload_threads = 2,
     .sockets_max = 8,

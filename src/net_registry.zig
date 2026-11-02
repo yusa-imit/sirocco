@@ -22,6 +22,10 @@
 //! because several fibers may wait on one pipe; they share its slot (and count against
 //! `sockets_max` once).
 //!
+//! A fiber may also hold several nodes at once (`wait.socket == .batch`, see
+//! `src/net_registry_batch.zig`: `batch_enter`, `leave`): its `wait.outcome` is then a claim that
+//! one waker wins, and each node records its own outcome for the resumed fiber to read.
+//!
 //! Invariants: a pair `(slot, interest)` has at most one poller registration; the event wakes
 //! every waiter and each retries, so a loser re-arms. A slot has either leases or a socket's
 //! ownership, never both (`leases > 0` marks a borrowed file). Nothing here allocates after
@@ -33,6 +37,7 @@ const Sched = @import("sched.zig");
 const poller = @import("backend/poller.zig");
 const sched_io = @import("sched_io.zig");
 const sys = @import("backend/sys.zig");
+const batch = @import("net_registry_batch.zig");
 
 const Io = std.Io;
 const Fiber = Sched.Fiber;
@@ -44,7 +49,7 @@ const fd_t = sys.fd_t;
 const spin_max: u32 = 1 << 28;
 const index_none: u32 = std.math.maxInt(u32);
 
-const Slot = struct {
+pub const Slot = struct {
     fd: fd_t,
     next_free: u32,
     /// Head of the doubly linked waiters per interest.
@@ -67,6 +72,10 @@ pub const Registry = struct {
     table: poller.Table,
     free_head: u32,
     mutex: std.atomic.Mutex,
+
+    /// A batch fiber's `waiter_enter` and its last word on a node; see `net_registry_batch.zig`.
+    pub const batch_enter = batch.enter;
+    pub const leave = batch.leave;
 
     pub const empty: Registry = .{
         .slots = &.{},
@@ -272,6 +281,7 @@ pub const Registry = struct {
         waiter_push(slot, index, interest, node);
         if (list_empty) sched_io.arm(sched, fd, interest, index) catch {
             waiter_remove(slot, node);
+            node.outcome = .idle;
             fiber.wait = .none;
             return .resources;
         };
@@ -295,9 +305,11 @@ pub const Registry = struct {
 
     /// One waiter leaves because a cancelation reached it: unlink, disarm when it was the last,
     /// make it runnable with outcome `.canceled`. A no-op when an event or a close ended its wait
-    /// first. Carrier-only; `fiber.wait.socket != .none`.
+    /// first. A batch fiber is only claimed and woken; its nodes leave in `leave`. Carrier-only;
+    /// `fiber.wait.socket != .none`.
     pub fn cancel(registry: *Registry, sched: *Sched, fiber: *Fiber) void {
         assert(fiber.wait.socket != .none);
+        if (fiber.wait.socket == .batch) return batch.cancel(sched, fiber);
         registry.lock();
         defer registry.mutex.unlock();
 
@@ -308,6 +320,7 @@ pub const Registry = struct {
         const interest = node.interest;
         assert(fiber.wait.addr == node.slot);
         waiter_remove(slot, node);
+        node.outcome = .idle;
         if (slot.waiters[interest_index(interest)] == null) {
             sched_io.disarm(sched, slot.fd, interest);
         }
@@ -332,15 +345,12 @@ pub const Registry = struct {
             if (head == null) continue;
             sched_io.disarm(sched, fd, if (side == 0) .read else .write);
             var waiter = head;
-            for (0..sched.fibers.len + 1) |_| {
+            for (0..sched.waiters.len + 1) |_| {
                 const node = waiter orelse break;
                 waiter = node.next;
-                node.prev = null;
-                node.next = null;
-                node.fiber.wait.outcome = .closed;
-                sched.unpark(node.fiber);
+                node_wake(sched, node, .closed);
             }
-            assert_always(waiter == null); // More waiters than fibers: the list is corrupt.
+            assert_always(waiter == null); // More waiters than nodes: the list is corrupt.
         }
         release_locked(registry, index);
         return true;
@@ -361,12 +371,12 @@ pub const Registry = struct {
         var pending: u32 = 0;
         for (slot.waiters) |head| {
             var waiter = head;
-            for (0..sched.fibers.len + 1) |_| {
+            for (0..sched.waiters.len + 1) |_| {
                 const node = waiter orelse break;
                 waiter = node.next;
                 pending += 1;
             }
-            assert_always(waiter == null); // More waiters than fibers: the list is corrupt.
+            assert_always(waiter == null); // More waiters than nodes: the list is corrupt.
         }
         if (pending == 0) {
             release_locked(registry, index);
@@ -378,13 +388,10 @@ pub const Registry = struct {
         slot.waiters = .{ null, null };
         for (heads) |head| {
             var waiter = head;
-            for (0..sched.fibers.len + 1) |_| {
+            for (0..sched.waiters.len + 1) |_| {
                 const node = waiter orelse break;
                 waiter = node.next; // Read before the hand-off: the carrier may reuse it.
-                node.prev = null;
-                node.next = null;
-                node.fiber.wait.outcome = .closing;
-                sched.unpark_foreign(io, node.fiber);
+                node_wake_foreign(sched, io, node);
             }
             assert_always(waiter == null); // Counted above: the list is intact.
         }
@@ -430,21 +437,25 @@ pub const Registry = struct {
         registry.free_head = @intCast(index);
     }
 
-    fn lock(registry: *Registry) void {
+    pub fn lock(registry: *Registry) void {
         for (0..spin_max) |_| {
             if (registry.mutex.tryLock()) return;
             std.atomic.spinLoopHint();
         }
         assert_always(false); // The lock is held for a hash lookup; this is a deadlock.
     }
+
+    /// Releases the lock `lock` took; the caller holds it.
+    pub fn unlock(registry: *Registry) void {
+        registry.mutex.unlock();
+    }
 };
 
-fn interest_index(interest: poller.Interest) usize {
+pub fn interest_index(interest: poller.Interest) usize {
     return @intFromEnum(interest);
 }
 
 fn waiter_push(slot: *Slot, index: u32, interest: poller.Interest, node: *Waiter) void {
-    const head = &slot.waiters[interest_index(interest)];
     node.fiber.wait = .{
         .addr = index,
         .prev = null,
@@ -456,10 +467,18 @@ fn waiter_push(slot: *Slot, index: u32, interest: poller.Interest, node: *Waiter
             .write => .write,
         },
     };
+    waiter_link(slot, index, interest, node);
+}
+
+/// Links `node` at the head of the list of `interest`, outcome `.waiting`; touches nothing of
+/// `node.fiber`. Caller holds the lock.
+pub fn waiter_link(slot: *Slot, index: u32, interest: poller.Interest, node: *Waiter) void {
+    const head = &slot.waiters[interest_index(interest)];
     node.* = .{
         .prev = null,
         .next = head.*,
         .fiber = node.fiber,
+        .outcome = .waiting,
         .interest = interest,
         .slot = index,
         .generation = slot.generation,
@@ -468,7 +487,7 @@ fn waiter_push(slot: *Slot, index: u32, interest: poller.Interest, node: *Waiter
     head.* = node;
 }
 
-fn waiter_remove(slot: *Slot, node: *Waiter) void {
+pub fn waiter_remove(slot: *Slot, node: *Waiter) void {
     const head = &slot.waiters[interest_index(node.interest)];
     if (node.prev) |prev| prev.next = node.next else head.* = node.next;
     if (node.next) |next| next.prev = node.prev;
@@ -492,15 +511,45 @@ pub fn on_event(ctx: *anyopaque, sched: *Sched, event: poller.Event) void {
     assert_always(head.* != null); // Armed exactly while the list is non-empty.
     var waiter = head.*;
     head.* = null;
-    for (0..sched.fibers.len + 1) |_| {
+    for (0..sched.waiters.len + 1) |_| {
         const node = waiter orelse break;
         waiter = node.next;
-        node.prev = null;
-        node.next = null;
-        node.fiber.wait.outcome = .woken;
-        sched.unpark(node.fiber);
+        node_wake(sched, node, .ready);
     }
-    assert_always(waiter == null); // More waiters than fibers: the list is corrupt.
+    assert_always(waiter == null); // More waiters than nodes: the list is corrupt.
+}
+
+/// Ends the wait of `node`, which the caller detached from its list, on the carrier: records
+/// `ended` (`.ready` or `.closed`) in the node and wakes its fiber. A batch fiber is claimed
+/// `.woken` (a lost claim still leaves the node marked); any other gets `ended` as its outcome.
+fn node_wake(sched: *Sched, node: *Waiter, ended: Waiter.Outcome) void {
+    const fiber = node.fiber;
+    assert(node.outcome == .waiting); // Linked until now.
+    assert(fiber.state != .free);
+    node.prev = null;
+    node.next = null;
+    node.outcome = ended;
+    if (fiber.wait.socket == .batch) return batch.wake_on_carrier(sched, fiber, .woken);
+    fiber.wait.outcome = switch (ended) {
+        .ready => .woken,
+        .closed => .closed,
+        .idle, .waiting, .closing => unreachable, // Only an event and a close on the carrier.
+    };
+    sched.unpark(fiber);
+}
+
+/// `node_wake` for a close from another thread: the node becomes `.closing` and its fiber is
+/// handed to the carrier (a batch fiber only if this call wins the claim).
+fn node_wake_foreign(sched: *Sched, io: Io, node: *Waiter) void {
+    const fiber = node.fiber;
+    assert(node.outcome == .waiting); // Linked until now.
+    assert(fiber.wait.socket != .none); // Stable while the node is linked.
+    node.prev = null;
+    node.next = null;
+    node.outcome = .closing;
+    if (fiber.wait.socket == .batch) return batch.wake_foreign(sched, io, fiber);
+    fiber.wait.outcome = .closing;
+    sched.unpark_foreign(io, fiber);
 }
 
 test "registry: slots recycle, a recycled fd replaces a stale entry, a full registry says so" {

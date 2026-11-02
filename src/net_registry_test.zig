@@ -26,6 +26,7 @@ const Fixture = struct {
     fn init(fixture: *Fixture) !void {
         const options: Sched.Options = .{
             .fibers_max = 4,
+            .batch_ops_max = 0,
             .stack_size = 16 * 1024,
             .now_ns = 0,
             .idle = .{ .poller = .{ .registrations_max = 8 } },

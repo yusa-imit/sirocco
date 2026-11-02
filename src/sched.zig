@@ -18,7 +18,9 @@
 //!
 //! Allocation: `init` allocates four blocks (fiber table, stack arena, wheel nodes, waiter pool)
 //! from `gpa`, plus the poller's table under `.poller`; `Sched` stores no allocator, so nothing
-//! allocates afterwards, and `deinit` takes the same `gpa` back.
+//! allocates afterwards, and `deinit` takes the same `gpa` back. The waiter pool holds one node
+//! per fiber and `batch_ops_max` spares for a fiber that waits on several sockets at once
+//! (`waiter_acquire`, `waiter_release`).
 //!
 //! Idling (`Options.idle`): with nothing ready the carrier sleeps until the wheel's next deadline
 //! or a foreign wake. Under `.futex` it blocks in the baseline futex on `inbox_version`. Under
@@ -62,8 +64,12 @@ const Sched = @This();
 
 fibers: []Fiber,
 stacks: []align(stack_align) u8,
-/// One socket-wait node per fiber (ADR 0004 section 6); node `i` belongs to fiber `i`.
+/// Socket-wait nodes (ADR 0004 section 6): node `i < fibers.len` belongs to fiber `i`, the rest
+/// are spares on the free list below.
 waiters: []Waiter,
+/// Spare nodes not lent out, linked through `Waiter.next`; touched by the carrier only.
+waiter_free_head: ?*Waiter,
+waiter_free_count: u32,
 stack_size: u32,
 free_head: ?*Fiber,
 ready_head: ?*Fiber,
@@ -110,6 +116,9 @@ pub const stack_size_min: u32 = 16 * 1024;
 pub const Options = struct {
     /// Fibers that may be alive at once; one stack is allocated for each.
     fibers_max: u32,
+    /// Waiter nodes beyond the one each fiber owns, for fibers that wait on several sockets at
+    /// once (`waiter_acquire`). 0 is valid: no such wait can be served.
+    batch_ops_max: u32,
     /// Bytes per stack, a multiple of 16 and at least `stack_size_min`.
     stack_size: u32,
     /// `Clock.awake` reading at creation, the wheel's starting time.
@@ -159,7 +168,9 @@ pub const Events = struct {
 };
 
 /// Which readiness a fiber parked on a socket waits for (`src/net.zig`); `none` otherwise.
-pub const SocketWait = enum(u8) { none, read, write };
+/// `batch`: the fiber holds several waiter nodes and `wait.outcome` is a claim that whoever moves
+/// it off `.waiting` first (`claim`) wins, and is then the only one to wake the fiber.
+pub const SocketWait = enum(u8) { none, read, write, batch };
 
 /// How a fiber's address wait ended; `futex.zig` owns the transitions. `closed` and `closing` are
 /// the socket waits whose handle was closed under them (`src/net_registry.zig`): `closed` leaves
@@ -189,6 +200,25 @@ pub const Wait = struct {
     };
 };
 
+/// Moves `fiber.wait.outcome` from `.waiting` to `outcome`; true for the one waker that does.
+/// Any thread. The winner alone may unpark the fiber (`unpark`, or `unpark_foreign` off the
+/// carrier); a loser only detaches what it holds. Precondition: `outcome` ends a wait.
+pub fn claim(fiber: *Fiber, outcome: WaitOutcome) bool {
+    assert(outcome != .idle);
+    assert(outcome != .waiting);
+    const seen = @cmpxchgStrong(
+        WaitOutcome,
+        &fiber.wait.outcome,
+        .waiting,
+        outcome,
+        .acq_rel,
+        .acquire,
+    );
+    // A fiber nobody set to `.waiting` has no wait to claim: a breach, not a lost race.
+    if (seen) |other| assert(other != .idle);
+    return seen == null;
+}
+
 pub const Fiber = struct {
     context: Io.fiber.Context,
     queue_next: ?*Fiber,
@@ -208,8 +238,9 @@ pub const Waiter = @import("waiter.zig").Waiter;
 pub const stack_align = 16;
 
 /// Fills `target` in place. Precondition: `options.fibers_max > 0`, `options.stack_size` is a
-/// multiple of 16 and at least `stack_size_min`. Runs nothing; allocates the fiber table and the
-/// stack arena (and the poller's table under `.poller`), and nothing after.
+/// multiple of 16 and at least `stack_size_min`. Runs nothing; allocates the fiber table, the
+/// stack arena, the wheel and the waiter pool (and the poller's table under `.poller`), and
+/// nothing after.
 pub fn init(target: *Sched, gpa: std.mem.Allocator, options: Options) InitError!void {
     return init_checked(target, gpa, options, supported);
 }
@@ -235,7 +266,10 @@ fn init_checked(
     const stacks = try gpa.alignedAlloc(u8, .@"16", arena_size);
     errdefer gpa.free(stacks);
 
-    const waiters = try gpa.alloc(Waiter, options.fibers_max);
+    const waiters_count = std.math.add(u32, options.fibers_max, options.batch_ops_max) catch {
+        return error.OutOfMemory;
+    };
+    const waiters = try gpa.alloc(Waiter, waiters_count);
     errdefer gpa.free(waiters);
 
     var wheel: Wheel = undefined; // Filled by `Wheel.init` on the next line, before any read.
@@ -249,6 +283,8 @@ fn init_checked(
         .fibers = fibers,
         .stacks = stacks,
         .waiters = waiters,
+        .waiter_free_head = null,
+        .waiter_free_count = 0,
         .stack_size = options.stack_size,
         .free_head = null,
         .ready_head = null,
@@ -269,13 +305,15 @@ fn init_checked(
     };
     fibers_init(target);
     assert(target.free_head == &fibers[0]);
+    assert(target.waiter_free_count == options.batch_ops_max);
 }
 
 /// Fills the free list and the waiter pool from `target`'s tables. Reverse order so the first
 /// `spawn` takes fiber 0 and the free list stays address-ordered.
 fn fibers_init(target: *Sched) void {
-    assert(target.fibers.len == target.waiters.len);
+    assert(target.fibers.len <= target.waiters.len);
     assert(target.free_head == null);
+    assert(target.waiter_free_head == null);
     for (0..target.fibers.len) |offset| {
         const index = target.fibers.len - 1 - offset;
         const stack_offset = index * target.stack_size;
@@ -288,15 +326,30 @@ fn fibers_init(target: *Sched) void {
             .wait = .none,
         };
         target.free_head = &target.fibers[index];
-        target.waiters[index] = .{
-            .prev = null,
-            .next = null,
-            .fiber = &target.fibers[index],
-            .interest = .read,
-            .slot = 0,
-            .generation = 0,
-        };
+        target.waiters[index] = waiter_idle(&target.fibers[index]);
     }
+    // Spares last-to-first so the first `waiter_acquire` takes the lowest. Their `fiber` is a
+    // placeholder until the borrower sets it.
+    for (0..target.waiters.len - target.fibers.len) |offset| {
+        const index = target.waiters.len - 1 - offset;
+        const node = &target.waiters[index];
+        node.* = waiter_idle(&target.fibers[0]);
+        node.next = target.waiter_free_head;
+        target.waiter_free_head = node;
+        target.waiter_free_count += 1;
+    }
+}
+
+fn waiter_idle(fiber: *Fiber) Waiter {
+    return .{
+        .prev = null,
+        .next = null,
+        .fiber = fiber,
+        .outcome = .idle,
+        .interest = .read,
+        .slot = 0,
+        .generation = 0,
+    };
 }
 
 fn idle_init(gpa: std.mem.Allocator, options: IdleOptions) InitError!Idle {
@@ -345,6 +398,46 @@ pub fn waiter_of(sched: *Sched, fiber: *Fiber) *Waiter {
     const index = @divExact(@intFromPtr(fiber) - first, @sizeOf(Fiber));
     assert(index < sched.fibers.len);
     return &sched.waiters[index];
+}
+
+/// Lends a spare waiter node to a fiber that waits on several sockets, or null when all
+/// `batch_ops_max` are out. The caller sets `node.fiber`; the node is idle and unlinked.
+/// Precondition: carrier thread.
+pub fn waiter_acquire(sched: *Sched) ?*Waiter {
+    assert(sched.waiter_free_count <= sched.waiters.len - sched.fibers.len);
+    const node = sched.waiter_free_head orelse {
+        assert(sched.waiter_free_count == 0);
+        return null;
+    };
+    assert(sched.waiter_free_count > 0);
+    sched.waiter_free_head = node.next;
+    sched.waiter_free_count -= 1;
+    node.next = null;
+    assert(node.prev == null);
+    assert(node.outcome == .idle);
+    return node;
+}
+
+/// Takes a spare back once its fiber has run `leave` on it. Precondition: carrier thread; `node`
+/// came from `waiter_acquire`, is not linked in a slot's list and is not given back twice.
+pub fn waiter_release(sched: *Sched, node: *Waiter) void {
+    const first = @intFromPtr(sched.waiters.ptr) + sched.fibers.len * @sizeOf(Waiter);
+    assert(@intFromPtr(node) >= first); // A fiber's own node is never lent.
+    assert(@intFromPtr(node) < @intFromPtr(sched.waiters.ptr + sched.waiters.len));
+    assert(node.prev == null);
+    assert(node.next == null);
+    assert(node.outcome != .waiting);
+    assert(sched.waiter_free_count < sched.waiters.len - sched.fibers.len);
+    node.* = waiter_idle(node.fiber);
+    node.next = sched.waiter_free_head;
+    sched.waiter_free_head = node;
+    sched.waiter_free_count += 1;
+}
+
+/// Spare nodes on the free list. Precondition: carrier thread.
+pub fn waiters_free(sched: *const Sched) u32 {
+    assert(sched.waiter_free_count <= sched.waiters.len - sched.fibers.len);
+    return sched.waiter_free_count;
 }
 
 /// Makes `entry(arg)` runnable on a free fiber; it first runs inside `run`. Precondition: called
@@ -635,7 +728,13 @@ pub fn switch_to_carrier(sched: *Sched, fiber: *Fiber) void {
 }
 
 fn test_options(fibers_max: u32, stack_size: u32) Options {
-    return .{ .fibers_max = fibers_max, .stack_size = stack_size, .now_ns = 0, .idle = .futex };
+    return .{
+        .fibers_max = fibers_max,
+        .batch_ops_max = 0,
+        .stack_size = stack_size,
+        .now_ns = 0,
+        .idle = .futex,
+    };
 }
 
 test "init reports FibersUnsupported before allocating" {

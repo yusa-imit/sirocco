@@ -254,7 +254,13 @@ const ns_per_ms: i96 = 1_000_000;
 const poller_supported = @import("backend/poller.zig").Native != void;
 
 fn test_sched_options(fibers_max: u32, idle: Sched.IdleOptions) Sched.Options {
-    return .{ .fibers_max = fibers_max, .stack_size = 64 * 1024, .now_ns = 0, .idle = idle };
+    return .{
+        .fibers_max = fibers_max,
+        .batch_ops_max = 0,
+        .stack_size = 64 * 1024,
+        .now_ns = 0,
+        .idle = idle,
+    };
 }
 
 const idle_poller: Sched.IdleOptions = .{ .poller = .{ .registrations_max = 8 } };

@@ -43,7 +43,7 @@ and then multi-carrier as plan 005. No consumer pins sirocco yet and zoltraak is
       `.kqueue` and `.threaded`; `tests/parity/net_close.zig` and the cancel-after-wake test
       from #49 pass; allocations are flat after init (gate 5); the ubuntu CI job (epoll) is
       green. Budget one CI round trip, because epoll is CI-only.
-- [ ] 5. 8b part 2: in `src/batch.zig`, an awaiting fiber holds one `Waiter` per op and parks
+- [x] 5. 8b part 2: in `src/batch.zig`, an awaiting fiber holds one `Waiter` per op and parks
       on poller + wheel. The 50 us-2 ms wheel slices and their `recvmsg` per slice go away
       (ADR 0003 section 2c is amended). Verify: `tests/parity/batch.zig` still matches. A new
       test shows an idle 64-socket batch makes no `recvmsg` between arming and the first event.

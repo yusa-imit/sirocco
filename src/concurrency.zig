@@ -156,6 +156,7 @@ pub fn sched_ensure(rt: *Runtime) void {
             assert(Sched.supported);
             const options: Sched.Options = .{
                 .fibers_max = rt.fibers_max,
+                .batch_ops_max = rt.batch_ops_max,
                 .stack_size = rt.fiber_stack_size,
                 .now_ns = std.math.lossyCast(u64, Io.Clock.awake.now(rt.baselineIo()).nanoseconds),
                 .idle = rt.idle_options(),
