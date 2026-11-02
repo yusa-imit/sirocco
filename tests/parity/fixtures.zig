@@ -4,8 +4,9 @@
 //! is written once and a later item that runs the suite a second time under `.fail` changes one
 //! call, not every test. The backend comes from the build: `build.zig` compiles this suite once
 //! per backend (`parity_config.backend`: `.threaded` always, `.kqueue` on Darwin, `.epoll` on
-//! Linux), so one source tree is checked under every idle path. Ownership: the caller `deinit`s
-//! the returned runtime; it must not move after its first `io()`.
+//! Linux), and once per carrier count (`parity_config.carriers`, 1 and 2), so one source tree is
+//! checked under every idle path and with and without idle peer carriers. Ownership: the caller
+//! `deinit`s the returned runtime; it must not move after its first `io()`.
 
 const std = @import("std");
 const Runtime = @import("sirocco").Runtime;
@@ -16,6 +17,17 @@ pub const backend: Runtime.Backend = std.meta.stringToEnum(
     Runtime.Backend,
     parity_config.backend,
 ) orelse @compileError("parity_config.backend names no Runtime.Backend");
+
+/// Carriers every runtime of this build of the suite has (`parity_config.carriers`): the suite
+/// runs at 1 and at 2, so the peers' start and teardown sit under every slot group.
+pub const carriers: u32 = parity_config.carriers;
+
+/// Allocator calls `Runtime.init` makes: the peers block, none at one carrier.
+pub const init_allocs: usize = if (carriers == 1) 0 else 1;
+
+/// Allocator calls the first `io()` makes for the peers: per peer, the fiber table, the stack
+/// arena, the wheel and the waiter pool, plus the poller table on an evented backend.
+pub const peers_allocs: usize = (carriers - 1) * (if (backend == .threaded) 4 else 5);
 
 /// Sockets (registry entries) a default test runtime may hold.
 pub const sockets_max_default: u32 = 16;
@@ -62,6 +74,7 @@ pub fn init_runtime_sockets(
         .unimplemented = unimplemented,
         .environ = .empty,
         .argv0 = .empty,
+        .carriers = carriers,
         .fibers_max = fibers_max,
         .batch_ops_max = 64,
         .fiber_stack_size = fiber_stack_size_default,

@@ -567,6 +567,13 @@ pub fn unpark_foreign(sched: *Sched, io: Io, fiber: *Fiber) void {
     )) |seen| {
         fiber.queue_next = seen;
     }
+    sched.notify(io);
+}
+
+/// Wakes the carrier from its idle sleep, from any thread: through `io` (the baseline) under
+/// `.futex`, through the poller's latched wake under `.poller`, where `io` is unused. A notify
+/// that lands before the carrier sleeps is not lost: the futex word moved, the wake is latched.
+pub fn notify(sched: *Sched, io: Io) void {
     switch (sched.idle) {
         .futex => {
             _ = @atomicRmw(u32, &sched.inbox_version, .Add, 1, .release);
@@ -578,6 +585,28 @@ pub fn unpark_foreign(sched: *Sched, io: Io, fiber: *Fiber) void {
             native.wake();
         },
     }
+    assert(sched.fibers.len > 0);
+    if (sched.idle == .poller) assert(sched.inbox_version == 0);
+}
+
+/// Body of a peer carrier's thread (ADR 0004 section 1): sleeps in the idle path until `stop` is
+/// set, then returns. Nothing is placed on a peer yet (plan 005 items 7 and 8), so no fiber is
+/// alive and `notify` is the only thing that wakes it; `Runtime.deinit` stores `stop` (release)
+/// and then notifies. The version is read before `stop` so a notify between the two is seen.
+/// Precondition: not nested, no fiber alive, called from outside any fiber.
+pub fn serve(sched: *Sched, io: Io, stop: *const std.atomic.Value(bool)) void {
+    assert(sched.current == null);
+    assert(!sched.running);
+    assert(sched.live_count == 0);
+    // The top-level loop of a carrier thread; it ends when the runtime stops it.
+    while (true) {
+        const version = @atomicLoad(u32, &sched.inbox_version, .acquire);
+        if (stop.load(.acquire)) break;
+        sched.idle_wait(io, version, null);
+        assert(sched.live_count == 0);
+    }
+    assert(sched.inbox == null);
+    assert(sched.ready_head == null);
 }
 
 /// Runs fibers on the calling thread until none is alive. A fiber that parks with nothing else

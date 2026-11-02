@@ -80,6 +80,7 @@ fn runtime_init(init: std.process.Init, backend: Runtime.Backend) !Runtime {
         .unimplemented = .forward,
         .environ = init.minimal.environ,
         .argv0 = .empty,
+        .carriers = 1,
         .fibers_max = 4,
         .batch_ops_max = 0,
         .fiber_stack_size = 64 * 1024,

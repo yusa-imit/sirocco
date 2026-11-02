@@ -371,6 +371,7 @@ const test_options: Runtime.Options = .{
     .unimplemented = .forward,
     .environ = .empty,
     .argv0 = .empty,
+    .carriers = 1,
     .fibers_max = 4,
     .batch_ops_max = 64,
     .fiber_stack_size = 128 * 1024,

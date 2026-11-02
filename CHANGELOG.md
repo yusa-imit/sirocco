@@ -18,6 +18,12 @@ exemption recorded in `citadel/protocol/VERSIONING.md`.
   spare socket-wait nodes per scheduler for fibers that wait on several sockets at once. Size
   it to the sum of the largest concurrent batches; 0 serves no parked batch (every batch goes to
   the baseline). Parked batches are limited to 128 operations.
+- **Breaking (0.x):** `Runtime.Options` gains the required `carriers` (`1..carriers_max`, 64).
+  `Runtime.init` allocates the `carriers - 1` peer blocks (`InitError` gains `OutOfMemory`) and
+  the first `io()` builds one scheduler and starts one thread per peer, joined by `deinit`.
+  Placement has not landed (plan `005` items 7 and 8): every task still runs on carrier 0 and the
+  peers idle, so `carriers = 1` behaves exactly as before and spawns no thread. `fibers_max` and
+  `batch_ops_max` are per carrier.
 
 ## [0.5.0] - 2026-10-27
 
