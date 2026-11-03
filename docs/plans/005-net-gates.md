@@ -48,10 +48,13 @@ and then multi-carrier as plan 005. No consumer pins sirocco yet and zoltraak is
       (ADR 0003 section 2c is amended). Verify: `tests/parity/batch.zig` still matches. A new
       test shows an idle 64-socket batch makes no `recvmsg` between arming and the first event.
       `zig build bench-echo` gate 2 stays >= 0.9x. ubuntu CI is green.
-- [ ] 6. Add `Options.carriers` as ADR 0004 specifies. `Runtime` builds `carriers` `Sched`s,
+- [x] 6. Add `Options.carriers` as ADR 0004 specifies. `Runtime` builds `carriers` `Sched`s,
       each with its own `Poller`, wheel and carrier thread, all allocated in `init`.
       `carriers = 1` behaves as v0.5.0. Verify: `tests/parity/fixtures.zig` runs the suite at
       1 and 2 carriers on `.kqueue` and `.epoll` (CI). Gate 5 holds. Gate 7 is re-run at 2.
+      Gate 7 at 2 carriers (macOS kqueue, ReleaseFast): p99 316792 ns against 317167 ns at 1
+      carrier and 8.01 ms for `Io.Threaded`; `bench-timer` now prints the row and gates on it.
+      Gate 5 holds: the parity allocation-index tests run at 2 carriers.
 - [ ] 7. Cross-carrier correctness: futex wake, `await` and cancel of a fiber on another
       carrier, and a socket closed from another carrier. Verify: a seeded model test at 4
       carriers (style of `tests/parity/futex_model.zig`, fixed seeds in CI), the parity suite at
