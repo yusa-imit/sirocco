@@ -56,7 +56,7 @@ pub fn start(rt: *Runtime, options: Sched.Options) bool {
     assert(!rt.stop.load(.monotonic));
     const gpa = rt.threaded.allocator;
     var built: usize = 0;
-    for (rt.peers) |*peer| {
+    for (rt.peers, 0..) |*peer, offset| {
         assert(peer.thread == null);
         peer.sched.init(gpa, options) catch |err| switch (err) {
             error.OutOfMemory,
@@ -70,6 +70,7 @@ pub fn start(rt: *Runtime, options: Sched.Options) bool {
                 return false;
             },
         };
+        peer.sched.index = @intCast(offset + 1);
         built += 1;
     }
     assert(built == rt.peers.len);

@@ -105,3 +105,19 @@ test "allocation failure at any point of a two-carrier start never leaks" {
     }
     try std.testing.expect(succeeded);
 }
+
+test "each peer carrier knows its index and owns fibers that point home" {
+    if (!Runtime.fibers_supported) return error.SkipZigTest;
+    var rt: Runtime = try .init(std.testing.allocator, options(.auto, 4));
+    defer rt.deinit();
+
+    const rio = rt.io();
+    var future = rio.async(add, .{ 2, 3 });
+    try std.testing.expectEqual(@as(u32, 5), future.await(rio));
+    if (rt.sched_state != .ready) return error.SkipZigTest;
+    try std.testing.expectEqual(@as(u32, 0), rt.sched.index);
+    for (rt.peers, 0..) |*peer, offset| {
+        try std.testing.expectEqual(@as(u32, @intCast(offset + 1)), peer.sched.index);
+        for (peer.sched.fibers) |*fiber| try std.testing.expectEqual(&peer.sched, fiber.home);
+    }
+}
