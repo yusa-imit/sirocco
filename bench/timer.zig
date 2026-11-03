@@ -3,7 +3,7 @@
 //! One task sleeps 1 ms, `samples_target` times in a row, on `rt.io()` and on `rt.baselineIo()`
 //! (the embedded `Io.Threaded`) from one `Runtime`, and again on `rt.io()` of a second `Runtime`
 //! built with `.auto` (kqueue where it exists: the carrier idles in the poller instead of the
-//! futex). Each sample is `elapsed - 1 ms` on
+//! futex), and once more on a third `Runtime` with two carriers. Each sample is `elapsed - 1 ms` on
 //! `Clock.awake`, the lateness of the wake; the tables print p50, p99 and the maximum. The task
 //! runs through `io.async` so that `sleep` executes on a fiber, where it is native; off a fiber
 //! it would forward to the baseline and the rows would measure the same thing. The gate is
@@ -74,13 +74,13 @@ fn measure(io: Io, errors_ns: []u64) Stats {
     return summarize(errors_ns);
 }
 
-fn runtime_init(init: std.process.Init, backend: Runtime.Backend) !Runtime {
+fn runtime_init(init: std.process.Init, backend: Runtime.Backend, carriers: u32) !Runtime {
     return Runtime.init(init.gpa, .{
         .backend = backend,
         .unimplemented = .forward,
         .environ = init.minimal.environ,
         .argv0 = .empty,
-        .carriers = 1,
+        .carriers = carriers,
         .fibers_max = 4,
         .batch_ops_max = 0,
         .fiber_stack_size = 64 * 1024,
@@ -91,11 +91,15 @@ fn runtime_init(init: std.process.Init, backend: Runtime.Backend) !Runtime {
 
 pub fn main(init: std.process.Init) !void {
     const gpa = init.gpa;
-    var rt_futex = try runtime_init(init, .threaded);
+    var rt_futex = try runtime_init(init, .threaded, 1);
     defer rt_futex.deinit();
 
-    var rt_auto = try runtime_init(init, .auto);
+    var rt_auto = try runtime_init(init, .auto, 1);
     defer rt_auto.deinit();
+
+    // Two carriers: the idle peer must not disturb the timer on carrier 0 (plan 005 item 6).
+    var rt_two = try runtime_init(init, .auto, 2);
+    defer rt_two.deinit();
 
     const errors_ns = try gpa.alloc(u64, samples_target);
     defer gpa.free(errors_ns);
@@ -108,11 +112,13 @@ pub fn main(init: std.process.Init) !void {
     const baseline = measure(rt_futex.baselineIo(), errors_ns);
     const futex = measure(rt_futex.io(), errors_ns);
     const native = measure(rt_auto.io(), errors_ns);
+    const native_two = measure(rt_two.io(), errors_ns);
     try out.print("{s:<16} {s:>12} {s:>12} {s:>12}\n", .{ "io", "p50_ns", "p99_ns", "max_ns" });
     const rows = [_]struct { name: []const u8, stats: Stats }{
         .{ .name = "threaded", .stats = baseline },
         .{ .name = "sirocco/threaded", .stats = futex },
         .{ .name = @tagName(rt_auto.backend), .stats = native },
+        .{ .name = "auto/2 carriers", .stats = native_two },
     };
     for (rows) |row| {
         try out.print(
@@ -120,6 +126,8 @@ pub fn main(init: std.process.Init) !void {
             .{ row.name, row.stats.p50_ns, row.stats.p99_ns, row.stats.max_ns },
         );
     }
-    const pass = native.p99_ns < gate_p99_ns_max and native.p99_ns <= baseline.p99_ns;
+    const pass_one = native.p99_ns < gate_p99_ns_max and native.p99_ns <= baseline.p99_ns;
+    const pass_two = native_two.p99_ns < gate_p99_ns_max and native_two.p99_ns <= baseline.p99_ns;
+    const pass = pass_one and pass_two;
     try out.print("gate 7: {s}\n", .{if (pass) "pass" else "FAIL"});
 }
