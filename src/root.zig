@@ -22,6 +22,8 @@ test {
     _ = @import("sched.zig");
     _ = @import("sched_fiber.zig");
     _ = @import("sched_test.zig");
+    _ = @import("mail.zig");
+    _ = @import("mail_test.zig");
     _ = @import("sched_io.zig");
     _ = @import("timer.zig");
     _ = @import("offload.zig");

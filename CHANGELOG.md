@@ -24,6 +24,8 @@ exemption recorded in `citadel/protocol/VERSIONING.md`.
   Placement has not landed (plan `005` items 7 and 8): every task still runs on carrier 0 and the
   peers idle, so `carriers = 1` behaves exactly as before and spawns no thread. `fibers_max` and
   `batch_ops_max` are per carrier.
+- A peer carrier now starts and runs fibers mailed to it from any thread (`src/mail.zig`, plan
+  `005` item 7); nothing mails a peer until placement lands, so behavior is unchanged.
 
 ## [0.5.0] - 2026-10-27
 
