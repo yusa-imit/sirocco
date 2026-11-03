@@ -60,6 +60,8 @@ and then multi-carrier as plan 005. No consumer pins sirocco yet and zoltraak is
       carriers (style of `tests/parity/futex_model.zig`, fixed seeds in CI), the parity suite at
       4 carriers, and 1000 serial runs of the built test binary with no hang (not looped
       `zig build test`: cached re-runs test nothing).
+      Staged: `Sched.index`, `Fiber.home`, `Sched.here()` and the peers' futex expiry and
+      poller event handlers are in; the claim CAS, join word, cancel mail and `Sched.post` remain.
 - [ ] 8. Placement and stealing, as ADR 0004 decides, for `async`, `concurrent` and
       `groupConcurrent`. Verify: 1000 `concurrent` tasks at 4 carriers spread within the ADR's
       imbalance bound (a counting test). If the ADR adopted stealing, a test shows a carrier

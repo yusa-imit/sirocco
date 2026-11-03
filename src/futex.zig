@@ -383,6 +383,8 @@ test "enqueue refuses past waiters_max and leaves the table intact" {
     var table: Table = .init(2);
     var word: u32 = 0;
     var fibers: [3]Fiber = undefined;
+    // Only the address is stored: `enqueue` never reads through `home`.
+    var home: Sched = undefined;
     for (&fibers) |*fiber| {
         fiber.* = .{
             .context = std.mem.zeroes(Io.fiber.Context),
@@ -391,6 +393,7 @@ test "enqueue refuses past waiters_max and leaves the table intact" {
             .stack = &.{},
             .arg = null,
             .wait = .none,
+            .home = &home,
         };
     }
     try std.testing.expectEqual(Enqueue.queued, table.enqueue(&fibers[0], &word, 0));

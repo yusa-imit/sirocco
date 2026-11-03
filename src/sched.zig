@@ -62,6 +62,9 @@ const assert_always = stdx.assert_always;
 
 const Sched = @This();
 
+/// Position among the runtime's carriers (ADR 0004 section 1): 0 for `rt.sched`, `i + 1` for
+/// peer `i`. Set once by whoever owns the `Sched`, before any fiber runs.
+index: u32,
 fibers: []Fiber,
 stacks: []align(stack_align) u8,
 /// Socket-wait nodes (ADR 0004 section 6): node `i < fibers.len` belongs to fiber `i`, the rest
@@ -105,10 +108,16 @@ pub const supported = switch (builtin.cpu.arch) {
     else => false,
 };
 
-/// True on the thread inside `run_loop`, i.e. the carrier. Per thread, so that `in_fiber` answers
-/// false, without reading carrier-owned state, when asked from any other thread (for example a
-/// worker of the forwarded `Io.Threaded` running a group task).
-threadlocal var carrier_active: bool = false;
+/// The `Sched` whose `run_loop` this thread is inside, else null. Per thread, so that `in_fiber`
+/// answers false, without reading carrier-owned state, when asked from any other thread (for
+/// example a worker of the forwarded `Io.Threaded` running a group task), and so that code on a
+/// fiber can name its carrier (ADR 0004 section 3).
+threadlocal var here_sched: ?*Sched = null;
+
+/// The carrier running on the calling thread, or null off any carrier. Total, any thread.
+pub fn here() ?*Sched {
+    return here_sched;
+}
 
 /// Smallest accepted stack; a fiber body plus std's `Io` call chain needs room in Debug builds.
 pub const stack_size_min: u32 = 16 * 1024;
@@ -228,6 +237,8 @@ pub const Fiber = struct {
     /// the fiber find its own task record from `current_fiber`.
     arg: ?*anyopaque,
     wait: Wait,
+    /// The carrier this fiber is born on, runs on and dies on (ADR 0004 section 2).
+    home: *Sched,
 
     const State = enum { free, ready, running, parked };
 };
@@ -280,6 +291,7 @@ fn init_checked(
     errdefer idle_deinit(&idle, gpa);
 
     target.* = .{
+        .index = 0,
         .fibers = fibers,
         .stacks = stacks,
         .waiters = waiters,
@@ -324,6 +336,7 @@ fn fibers_init(target: *Sched) void {
             .stack = target.stacks[stack_offset..][0..target.stack_size],
             .arg = null,
             .wait = .none,
+            .home = target,
         };
         target.free_head = &target.fibers[index];
         target.waiters[index] = waiter_idle(&target.fibers[index]);
@@ -491,7 +504,7 @@ fn spawn_placed(sched: *Sched, entry: Entry, arg: ?*anyopaque, place: Placement)
 /// True when the caller is a fiber running inside `run` (as opposed to the carrier loop or any
 /// code outside `run`, on any thread). Total: valid in every state and from any thread.
 pub fn in_fiber(sched: *const Sched) bool {
-    if (!carrier_active) return false;
+    if (here_sched != sched) return false;
     if (sched.current) |fiber| {
         assert(fiber.state == .running);
         assert(sched.running);
@@ -631,11 +644,11 @@ pub fn run_until(sched: *Sched, io: Io, stop: *const bool) void {
 fn run_loop(sched: *Sched, io: Io, stop: ?*const bool) void {
     assert(sched.current == null);
     assert(!sched.running);
-    assert(!carrier_active);
+    assert(here_sched == null);
     sched.running = true;
-    carrier_active = true;
+    here_sched = sched;
     defer {
-        carrier_active = false;
+        here_sched = null;
         sched.running = false;
     }
 

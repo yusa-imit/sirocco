@@ -446,3 +446,53 @@ test "every fiber owns one waiter node, allocated in init" {
         try std.testing.expect(node.next == null);
     }
 }
+
+fn test_here_probe(arg: ?*anyopaque) void {
+    const log: *TestLog = @ptrCast(@alignCast(arg.?));
+    const here = Sched.here();
+    log.record(if (here == log.sched) 1 else 0);
+    log.record(if (log.fiber.? == log.sched.current) 1 else 0);
+    log.record(if (log.fiber.?.home == log.sched) 1 else 0);
+}
+
+test "here names the carrier inside a fiber and is null outside, and a fiber knows its home" {
+    if (!supported) return error.SkipZigTest;
+    var sched: Sched = undefined;
+    try sched.init(std.testing.allocator, test_options(2, 32 * 1024));
+    defer sched.deinit(std.testing.allocator);
+
+    var log: TestLog = .{ .sched = &sched, .ids = @splat(0), .len = 0, .fiber = null, .flag = 0 };
+    for (sched.fibers) |*fiber| try std.testing.expectEqual(&sched, fiber.home);
+    try std.testing.expectEqual(@as(u32, 0), sched.index);
+    try std.testing.expect(Sched.here() == null);
+    log.fiber = try sched.spawn(test_here_probe, &log);
+    try std.testing.expect(Sched.here() == null); // Spawned is not running.
+    sched.run(std.testing.io);
+
+    try std.testing.expectEqualSlices(u32, &.{ 1, 1, 1 }, log.ids[0..log.len]);
+    try std.testing.expect(Sched.here() == null);
+}
+
+fn test_other_probe(arg: ?*anyopaque) void {
+    const log: *TestLog = @ptrCast(@alignCast(arg.?));
+    // The other scheduler is not running on this thread: here() is `log.sched`, not it.
+    log.record(if (Sched.here() == log.sched) 1 else 0);
+}
+
+test "here is one carrier per thread: a second scheduler's fiber does not see the first" {
+    if (!supported) return error.SkipZigTest;
+    var first: Sched = undefined;
+    try first.init(std.testing.allocator, test_options(1, 32 * 1024));
+    defer first.deinit(std.testing.allocator);
+    var second: Sched = undefined;
+    try second.init(std.testing.allocator, test_options(1, 32 * 1024));
+    defer second.deinit(std.testing.allocator);
+    second.index = 1;
+
+    var log: TestLog = .{ .sched = &first, .ids = @splat(0), .len = 0, .fiber = null, .flag = 0 };
+    _ = try second.spawn(test_other_probe, &log);
+    second.run(std.testing.io);
+    try std.testing.expectEqualSlices(u32, &.{0}, log.ids[0..log.len]);
+    try std.testing.expect(!first.in_fiber());
+    try std.testing.expect(!second.in_fiber());
+}
