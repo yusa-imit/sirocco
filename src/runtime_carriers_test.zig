@@ -121,3 +121,23 @@ test "each peer carrier knows its index and owns fibers that point home" {
         for (peer.sched.fibers) |*fiber| try std.testing.expectEqual(&peer.sched, fiber.home);
     }
 }
+
+test "peer carriers get the futex expiry and, when sockets exist, the poller event handler" {
+    if (!Runtime.fibers_supported) return error.SkipZigTest;
+    const backends = [_]Runtime.Backend{ .threaded, .auto };
+    for (backends) |backend| {
+        var rt: Runtime = try .init(std.testing.allocator, options(backend, 3));
+        defer rt.deinit();
+
+        const rio = rt.io();
+        var future = rio.async(add, .{ 4, 4 });
+        try std.testing.expectEqual(@as(u32, 8), future.await(rio));
+        if (rt.sched_state != .ready) return error.SkipZigTest;
+        const sockets_built = rt.backend != .threaded;
+        try std.testing.expectEqual(sockets_built, rt.sched.events != null);
+        for (rt.peers) |*peer| {
+            try std.testing.expect(peer.sched.expiry != null);
+            try std.testing.expectEqual(sockets_built, peer.sched.events != null);
+        }
+    }
+}

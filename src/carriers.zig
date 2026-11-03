@@ -19,6 +19,8 @@ const std = @import("std");
 const Io = std.Io;
 const stdx = @import("stdx.zig");
 const Sched = @import("sched.zig");
+const futex = @import("futex.zig");
+const net = @import("net.zig");
 const Runtime = @import("runtime.zig");
 
 const assert = stdx.assert;
@@ -71,6 +73,11 @@ pub fn start(rt: *Runtime, options: Sched.Options) bool {
             },
         };
         peer.sched.index = @intCast(offset + 1);
+        // The handlers carrier 0 gets in `concurrency.sched_ensure`; they read shared tables.
+        peer.sched.expiry = futex.expiry(&rt.waits);
+        if (rt.backend != .threaded) {
+            peer.sched.events = .{ .ctx = &rt.sockets, .ready = net.on_event };
+        }
         built += 1;
     }
     assert(built == rt.peers.len);
