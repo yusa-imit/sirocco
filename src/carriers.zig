@@ -2,7 +2,7 @@
 //!
 //! Purpose: `Runtime` owns carrier 0 as `rt.sched`, run by the driver thread. A runtime built
 //! with `Options.carriers = N` also owns `N - 1` peers, each a `Sched` of its own (fiber table,
-//! stacks, wheel, poller) plus a thread that runs `Sched.serve` until `rt.stop` is set. Nothing
+//! stacks, wheel, poller) plus a thread that runs `mail.serve` until `rt.stop` is set. Nothing
 //! is placed on a peer yet (plan 005 items 7 and 8), so a peer only idles; carriers = 1 has no
 //! peer and no thread, and behaves exactly as v0.5.0 did.
 //!
@@ -21,6 +21,7 @@ const stdx = @import("stdx.zig");
 const Sched = @import("sched.zig");
 const futex = @import("futex.zig");
 const net = @import("net.zig");
+const mail = @import("mail.zig");
 const Runtime = @import("runtime.zig");
 
 const assert = stdx.assert;
@@ -93,7 +94,7 @@ pub fn start(rt: *Runtime, options: Sched.Options) bool {
 }
 
 fn peer_main(sched: *Sched, io: Io, stop: *const std.atomic.Value(bool)) void {
-    sched.serve(io, stop);
+    mail.serve(sched, io, stop);
 }
 
 /// Stops the first `built` peers: sets `rt.stop`, wakes and joins every running thread, then

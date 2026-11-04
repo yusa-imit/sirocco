@@ -55,6 +55,7 @@ const sleep = @import("sleep.zig");
 const evented = @import("backend/poller.zig");
 const sched_io = @import("sched_io.zig");
 const sched_fiber = @import("sched_fiber.zig");
+const mail = @import("mail.zig");
 
 const Io = std.Io;
 const assert = stdx.assert;
@@ -87,6 +88,8 @@ inbox: ?*Fiber,
 /// Futex word bumped after every inbox push under `.futex` idling, which the carrier waits on when
 /// it has nothing to run; stays 0 under `.poller`.
 inbox_version: u32,
+/// Tasks posted to this carrier (`src/mail.zig`); drained by the carrier next to the inbox.
+mailbox: mail.Mailbox,
 /// How the carrier sleeps; chosen by `Options.idle` and fixed for life.
 idle: Idle,
 /// Handler for futex waiters whose deadline passed; null until `src/futex.zig` installs it.
@@ -308,6 +311,7 @@ fn init_checked(
         .running = false,
         .inbox = null,
         .inbox_version = 0,
+        .mailbox = .empty,
         .idle = idle,
         .expiry = null,
         .wheel = wheel,
@@ -602,26 +606,6 @@ pub fn notify(sched: *Sched, io: Io) void {
     if (sched.idle == .poller) assert(sched.inbox_version == 0);
 }
 
-/// Body of a peer carrier's thread (ADR 0004 section 1): sleeps in the idle path until `stop` is
-/// set, then returns. Nothing is placed on a peer yet (plan 005 items 7 and 8), so no fiber is
-/// alive and `notify` is the only thing that wakes it; `Runtime.deinit` stores `stop` (release)
-/// and then notifies. The version is read before `stop` so a notify between the two is seen.
-/// Precondition: not nested, no fiber alive, called from outside any fiber.
-pub fn serve(sched: *Sched, io: Io, stop: *const std.atomic.Value(bool)) void {
-    assert(sched.current == null);
-    assert(!sched.running);
-    assert(sched.live_count == 0);
-    // The top-level loop of a carrier thread; it ends when the runtime stops it.
-    while (true) {
-        const version = @atomicLoad(u32, &sched.inbox_version, .acquire);
-        if (stop.load(.acquire)) break;
-        sched.idle_wait(io, version, null);
-        assert(sched.live_count == 0);
-    }
-    assert(sched.inbox == null);
-    assert(sched.ready_head == null);
-}
-
 /// Runs fibers on the calling thread until none is alive. A fiber that parks with nothing else
 /// runnable blocks the carrier in the idle sleep (futex or poller) until `unpark_foreign`
 /// delivers it.
@@ -658,6 +642,7 @@ fn run_loop(sched: *Sched, io: Io, stop: ?*const bool) void {
         }
         const version = @atomicLoad(u32, &sched.inbox_version, .acquire);
         sched.inbox_drain();
+        mail.drain(sched);
         const deadline_ns = sleep.fire(sched, io);
         const fiber = sched.pop_ready() orelse {
             // Every live fiber is parked on a timer or on something another thread must deliver.
@@ -682,7 +667,7 @@ fn run_loop(sched: *Sched, io: Io, stop: ?*const bool) void {
 /// Blocks the carrier until a foreign wake or, when given, `deadline_ns` (`Clock.awake`) passes:
 /// on `inbox_version` under `.futex` (`version` is the value read before the inbox drain), in
 /// the poller under `.poller`. Returning early is fine: `run_loop` re-checks everything.
-fn idle_wait(sched: *Sched, io: Io, version: u32, deadline_ns: ?i96) void {
+pub fn idle_wait(sched: *Sched, io: Io, version: u32, deadline_ns: ?i96) void {
     switch (sched.idle) {
         .futex => idle_wait_futex(&sched.inbox_version, io, version, deadline_ns),
         .poller => {
