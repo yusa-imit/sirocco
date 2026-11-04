@@ -155,18 +155,12 @@ pub const Table = struct {
         assert((table.head == null) == (table.waiting == 0));
     }
 
-    /// Wakes up to `max_waiters` fibers waiting on `addr`, oldest first; returns how many. Inside
-    /// a fiber they are unparked directly; anywhere else they are removed under the lock and then
-    /// handed to `unpark_foreign` (through `io`, the baseline) once it is released.
-    pub fn wake(
-        table: *Table,
-        sched: *Sched,
-        io: Io,
-        addr: usize,
-        max_waiters: u32,
-    ) u32 {
+    /// Wakes up to `max_waiters` fibers waiting on `addr`, oldest first; returns how many. Each is
+    /// resumed on its own carrier (`fiber.home`): directly when the caller is a fiber on that
+    /// carrier, else removed under the lock and handed to `home.unpark_foreign` (through `io`, the
+    /// baseline) once the lock is released. Any thread.
+    pub fn wake(table: *Table, io: Io, addr: usize, max_waiters: u32) u32 {
         assert(max_waiters > 0);
-        const on_carrier = sched.in_fiber();
         var handoff_head: ?*Fiber = null;
         var handoff_tail: ?*Fiber = null;
         var woken: u32 = 0;
@@ -179,10 +173,12 @@ pub const Table = struct {
             node = fiber.wait.next;
             if (fiber.wait.addr != addr) continue;
             table.remove(fiber);
-            fiber.wait.outcome = .woken;
+            // Every other claimant of a futex wait holds this lock, so the claim cannot be lost.
+            assert_always(Sched.claim(fiber, .woken));
             woken += 1;
-            if (on_carrier) {
-                sched.unpark(fiber);
+            const home = fiber.home;
+            if (home.in_fiber()) {
+                home.unpark(fiber);
                 continue;
             }
             // The fiber may not have parked yet and `queue_next` is free while it is in the table.
@@ -196,7 +192,7 @@ pub const Table = struct {
         for (0..woken) |_| {
             const fiber = next orelse break;
             next = fiber.queue_next;
-            sched.unpark_foreign(io, fiber);
+            fiber.home.unpark_foreign(io, fiber);
         }
         assert(next == null);
         assert(woken <= max_waiters);
@@ -352,7 +348,7 @@ fn slot_futex_wake(userdata: ?*anyopaque, ptr: *const u32, max_waiters: u32) voi
     const baseline = rt.baselineIo();
     const ready = rt.sched_state == .ready;
     const woken: u32 = if (ready)
-        rt.waits.wake(&rt.sched, baseline, @intFromPtr(ptr), max_waiters)
+        rt.waits.wake(baseline, @intFromPtr(ptr), max_waiters)
     else
         0;
     assert(woken <= max_waiters);

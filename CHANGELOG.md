@@ -26,6 +26,9 @@ exemption recorded in `citadel/protocol/VERSIONING.md`.
   `batch_ops_max` are per carrier.
 - A peer carrier now starts and runs fibers mailed to it from any thread (`src/mail.zig`, plan
   `005` item 7); nothing mails a peer until placement lands, so behavior is unchanged.
+- `futex.Table.wake` no longer takes a `Sched`: it claims each waiter and resumes it on the fiber's
+  own carrier, directly from a fiber on that carrier and through that carrier's inbox from any other
+  thread or carrier (plan `005` item 7). With one carrier nothing changes.
 
 ## [0.5.0] - 2026-10-27
 
