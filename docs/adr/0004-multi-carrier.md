@@ -134,11 +134,12 @@ names the carrier.
   So no idle-flag shortcut is added before item 9 measures one.
 
 **Futex: one shared table.** `Runtime.waits` stays a single `futex.Table` with
-`waiters_max = carriers * fibers_max`. `Table.wake(table, here: ?*Sched, io, addr, max)` routes
-each removed waiter by `fiber.home`: direct `unpark` when it equals `here` and the caller is a
-fiber, otherwise the hand-off list, released after the lock, then `unpark_foreign`. `timeout`
-and `cancel_wait` always run on the fiber's home carrier, because the wheel and the cancel mail
-are local there. FIFO per address survives because every waiter of an address sits in one list.
+`waiters_max = carriers * fibers_max`. `Table.wake(table, io, addr, max)` routes
+each removed waiter by `fiber.home`: direct `unpark` when `fiber.home.in_fiber()` (the caller is
+a fiber of that carrier), otherwise the hand-off list, released after the lock, then
+`unpark_foreign`. `timeout` and `cancel_wait` always run on the fiber's home carrier, because
+the wheel and the cancel mail are local there. FIFO per address survives because every
+waiter of an address sits in one list.
 
 **`await`.** `Task.done` and `Task.waiter` merge into `join: std.atomic.Value(usize)`, with the
 values `0` running, `1` done, `2` the off-fiber driver waiting, or a `*Fiber`. The awaiter does

@@ -29,6 +29,8 @@ exemption recorded in `citadel/protocol/VERSIONING.md`.
 - `futex.Table.wake` no longer takes a `Sched`: it claims each waiter and resumes it on the fiber's
   own carrier, directly from a fiber on that carrier and through that carrier's inbox from any other
   thread or carrier (plan `005` item 7). With one carrier nothing changes.
+- `futex.Table.timeout` and `cancel_wait` end a wait through the same claim as `wake` and assert
+  that they run on the fiber's home carrier.
 
 ## [0.5.0] - 2026-10-27
 

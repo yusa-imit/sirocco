@@ -37,12 +37,15 @@
 //! Threads: `Io` is thread-safe, so any thread holding `rt.io()` may call `futexWake` (a
 //! `Mutex.unlock` from a user thread). A small spinlock (`Table.acquire`) guards the list and the
 //! counters; critical sections are bounded by `waiters_max`, take no clock reading and make no
-//! syscall. A wake inside a fiber (the carrier) unparks directly. A wake from any other thread,
-//! or from the carrier outside `run`, removes the waiters under the lock and then hands each to
-//! `Sched.unpark_foreign`, which bumps the inbox word so an idle carrier wakes. The comparison
-//! with `expected` is made under the same lock as the enqueue, so a value change followed by a
-//! wake from another thread cannot slip between the two. `futexWait` itself is fiber code and
-//! so runs on the carrier; its cancel state, like every task's, is carrier-only.
+//! syscall. Each waiter is resumed on its home carrier (`Fiber.home`): a wake inside a fiber of
+//! that carrier unparks directly. A wake from any other thread or carrier, or from a carrier
+//! outside `run`, removes the waiters under the lock and then hands each to
+//! `home.unpark_foreign`, which bumps the inbox word so an idle carrier wakes. The waker claims
+//! each waiter (`Sched.claim`) while it holds the lock, as do `timeout` and `cancel_wait`, so a
+//! wake, a timeout and a cancel cannot all resume one fiber. The comparison with `expected` is
+//! made under the same lock as the enqueue, so a value change followed by a wake from another
+//! thread cannot slip between the two. `futexWait` itself is fiber code and so runs on its home
+//! carrier; its cancel state, like every task's, is carrier-only.
 
 const std = @import("std");
 const stdx = @import("stdx.zig");
@@ -201,18 +204,20 @@ pub const Table = struct {
 
     /// The wheel node of `fiber` fired: if it still waits, takes it out of the table and makes it
     /// runnable with outcome `.timed_out`. A no-op when a wake or cancel ended the wait first.
-    /// Precondition: carrier thread.
+    /// Preconditions: the thread of `sched`, which is `fiber.home` (the wheel is local to it).
     pub fn timeout(table: *Table, sched: *Sched, fiber: *Fiber) void {
+        assert(fiber.home == sched);
         table.acquire();
         defer table.release();
 
         assert(table.waiting <= table.waiters_max);
-        // A wake or cancel that came first set another outcome and made the fiber ready (or it
+        // A wake or cancel that came first holds another outcome and made the fiber ready (or it
         // still runs toward its park); its node stays linked until it runs again.
         if (fiber.wait.outcome != .waiting) return;
         assert(fiber.state == .parked);
         table.remove(fiber);
-        fiber.wait.outcome = .timed_out;
+        // Every other claimant of a futex wait holds this lock, so the claim cannot be lost.
+        assert_always(Sched.claim(fiber, .timed_out));
         sched.unpark(fiber);
     }
 };
@@ -220,8 +225,9 @@ pub const Table = struct {
 /// A cancelation request reached `fiber` while it was parked in `futexWait` (or `sleep`, which
 /// `sleep.cancel` handles): take it out of the table and make it runnable. A no-op when it was
 /// already woken or timed out this turn (it has not run yet; the request stays pending for its
-/// next cancelation point).
+/// next cancelation point). Preconditions: the thread of `sched`, which is `fiber.home`.
 pub fn cancel_wait(table: *Table, sched: *Sched, fiber: *Fiber) void {
+    assert(fiber.home == sched);
     if (fiber.wait.sleeping) return sleep.cancel(sched, fiber);
 
     table.acquire();
@@ -231,7 +237,8 @@ pub fn cancel_wait(table: *Table, sched: *Sched, fiber: *Fiber) void {
     if (fiber.wait.outcome != .waiting) return;
     assert(fiber.state == .parked);
     table.remove(fiber);
-    fiber.wait.outcome = .canceled;
+    // Every other claimant of a futex wait holds this lock, so the claim cannot be lost.
+    assert_always(Sched.claim(fiber, .canceled));
     sched.unpark(fiber);
 }
 
