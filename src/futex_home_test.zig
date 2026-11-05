@@ -126,6 +126,83 @@ fn entry_cancel(arg: ?*anyopaque) void {
     futex.cancel_wait(&case.table, case.home, case.fiber.load(.acquire).?);
 }
 
+/// Runs as a fiber on the waiter's home carrier, so the waiter is parked or ready, never running.
+/// Wakes first, then fires the expiry of the same waiter: the late timeout must be a no-op.
+fn entry_wake_then_timeout(arg: ?*anyopaque) void {
+    const case = case_of(arg);
+    const fiber = case.fiber.load(.acquire).?;
+    const count = case.table.wake(case.io, @intFromPtr(&case.word), 1);
+    assert(fiber.wait.outcome == .woken);
+    futex.Table.timeout(&case.table, case.home, fiber);
+    assert(fiber.wait.outcome == .woken);
+    case.woken.store(count, .release);
+}
+
+/// The reverse order: the expiry claims the waiter, then the late wake finds nobody to wake.
+fn entry_timeout_then_wake(arg: ?*anyopaque) void {
+    const case = case_of(arg);
+    const fiber = case.fiber.load(.acquire).?;
+    futex.Table.timeout(&case.table, case.home, fiber);
+    assert(fiber.wait.outcome == .timed_out);
+    const count = case.table.wake(case.io, @intFromPtr(&case.word), 1);
+    assert(fiber.wait.outcome == .timed_out);
+    case.woken.store(count + 100, .release);
+}
+
+test "a timeout that fires after a wake leaves the woken outcome" {
+    if (!Sched.supported) return error.SkipZigTest;
+    const io = std.testing.io;
+    var home: Peer = undefined;
+    try home.start(io);
+    var case = case_make(io, &home.sched);
+    var waiter: Mail = .init(entry_wait, &case);
+    var racer: Mail = .init(entry_wake_then_timeout, &case);
+
+    mail.post(&home.sched, io, &waiter);
+    spin_until_queued(&case) catch |err| {
+        abandon(&case, &.{&home});
+        return err;
+    };
+    mail.post(&home.sched, io, &racer);
+    spin_until_done(&case) catch |err| {
+        abandon(&case, &.{&home});
+        return err;
+    };
+    home.finish(io);
+
+    try std.testing.expectEqual(@as(u32, 1), case.woken.load(.acquire));
+    try std.testing.expectEqual(Sched.WaitOutcome.woken, case.outcome);
+    try std.testing.expect(case.resumed_on_home);
+    try std.testing.expectEqual(@as(u32, 0), case.table.waiting_count());
+}
+
+test "a wake that comes after a timeout finds no waiter and leaves the timed out outcome" {
+    if (!Sched.supported) return error.SkipZigTest;
+    const io = std.testing.io;
+    var home: Peer = undefined;
+    try home.start(io);
+    var case = case_make(io, &home.sched);
+    var waiter: Mail = .init(entry_wait, &case);
+    var racer: Mail = .init(entry_timeout_then_wake, &case);
+
+    mail.post(&home.sched, io, &waiter);
+    spin_until_queued(&case) catch |err| {
+        abandon(&case, &.{&home});
+        return err;
+    };
+    mail.post(&home.sched, io, &racer);
+    spin_until_done(&case) catch |err| {
+        abandon(&case, &.{&home});
+        return err;
+    };
+    home.finish(io);
+
+    try std.testing.expectEqual(@as(u32, 100), case.woken.load(.acquire));
+    try std.testing.expectEqual(Sched.WaitOutcome.timed_out, case.outcome);
+    try std.testing.expect(case.resumed_on_home);
+    try std.testing.expectEqual(@as(u32, 0), case.table.waiting_count());
+}
+
 test "a wake from a thread off every carrier resumes the fiber on its home carrier" {
     if (!Sched.supported) return error.SkipZigTest;
     const io = std.testing.io;
