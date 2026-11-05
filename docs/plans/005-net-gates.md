@@ -64,8 +64,10 @@ and then multi-carrier as plan 005. No consumer pins sirocco yet and zoltraak is
       poller event handlers are in; `src/mail.zig` (`post`, `drain`, and a peer `serve` that runs
       the fibers it is mailed) is in; `Table.wake` claims each waiter (`Sched.claim`) and resumes
       it on `fiber.home` (`src/futex_home_test.zig`); `timeout` and `cancel_wait` claim through
-      `Sched.claim` and assert they run on the fiber's home. The join word, cancel mail, close
-      from another carrier and the model test remain.
+      `Sched.claim` and assert they run on the fiber's home. A future's `Task.done` and
+      `Task.waiter` are one atomic join word (`src/join.zig`): the finisher wakes the awaiter on
+      its home carrier. `GroupRec.waiter` and an atomic `run_until` stop flag wait for the group
+      lock. The cancel mail, close from another carrier and the model test remain.
 - [ ] 8. Placement and stealing, as ADR 0004 decides, for `async`, `concurrent` and
       `groupConcurrent`. Verify: 1000 `concurrent` tasks at 4 carriers spread within the ADR's
       imbalance bound (a counting test). If the ADR adopted stealing, a test shows a carrier

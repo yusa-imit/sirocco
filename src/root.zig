@@ -22,6 +22,7 @@ test {
     _ = @import("sched.zig");
     _ = @import("sched_fiber.zig");
     _ = @import("sched_test.zig");
+    _ = @import("join.zig");
     _ = @import("mail.zig");
     _ = @import("mail_test.zig");
     _ = @import("futex_home_test.zig");

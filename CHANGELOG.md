@@ -9,6 +9,9 @@ exemption recorded in `citadel/protocol/VERSIONING.md`.
 
 ### Changed
 
+- A future's task keeps who awaits it and whether it finished in one atomic join word
+  (`src/join.zig`), so a finisher on one carrier and an awaiter on another cannot miss each
+  other; the finisher wakes a parked awaiter on its home carrier (plan `005` item 7).
 - A batch of only `net_receive`s on registered sockets, awaited on a fiber, now parks on the
   poller and the wheel (one `Waiter` node per operation) instead of sleeping 50 us to 2 ms
   slices with a `recvmsg` sweep per slice; an idle batch makes no syscall until its first
