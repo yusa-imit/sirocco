@@ -170,6 +170,14 @@ local there:
    the mail handler. If the state is `.handled`, the finisher completes as usual. Both of these
    paths run on the home carrier, so the record is freed only after its mail has been consumed.
 
+*As built (plan 005 item 7, `src/cancel_mail.zig`).* The request flag stays home-owned: a
+foreign canceller writes no `Task.cancel`, it only mails (`Task.cancel_slot`, one `Mail` plus
+a join word), and the handler, a fiber started on the home, applies `task_request_cancel` unless
+the task is already done. That check is exact because finishing and the handler both run on the
+home. The use-after-free guard of step 4 is the canceller instead: `settle` waits on the slot's
+join word (a fiber parks, any other thread sleeps in the futex) before `task_free`, so the
+finisher needs no `mail_state`.
+
 `GroupRec` gains `lock: std.atomic.Mutex` over `head`, `pending`, `waiter` and `canceling`, and
 `idle` becomes atomic. `member_finish` unlinks under the lock. `group_request_cancel` walks the
 members under the lock and mails each foreign one.

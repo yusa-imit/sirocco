@@ -9,6 +9,9 @@ exemption recorded in `citadel/protocol/VERSIONING.md`.
 
 ### Changed
 
+- A cancel requested off a task's home carrier is mailed there (`src/cancel_mail.zig`): a fiber
+  on the home applies it, and the canceller waits for that mail before it frees the task record
+  (plan `005` item 7). Nothing places tasks on peers yet, so this path only runs in tests.
 - A future's task keeps who awaits it and whether it finished in one atomic join word
   (`src/join.zig`), so a finisher on one carrier and an awaiter on another cannot miss each
   other; the finisher wakes a parked awaiter on its home carrier (plan `005` item 7).
