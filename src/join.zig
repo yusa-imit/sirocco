@@ -17,6 +17,7 @@ const std = @import("std");
 const stdx = @import("stdx.zig");
 const Sched = @import("sched.zig");
 
+const Io = std.Io;
 const assert = stdx.assert;
 const assert_always = stdx.assert_always;
 
@@ -76,6 +77,18 @@ pub fn finish(word: *Word) Waiter {
         driver => .driver,
         else => .{ .fiber = @ptrFromInt(seen) },
     };
+}
+
+/// Resumes `fiber`, the awaiter `finish` named, on its own carrier: directly when the caller is
+/// a fiber of that carrier, else through its inbox. Any thread. The awaiter may free the word's
+/// owner once resumed, so the owner is not read afterwards.
+pub fn wake_fiber(fiber: *Sched.Fiber, io: Io) void {
+    const home = fiber.home;
+    if (home.in_fiber()) {
+        home.unpark(fiber);
+    } else {
+        home.unpark_foreign(io, fiber);
+    }
 }
 
 const testing = std.testing;

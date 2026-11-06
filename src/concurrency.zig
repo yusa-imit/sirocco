@@ -75,6 +75,7 @@ const carriers = @import("carriers.zig");
 const net = @import("net.zig");
 const concurrency_group = @import("concurrency_group.zig");
 const join = @import("join.zig");
+const cancel_mail = @import("cancel_mail.zig");
 
 const Io = std.Io;
 const assert = stdx.assert;
@@ -84,7 +85,9 @@ const assert_always = stdx.assert_always;
 /// own fiber ends), followed in the same allocation by the copied context and the result storage
 /// (each at its own alignment; a member has no result).
 pub const Task = struct {
+    /// The task's home carrier: its fiber is born, runs and ends there.
     sched: *Sched,
+    rt: *Runtime,
     body: Body,
     /// The group this task is a member of; null for a future's task.
     group: ?*concurrency_group.GroupRec,
@@ -107,6 +110,8 @@ pub const Task = struct {
     /// `cancel` sets `.requested`; the first unprotected `checkCancel` on the task's fiber
     /// acknowledges it; `recancel` re-arms it.
     cancel: CancelState,
+    /// The mail that carries a cancel from another carrier (`src/cancel_mail.zig`).
+    cancel_slot: cancel_mail.Slot,
     protection: Io.CancelProtection,
 
     fn context(task: *Task) *const anyopaque {
@@ -118,7 +123,7 @@ pub const Task = struct {
     }
 };
 
-const CancelState = enum { none, requested, acknowledged };
+pub const CancelState = enum { none, requested, acknowledged };
 
 /// What a task's fiber runs: a future's function (result delivered to `await`) or a group
 /// member's (nobody awaits it; the group counts it down).
@@ -306,7 +311,7 @@ fn slot_cancel(
     assert(rt.sched_state == .ready);
     const task: *Task = @ptrCast(@alignCast(any_future));
     assert(task.cancel == .none); // `cancel` consumes the future: once.
-    task_request_cancel(task);
+    cancel_mail.request(task, rt.baselineIo());
     task_finish(rt, task, result, result_alignment);
 }
 
@@ -323,7 +328,7 @@ pub fn current_task(rt: *Runtime) ?*Task {
     assert(arg != null);
     const task: *Task = @ptrCast(@alignCast(arg.?));
     assert(task.sched == &rt.sched);
-    assert(!task_done(task));
+    assert(!task_is_done(task));
     return task;
 }
 
@@ -353,8 +358,8 @@ pub fn task_acknowledge_cancel(task: *Task) bool {
 /// members itself).
 pub fn task_request_cancel(task: *Task) void {
     assert(task.cancel == .none);
-    if (task.waiting != null) assert(!task_done(task)); // A finished task is no longer parked.
-    if (task.awaiting != null) assert(!task_done(task));
+    if (task.waiting != null) assert(!task_is_done(task)); // A finished task is no longer parked.
+    if (task.awaiting != null) assert(!task_is_done(task));
     task.cancel = .requested;
     if (task.awaiting) |rec| {
         // Protection cannot change while the task is parked, and `group_park` arms `awaiting`
@@ -368,7 +373,7 @@ pub fn task_request_cancel(task: *Task) void {
         return;
     }
     const fiber = task.waiting orelse return;
-    const rt: *Runtime = @fieldParentPtr("sched", task.sched);
+    const rt = task.rt;
     if (fiber.wait.socket != .none) return net.cancel(rt, fiber);
     futex.cancel_wait(&rt.waits, task.sched, fiber);
 }
@@ -377,7 +382,7 @@ pub fn task_request_cancel(task: *Task) void {
 /// unparks the fiber. Protection cannot change while the task is parked, so a protected task is
 /// simply never armed.
 pub fn task_cancel_wake(task: *Task, fiber: ?*Sched.Fiber) void {
-    assert(!task_done(task));
+    assert(!task_is_done(task));
     if (fiber != null) assert(task.waiting == null);
     task.waiting = switch (task.protection) {
         .blocked => null,
@@ -426,6 +431,7 @@ pub fn task_create(
     const task: *Task = @ptrCast(@alignCast(base));
     task.* = .{
         .sched = &rt.sched,
+        .rt = rt,
         .body = body,
         .group = null,
         .prev = null,
@@ -440,6 +446,7 @@ pub fn task_create(
         .alloc_len = alloc_len,
         .alloc_alignment = alignment,
         .cancel = .none,
+        .cancel_slot = .init(),
         .protection = .unblocked,
     };
     assert(context_alignment.check(@intFromPtr(task.context())));
@@ -452,7 +459,7 @@ pub fn task_create(
 /// waiter; a group member leaves its group and frees its own record).
 pub fn task_entry(arg: ?*anyopaque) void {
     const task: *Task = @ptrCast(@alignCast(arg.?));
-    assert(!task_done(task));
+    assert(!task_is_done(task));
     assert(task.sched.in_fiber());
     switch (task.body) {
         .future => |start| {
@@ -469,30 +476,26 @@ pub fn task_entry(arg: ?*anyopaque) void {
 }
 
 /// Whether a future's task has finished (acquire: its result is then visible).
-fn task_done(task: *const Task) bool {
+pub fn task_is_done(task: *const Task) bool {
     return join.is_done(&task.join);
 }
 
 /// Publishes a future's completion and wakes whoever awaits it: a fiber on its home carrier, or
 /// the off-fiber driver, which is stopped through `driver_stop`. Runs on the task's own fiber.
+/// The awaiter may free the record the moment it is woken, so the record is not read afterwards.
 fn task_publish(task: *Task) void {
-    const rt: *Runtime = @fieldParentPtr("sched", task.sched);
-    switch (join.finish(&task.join)) {
+    const rt = task.rt;
+    const waiter = join.finish(&task.join);
+    assert(task_is_done(task));
+    switch (waiter) {
         .none => {},
         .driver => {
+            // The driver is carrier 0's thread; once it sees the flag it may free the record.
             task.driver_stop = true;
-            task.sched.notify(rt.baselineIo());
+            rt.sched.notify(rt.baselineIo());
         },
-        .fiber => |fiber| {
-            const home = fiber.home;
-            if (home.in_fiber()) {
-                home.unpark(fiber);
-            } else {
-                home.unpark_foreign(rt.baselineIo(), fiber);
-            }
-        },
+        .fiber => |fiber| join.wake_fiber(fiber, rt.baselineIo()),
     }
-    assert(task_done(task));
 }
 
 /// Waits for `task` (parking inside a fiber, driving the scheduler outside one), moves the result
@@ -514,7 +517,9 @@ fn task_finish(
             rt.sched.run_until(rt.baselineIo(), &task.driver_stop);
         }
     }
-    assert_always(task_done(task));
+    assert_always(task_is_done(task));
+    // A mailed cancel holds a pointer into the record until its home has read it.
+    cancel_mail.settle(task);
     assert(result_alignment.check(@intFromPtr(task.result())));
     @memcpy(result, @as([*]const u8, @ptrCast(task.result()))[0..task.result_len]);
     task_free(rt, task);
@@ -522,7 +527,7 @@ fn task_finish(
 
 /// Releases a record made by `task_create`. Precondition: nobody waits on it any more.
 pub fn task_free(rt: *Runtime, task: *Task) void {
-    assert(task.sched == &rt.sched);
+    assert(task.rt == rt);
     const base: [*]u8 = @ptrCast(task);
     rt.threaded.allocator.rawFree(base[0..task.alloc_len], task.alloc_alignment, @returnAddress());
 }
@@ -537,7 +542,7 @@ fn slot_crash_handler(userdata: ?*anyopaque) void {
     };
     // `.acknowledged` is Threaded's `.canceled`: already delivered, so lifting protection later
     // does not interrupt the cleanup that follows.
-    assert(!task_done(task));
+    assert(!task_is_done(task));
     task.cancel = .acknowledged;
     task.protection = .blocked;
     assert(task.cancel == .acknowledged);

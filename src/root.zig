@@ -25,6 +25,8 @@ test {
     _ = @import("join.zig");
     _ = @import("mail.zig");
     _ = @import("mail_test.zig");
+    _ = @import("cancel_mail.zig");
+    _ = @import("cancel_mail_test.zig");
     _ = @import("futex_home_test.zig");
     _ = @import("sched_io.zig");
     _ = @import("timer.zig");
