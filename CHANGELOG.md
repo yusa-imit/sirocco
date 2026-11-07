@@ -9,6 +9,10 @@ exemption recorded in `citadel/protocol/VERSIONING.md`.
 
 ### Changed
 
+- Tests pin that a socket closed by a fiber on a peer carrier takes the foreign-close path: the
+  waiters parked on carrier 0 wake with `.closing` and the last one closes the fd
+  (`src/net_close_peer_test.zig`, plan `005` item 7). No code changed: the registry is shared
+  and only carrier 0 arms the poller until placement lands.
 - A cancel requested off a task's home carrier is mailed there (`src/cancel_mail.zig`): a fiber
   on the home applies it, and the canceller waits for that mail before it frees the task record
   (plan `005` item 7). Nothing places tasks on peers yet, so this path only runs in tests.
