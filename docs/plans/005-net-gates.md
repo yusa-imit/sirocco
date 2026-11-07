@@ -70,7 +70,10 @@ and then multi-carrier as plan 005. No consumer pins sirocco yet and zoltraak is
       foreign cancel is mailed to the home, which applies it unless the task finished, and the
       canceller `settle`s before it frees the record (`src/cancel_mail_test.zig`).
       `GroupRec.waiter`, group cancel from another carrier and an atomic `run_until` stop
-      flag wait for the group lock. Close from another carrier and the model test remain.
+      flag wait for the group lock. A close from a fiber on a peer carrier is pinned by
+      `src/net_close_peer_test.zig` (it takes the foreign-close path; only carrier 0 arms the
+      poller, so the per-slot lock and armed mask of ADR 0004 section 4 come with item 8's
+      placement). The model test remains.
 - [ ] 8. Placement and stealing, as ADR 0004 decides, for `async`, `concurrent` and
       `groupConcurrent`. Verify: 1000 `concurrent` tasks at 4 carriers spread within the ADR's
       imbalance bound (a counting test). If the ADR adopted stealing, a test shows a carrier
