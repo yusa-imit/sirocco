@@ -75,7 +75,10 @@ and then multi-carrier as plan 005. No consumer pins sirocco yet and zoltraak is
       mail per member), an awaiter on a peer and an atomic `run_until` stop flag remain. A close
       from a fiber on a peer carrier is pinned by `src/net_close_peer_test.zig` (it takes the
       foreign-close path; only carrier 0 arms the poller, so the per-slot lock and armed mask of
-      ADR 0004 section 4 come with item 8's placement). The model test remains.
+      ADR 0004 section 4 come with item 8's placement). The seeded 4-carrier model test for
+      futex wake and cancel is in (`src/futex_model_peers_test.zig`, 16 fixed seeds: waiters
+      homed on peers 1..3, released from the test thread or a peer fiber, or canceled on their
+      home, checked against the plan); the same for `await` and group waits remains.
 - [ ] 8. Placement and stealing, as ADR 0004 decides, for `async`, `concurrent` and
       `groupConcurrent`. Verify: 1000 `concurrent` tasks at 4 carriers spread within the ADR's
       imbalance bound (a counting test). If the ADR adopted stealing, a test shows a carrier
