@@ -12,7 +12,9 @@
 //! Invariants: `GroupRec.pending` equals the length of the `head` list and `idle` is exactly
 //! `pending == 0`; a group is awaited or canceled once, by one fiber that is not one of its
 //! members; a group awaiter parks at most `parks_max` times; the token is null from `group_finish`
-//! on. Everything runs on the carrier thread, as in `src/concurrency.zig`.
+//! on. Members are created and canceled on the awaiter's carrier, as in `src/concurrency.zig`; a
+//! member may end on another carrier: the list, `pending`, `idle` and `waiter` change under
+//! `GroupRec.lock`, and the last member wakes the awaiter on its home (`join.wake_fiber`).
 //!
 //! Allocation: the first member of a group allocates one `GroupRec` (and every member one task
 //! record, `concurrency.task_create`) from the allocator `Runtime` gave `Io.Threaded`; the record
@@ -23,6 +25,7 @@ const stdx = @import("stdx.zig");
 const Sched = @import("sched.zig");
 const Runtime = @import("runtime.zig");
 const concurrency = @import("concurrency.zig");
+const join = @import("join.zig");
 
 const Io = std.Io;
 const assert = stdx.assert;
@@ -33,6 +36,10 @@ const Task = concurrency.Task;
 /// `groupAsync` that starts a fiber, freed by `groupAwait`/`groupCancel`, which also null the
 /// token. `Io.Group.state` is not used.
 pub const GroupRec = struct {
+    /// Spinlock (`rec_acquire`) over `head`, the members' links, `pending`, `idle` and `waiter`:
+    /// a member finishes on its own carrier while the awaiter is on another.
+    lock: u32,
+    /// The awaiter's carrier.
     sched: *Sched,
     /// Live (not yet finished) members, most recent first; `pending` of them.
     head: ?*Task,
@@ -45,6 +52,70 @@ pub const GroupRec = struct {
     /// are born requested.
     canceling: bool,
 };
+
+/// Bound on the spins for the record lock: its critical sections are a few dozen steps.
+const spin_max: u32 = 1 << 24;
+
+/// A record for a group whose awaiter runs on `sched`, with no members.
+pub fn rec_init(sched: *Sched) GroupRec {
+    return .{
+        .lock = 0,
+        .sched = sched,
+        .head = null,
+        .pending = 0,
+        .idle = true,
+        .waiter = null,
+        .canceling = false,
+    };
+}
+
+pub fn rec_acquire(rec: *GroupRec) void {
+    for (0..spin_max) |spin| {
+        const seen = @cmpxchgWeak(u32, &rec.lock, 0, 1, .acquire, .monotonic);
+        if (seen == null) return;
+        if (spin % 256 == 255) std.Thread.yield() catch {};
+        std.atomic.spinLoopHint();
+    }
+    assert_always(false); // A critical section is a few dozen steps: the lock leaked.
+}
+
+pub fn rec_release(rec: *GroupRec) void {
+    assert(@atomicLoad(u32, &rec.lock, .monotonic) == 1);
+    @atomicStore(u32, &rec.lock, 0, .release);
+}
+
+/// Whether every member finished. An acquire load: what the last member wrote is then visible.
+pub fn rec_is_idle(rec: *const GroupRec) bool {
+    return @atomicLoad(bool, &rec.idle, .acquire);
+}
+
+/// Takes the parked awaiter, if any, out of the record: its wake belongs to the caller. Any
+/// thread.
+pub fn rec_take_waiter(rec: *GroupRec) ?*Sched.Fiber {
+    rec_acquire(rec);
+    defer rec_release(rec);
+
+    const waiter = rec.waiter;
+    rec.waiter = null;
+    return waiter;
+}
+
+/// Adds `task` (a member, `task.group` unset) to the live list. Any thread.
+pub fn rec_link(rec: *GroupRec, task: *Task) void {
+    assert(task.group == null);
+    rec_acquire(rec);
+    defer rec_release(rec);
+
+    task.group = rec;
+    task.next = rec.head;
+    task.prev = null;
+    if (rec.head) |head| head.prev = task;
+    rec.head = task;
+    rec.pending += 1;
+    @atomicStore(bool, &rec.idle, false, .release);
+    assert(rec.pending > 0);
+    assert(!rec.idle);
+}
 
 /// A group awaiter parks at most twice: once until a cancel or the last member, and once more for
 /// the last member after a cancel (a second request cannot arrive: the first is delivered).
@@ -87,12 +158,7 @@ fn group_member_start(
         return false;
     };
     assert(rec.sched == &rt.sched);
-    task.group = rec;
-    task.next = rec.head;
-    if (rec.head) |head| head.prev = task;
-    rec.head = task;
-    rec.pending += 1;
-    rec.idle = false;
+    rec_link(rec, task);
     if (rec.canceling) task.cancel = .requested;
     const fiber = rt.sched.spawn(concurrency.task_entry, task) catch |err| switch (err) {
         // `has_free_fiber` held on this thread a moment ago and nothing ran in between.
@@ -109,14 +175,7 @@ fn group_rec_ensure(rt: *Runtime, group: *Io.Group) ?*GroupRec {
     const rec = rt.threaded.allocator.create(GroupRec) catch |err| switch (err) {
         error.OutOfMemory => return null,
     };
-    rec.* = .{
-        .sched = &rt.sched,
-        .head = null,
-        .pending = 0,
-        .idle = true,
-        .waiter = null,
-        .canceling = false,
-    };
+    rec.* = rec_init(&rt.sched);
     group.token.store(rec, .release);
     assert(rec.idle);
     assert(rec.pending == 0);
@@ -170,11 +229,17 @@ pub fn slot_group_cancel(userdata: ?*anyopaque, group: *Io.Group, token: *anyopa
 }
 
 fn group_request_cancel(rec: *GroupRec) void {
+    // Members are canceled in place, so they run on the awaiter's carrier until the cancel mail
+    // reaches groups (plan 005 item 7). The lock keeps a member from finishing under the walk.
+    rec_acquire(rec);
+    defer rec_release(rec);
+
     assert((rec.head == null) == (rec.pending == 0));
     rec.canceling = true;
     var node = rec.head;
     for (0..rec.pending) |_| {
         const member = node.?;
+        assert(member.sched == rec.sched);
         if (member.cancel == .none) concurrency.task_request_cancel(member);
         node = member.next;
     }
@@ -189,7 +254,7 @@ fn group_finish(rt: *Runtime, group: *Io.Group, rec: *GroupRec, wait: GroupWait)
     // A member waiting for its own group could never be woken: the count never reaches zero.
     if (concurrency.current_task(rt)) |task| assert_always(task.group != rec);
     var canceled = false;
-    if (!rec.idle) {
+    if (!rec_is_idle(rec)) {
         if (rt.sched.in_fiber()) {
             canceled = group_park(rt, rec, wait);
         } else {
@@ -197,7 +262,7 @@ fn group_finish(rt: *Runtime, group: *Io.Group, rec: *GroupRec, wait: GroupWait)
             rt.sched.run_until(rt.baselineIo(), &rec.idle);
         }
     }
-    assert_always(rec.idle);
+    assert_always(rec_is_idle(rec));
     assert(rec.pending == 0);
     assert(rec.head == null);
     assert(rec.waiter == null);
@@ -226,9 +291,17 @@ fn group_park(rt: *Runtime, rec: *GroupRec, wait: GroupWait) bool {
     }
     var canceled = false;
     for (0..parks_max) |_| {
+        // The idle check and the registration share the lock, so the last member either sees the
+        // waiter and wakes it, or finished first and the awaiter does not park.
+        rec_acquire(rec);
+        if (rec.idle) {
+            rec_release(rec);
+            break;
+        }
         rec.waiter = rt.sched.current_fiber();
+        rec_release(rec);
         rt.sched.park();
-        if (rec.idle) break;
+        if (rec_is_idle(rec)) break;
         // Woken by a cancel (a finished group wakes only with `idle` set).
         assert(task.awaiting != null);
         assert(!canceled);
@@ -237,7 +310,7 @@ fn group_park(rt: *Runtime, rec: *GroupRec, wait: GroupWait) bool {
         group_request_cancel(rec);
         task.awaiting = null; // A second request cannot arrive: the flag is already delivered.
     }
-    assert(rec.idle);
+    assert(rec_is_idle(rec));
     return canceled;
 }
 
@@ -246,17 +319,26 @@ fn group_park(rt: *Runtime, rec: *GroupRec, wait: GroupWait) bool {
 /// the caller.
 pub fn member_finish(task: *Task) void {
     const rec = task.group.?;
-    const rt: *Runtime = @fieldParentPtr("sched", task.sched);
-    assert(rec.pending > 0);
-    assert(!rec.idle);
-    if (task.prev) |prev| prev.next = task.next else rec.head = task.next;
-    if (task.next) |next| next.prev = task.prev;
-    concurrency.task_free(rt, task);
-    rec.pending -= 1;
-    if (rec.pending > 0) return;
-    rec.idle = true;
-    if (rec.waiter) |waiter| {
-        rec.waiter = null;
-        rec.sched.unpark(waiter);
+    const rt = task.rt;
+    var waiter: ?*Sched.Fiber = null;
+    {
+        rec_acquire(rec);
+        defer rec_release(rec);
+
+        assert(rec.pending > 0);
+        assert(!rec.idle);
+        if (task.prev) |prev| prev.next = task.next else rec.head = task.next;
+        if (task.next) |next| next.prev = task.prev;
+        rec.pending -= 1;
+        if (rec.pending == 0) {
+            assert(rec.head == null);
+            waiter = rec.waiter;
+            rec.waiter = null;
+            @atomicStore(bool, &rec.idle, true, .release);
+        }
     }
+    // Unlinked, so nobody reaches the record any more. Past the unlock `rec` belongs to the
+    // awaiter, which may free it once idle, so only `waiter` is used from here.
+    concurrency.task_free(rt, task);
+    if (waiter) |fiber| join.wake_fiber(fiber, rt.baselineIo());
 }
