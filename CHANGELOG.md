@@ -9,6 +9,10 @@ exemption recorded in `citadel/protocol/VERSIONING.md`.
 
 ### Changed
 
+- A group's member list, count, idle flag and awaiter are guarded by a spinlock
+  (`GroupRec.lock`), so a member may end on a peer carrier: the last one wakes the awaiter on its
+  home carrier (`src/group_peer_test.zig`, plan `005` item 7). Members are still created and
+  canceled on the awaiter's carrier.
 - Tests pin that a socket closed by a fiber on a peer carrier takes the foreign-close path: the
   waiters parked on carrier 0 wake with `.closing` and the last one closes the fd
   (`src/net_close_peer_test.zig`, plan `005` item 7). No code changed: the registry is shared

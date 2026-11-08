@@ -29,6 +29,7 @@ test {
     _ = @import("cancel_mail_test.zig");
     _ = @import("futex_home_test.zig");
     _ = @import("net_close_peer_test.zig");
+    _ = @import("group_peer_test.zig");
     _ = @import("sched_io.zig");
     _ = @import("timer.zig");
     _ = @import("offload.zig");

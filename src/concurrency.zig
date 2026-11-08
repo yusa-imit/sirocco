@@ -366,9 +366,8 @@ pub fn task_request_cancel(task: *Task) void {
         // only for an unprotected awaiter. The wake is one-shot: a finished group already woke it.
         assert(task.waiting == null);
         assert(task.protection == .unblocked);
-        if (rec.waiter) |waiter| {
-            rec.waiter = null;
-            task.sched.unpark(waiter);
+        if (concurrency_group.rec_take_waiter(rec)) |waiter| {
+            join.wake_fiber(waiter, task.rt.baselineIo());
         }
         return;
     }
