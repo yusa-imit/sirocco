@@ -9,6 +9,8 @@ exemption recorded in `citadel/protocol/VERSIONING.md`.
 
 ### Changed
 
+- The differential suite also runs with 4 carriers (`build.zig`: 1, 2 and 4), so three idle peer
+  threads sit under every slot group on each backend (plan `005` item 7).
 - A group's member list, count, idle flag and awaiter are guarded by a spinlock
   (`GroupRec.lock`), so a member may end on a peer carrier: the last one wakes the awaiter on its
   home carrier (`src/group_peer_test.zig`, plan `005` item 7). Members are still created and
