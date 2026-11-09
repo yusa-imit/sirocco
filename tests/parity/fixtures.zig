@@ -4,7 +4,7 @@
 //! is written once and a later item that runs the suite a second time under `.fail` changes one
 //! call, not every test. The backend comes from the build: `build.zig` compiles this suite once
 //! per backend (`parity_config.backend`: `.threaded` always, `.kqueue` on Darwin, `.epoll` on
-//! Linux), and once per carrier count (`parity_config.carriers`, 1 and 2), so one source tree is
+//! Linux), and once per carrier count (`parity_config.carriers`, 1, 2 and 4), so one source tree is
 //! checked under every idle path and with and without idle peer carriers. Ownership: the caller
 //! `deinit`s the returned runtime; it must not move after its first `io()`.
 
@@ -19,7 +19,7 @@ pub const backend: Runtime.Backend = std.meta.stringToEnum(
 ) orelse @compileError("parity_config.backend names no Runtime.Backend");
 
 /// Carriers every runtime of this build of the suite has (`parity_config.carriers`): the suite
-/// runs at 1 and at 2, so the peers' start and teardown sit under every slot group.
+/// runs at 1, 2 and 4, so the peers' start and teardown sit under every slot group.
 pub const carriers: u32 = parity_config.carriers;
 
 /// Allocator calls `Runtime.init` makes: the peers block, none at one carrier.

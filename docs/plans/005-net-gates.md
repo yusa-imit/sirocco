@@ -78,7 +78,8 @@ and then multi-carrier as plan 005. No consumer pins sirocco yet and zoltraak is
       ADR 0004 section 4 come with item 8's placement). The seeded 4-carrier model test for
       futex wake and cancel is in (`src/futex_model_peers_test.zig`, 16 fixed seeds: waiters
       homed on peers 1..3, released from the test thread or a peer fiber, or canceled on their
-      home, checked against the plan); the same for `await` and group waits remains.
+      home, checked against the plan); the same for `await` and group waits remains. The parity suite also builds at 4
+      carriers (`build.zig`: 1, 2 and 4) and passes on every backend.
 - [ ] 8. Placement and stealing, as ADR 0004 decides, for `async`, `concurrent` and
       `groupConcurrent`. Verify: 1000 `concurrent` tasks at 4 carriers spread within the ADR's
       imbalance bound (a counting test). If the ADR adopted stealing, a test shows a carrier

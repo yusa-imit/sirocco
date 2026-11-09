@@ -70,8 +70,9 @@ pub fn build(b: *std.Build) void {
         if (!std.mem.eql(u8, backend, "threaded") and arch != .aarch64 and arch != .x86_64) {
             continue;
         }
-        // Peer carriers idle until placement lands; 2 puts one peer thread under every test.
-        const parity_carriers = [_]u32{ 1, 2 };
+        // Peer carriers idle until placement lands; 2 and 4 put one and three peer threads under
+        // every test.
+        const parity_carriers = [_]u32{ 1, 2, 4 };
         for (parity_carriers) |carriers| {
             const config = b.addOptions();
             config.addOption([]const u8, "backend", backend);
