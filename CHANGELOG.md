@@ -9,6 +9,10 @@ exemption recorded in `citadel/protocol/VERSIONING.md`.
 
 ### Changed
 
+- A seeded model test runs `await` and cancel of tasks homed on peers 1..3 of four carriers
+  (`src/await_model_peers_test.zig`, 16 fixed seeds): awaiters on the test thread (before or after
+  the finish) or on a peer fiber, cancelers on the test thread or a peer fiber, checked against the
+  plan (plan `005` item 7).
 - The differential suite also runs with 4 carriers (`build.zig`: 1, 2 and 4), so three idle peer
   threads sit under every slot group on each backend (plan `005` item 7).
 - A group's member list, count, idle flag and awaiter are guarded by a spinlock
