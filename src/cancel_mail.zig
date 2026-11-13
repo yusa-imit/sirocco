@@ -10,8 +10,9 @@
 //!
 //! Invariants: a task is canceled once, so a slot posts at most one mail. The handler skips the
 //! request when the task is already done (it ran to completion first), which is decided on the
-//! home, where finishing and canceling cannot interleave. The handler's last touch of the task is
-//! the wake of the settler.
+//! home, where finishing and canceling cannot interleave. A group member is its own settler: it
+//! settles on its home before it frees its record (`src/concurrency_group.zig`). The handler's
+//! last touch of the task is the wake of the settler.
 //!
 //! Allocation: none; the mail and join word are part of the `Task`. Threads: `request` and
 //! `settle` any thread (the canceler's), the handler on the task's home carrier.
@@ -100,7 +101,11 @@ fn handle(arg: ?*anyopaque) void {
     const rt = task.rt;
     assert(task.sched.in_fiber());
     assert(task.cancel_slot.posted);
-    if (!concurrency.task_is_done(task)) concurrency.task_request_cancel(task);
+    // A group member never finishes its join word, so it is also skipped once it has a cancel
+    // state of its own (born requested, or acknowledged by the crash handler).
+    if (!concurrency.task_is_done(task) and task.cancel == .none) {
+        concurrency.task_request_cancel(task);
+    }
     const waiter = join.finish(&task.cancel_slot.join);
     const io = rt.baselineIo();
     switch (waiter) {

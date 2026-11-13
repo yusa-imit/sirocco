@@ -245,6 +245,8 @@ fn group_request_cancel(rec: *GroupRec) void {
     for (0..rec.pending) |_| {
         const member = node.?;
         if (cancel_mail.is_remote(member)) {
+            // `posted` is the once-only flag here, as `cancel == .none` is for the local branch.
+            assert(rec.canceling);
             if (!member.cancel_slot.posted) cancel_mail.request(member, member.rt.baselineIo());
         } else {
             assert(member.sched == rec.sched);
@@ -351,7 +353,10 @@ pub fn member_finish(task: *Task) void {
     }
     // Unlinked, so nobody reaches the record any more. Past the unlock `rec` belongs to the
     // awaiter, which may free it once idle, so only `waiter` is used from here. A mailed cancel
-    // holds a pointer into the task until its home has read it.
+    // holds a pointer into the task until its home has read it. The group may already read as
+    // idle, so a canceler can return while this last member still settles; its fiber ends before
+    // the carriers halt. The handler needs a free fiber on the home, so a home whose fibers all
+    // wait here would stall: placement (item 8) must keep one spare.
     if (mailed) cancel_mail.settle(task);
     concurrency.task_free(rt, task);
     if (waiter) |fiber| join.wake_fiber(fiber, rt.baselineIo());
