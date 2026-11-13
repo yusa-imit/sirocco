@@ -12,9 +12,11 @@
 //! Invariants: `GroupRec.pending` equals the length of the `head` list and `idle` is exactly
 //! `pending == 0`; a group is awaited or canceled once, by one fiber that is not one of its
 //! members; a group awaiter parks at most `parks_max` times; the token is null from `group_finish`
-//! on. Members are created and canceled on the awaiter's carrier, as in `src/concurrency.zig`; a
-//! member may end on another carrier: the list, `pending`, `idle` and `waiter` change under
-//! `GroupRec.lock`, and the last member wakes the awaiter on its home (`join.wake_fiber`).
+//! on. Members are created on the awaiter's carrier, as in `src/concurrency.zig`; a cancel reaches
+//! one homed elsewhere as a mail (`src/cancel_mail.zig`), which the member settles before it frees
+//! its record; a member may end on another carrier: the list, `pending`, `idle` and `waiter`
+//! change under `GroupRec.lock`, and the last member wakes the awaiter on its home
+//! (`join.wake_fiber`).
 //!
 //! Allocation: the first member of a group allocates one `GroupRec` (and every member one task
 //! record, `concurrency.task_create`) from the allocator `Runtime` gave `Io.Threaded`; the record
@@ -26,6 +28,7 @@ const Sched = @import("sched.zig");
 const Runtime = @import("runtime.zig");
 const concurrency = @import("concurrency.zig");
 const join = @import("join.zig");
+const cancel_mail = @import("cancel_mail.zig");
 
 const Io = std.Io;
 const assert = stdx.assert;
@@ -229,8 +232,10 @@ pub fn slot_group_cancel(userdata: ?*anyopaque, group: *Io.Group, token: *anyopa
 }
 
 fn group_request_cancel(rec: *GroupRec) void {
-    // Members are canceled in place, so they run on the awaiter's carrier until the cancel mail
-    // reaches groups (plan 005 item 7). The lock keeps a member from finishing under the walk.
+    // A member on the awaiter's carrier is canceled in place; one homed elsewhere gets a cancel
+    // mail, which its home applies (`src/cancel_mail.zig`). The lock keeps a member from leaving
+    // the list under the walk, and a mailed member settles before it frees its record
+    // (`member_finish`), so the mail never outlives the record.
     rec_acquire(rec);
     defer rec_release(rec);
 
@@ -239,8 +244,14 @@ fn group_request_cancel(rec: *GroupRec) void {
     var node = rec.head;
     for (0..rec.pending) |_| {
         const member = node.?;
-        assert(member.sched == rec.sched);
-        if (member.cancel == .none) concurrency.task_request_cancel(member);
+        if (cancel_mail.is_remote(member)) {
+            // `posted` is the once-only flag here, as `cancel == .none` is for the local branch.
+            assert(rec.canceling);
+            if (!member.cancel_slot.posted) cancel_mail.request(member, member.rt.baselineIo());
+        } else {
+            assert(member.sched == rec.sched);
+            if (member.cancel == .none) concurrency.task_request_cancel(member);
+        }
         node = member.next;
     }
     assert(node == null);
@@ -321,6 +332,7 @@ pub fn member_finish(task: *Task) void {
     const rec = task.group.?;
     const rt = task.rt;
     var waiter: ?*Sched.Fiber = null;
+    var mailed = false;
     {
         rec_acquire(rec);
         defer rec_release(rec);
@@ -330,6 +342,8 @@ pub fn member_finish(task: *Task) void {
         if (task.prev) |prev| prev.next = task.next else rec.head = task.next;
         if (task.next) |next| next.prev = task.prev;
         rec.pending -= 1;
+        // Read under the lock: a canceler posts only while the task is linked.
+        mailed = task.cancel_slot.posted;
         if (rec.pending == 0) {
             assert(rec.head == null);
             waiter = rec.waiter;
@@ -338,7 +352,12 @@ pub fn member_finish(task: *Task) void {
         }
     }
     // Unlinked, so nobody reaches the record any more. Past the unlock `rec` belongs to the
-    // awaiter, which may free it once idle, so only `waiter` is used from here.
+    // awaiter, which may free it once idle, so only `waiter` is used from here. A mailed cancel
+    // holds a pointer into the task until its home has read it. The group may already read as
+    // idle, so a canceler can return while this last member still settles; its fiber ends before
+    // the carriers halt. The handler needs a free fiber on the home, so a home whose fibers all
+    // wait here would stall: placement (item 8) must keep one spare.
+    if (mailed) cancel_mail.settle(task);
     concurrency.task_free(rt, task);
     if (waiter) |fiber| join.wake_fiber(fiber, rt.baselineIo());
 }
