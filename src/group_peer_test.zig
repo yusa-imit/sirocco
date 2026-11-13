@@ -29,11 +29,18 @@ const Shared = struct {
     finished: std.atomic.Value(u32),
     /// Members that ran on a carrier other than the awaiter's.
     off_awaiter: std.atomic.Value(u32),
+    /// Members that acknowledged a cancel request.
+    canceled: std.atomic.Value(u32),
 };
 
 const Member = struct {
     shared: *Shared,
     yields: u32,
+    /// The member's own record, so its body can acknowledge a cancel (`current_task` is carrier
+    /// 0 only).
+    task: ?*Task,
+    /// The member runs until a cancel is acknowledged, ignoring `Shared.go`.
+    wait_cancel: bool,
 };
 
 const Fixture = struct {
@@ -54,7 +61,7 @@ fn options() Runtime.Options {
         .environ = .empty,
         .argv0 = .empty,
         .carriers = 4,
-        .fibers_max = 4,
+        .fibers_max = 32, // A cancel handler needs a free fiber beside every parked member.
         .batch_ops_max = 8,
         .fiber_stack_size = 128 * 1024,
         .offload_threads = 2,
@@ -67,6 +74,17 @@ fn member_body(context: *const anyopaque) void {
     const member = @as(*const *Member, @ptrCast(@alignCast(context))).*;
     const here = Sched.here().?;
     if (here != member.shared.awaiter) _ = member.shared.off_awaiter.fetchAdd(1, .monotonic);
+    if (member.wait_cancel) {
+        for (0..spin_max) |_| {
+            if (concurrency.task_acknowledge_cancel(member.task.?)) {
+                _ = member.shared.canceled.fetchAdd(1, .monotonic);
+                break;
+            }
+            here.yield();
+        }
+        _ = member.shared.finished.fetchAdd(1, .release);
+        return;
+    }
     for (0..spin_max) |_| {
         if (member.shared.go.load(.acquire)) break;
         here.yield();
@@ -76,7 +94,13 @@ fn member_body(context: *const anyopaque) void {
 }
 
 /// Fills `fixture` with `count` members linked to its record, homed round-robin on the peers.
-fn fixture_init(fixture: *Fixture, rt: *Runtime, seed: u64, count: u32) !void {
+fn fixture_init(
+    fixture: *Fixture,
+    rt: *Runtime,
+    seed: u64,
+    count: u32,
+    cancel_every: u32,
+) !void {
     assert(count <= members_max);
     var prng = std.Random.DefaultPrng.init(seed);
     fixture.rt = rt;
@@ -87,6 +111,7 @@ fn fixture_init(fixture: *Fixture, rt: *Runtime, seed: u64, count: u32) !void {
         .go = .init(false),
         .finished = .init(0),
         .off_awaiter = .init(0),
+        .canceled = .init(0),
     };
     fixture.count = 0;
     for (0..count) |index| {
@@ -94,12 +119,15 @@ fn fixture_init(fixture: *Fixture, rt: *Runtime, seed: u64, count: u32) !void {
         member.* = .{
             .shared = &fixture.shared,
             .yields = prng.random().uintLessThan(u32, yields_max),
+            .task = null,
+            .wait_cancel = cancel_every != 0 and index % cancel_every == 0,
         };
         const context = std.mem.asBytes(&member);
         const body: concurrency.Body = .{ .member = member_body };
         const task = concurrency.task_create(rt, 0, .@"1", context, .of(*Member), body) orelse {
             return error.OutOfMemory;
         };
+        member.task = task;
         task.sched = &rt.peers[index % peers_count].sched;
         group.rec_link(fixture.rec, task);
         fixture.tasks[index] = task;
@@ -148,7 +176,7 @@ test "members finishing on three peers empty the list under the lock" {
     defer std.testing.allocator.destroy(fixture);
 
     for ([_]u64{ 1, 2, 3, 4 }) |seed| {
-        try fixture_init(fixture, &rt, seed, members_max);
+        try fixture_init(fixture, &rt, seed, members_max, 0);
         fixture.shared.go.store(true, .release);
         fixture_start(fixture);
         try spin_until_idle(fixture.rec);
@@ -180,7 +208,7 @@ test "the last member finishing on a peer wakes the awaiter on carrier 0" {
     defer std.testing.allocator.destroy(fixture);
 
     for ([_]u64{ 11, 12, 13, 14, 15, 16 }) |seed| {
-        try fixture_init(fixture, &rt, seed, 6 + @as(u32, @intCast(seed % 3)) * 6);
+        try fixture_init(fixture, &rt, seed, 6 + @as(u32, @intCast(seed % 3)) * 6, 0);
         const context = std.mem.asBytes(&fixture);
         const body: concurrency.Body = .{ .future = awaiter_body };
         const alignment: std.mem.Alignment = .of(*Fixture);
@@ -195,5 +223,49 @@ test "the last member finishing on a peer wakes the awaiter on carrier 0" {
         try std.testing.expect(concurrency.task_is_done(awaiter));
         try check_ended(fixture, false);
         concurrency.task_free(&rt, awaiter);
+    }
+}
+
+/// Body of the canceling future on carrier 0: members that wait for it end only through the
+/// cancel mailed to their peers, the rest end by themselves.
+fn canceler_body(context: *const anyopaque, result: *anyopaque) void {
+    _ = result;
+    const fixture = @as(*const *Fixture, @ptrCast(@alignCast(context))).*;
+    var handle: Io.Group = .init;
+    handle.token.store(fixture.rec, .release);
+    fixture.shared.go.store(true, .release);
+    handle.cancel(fixture.rt.io());
+    assert(handle.token.raw == null);
+}
+
+test "a group cancel reaches members homed on three peers" {
+    if (!Runtime.fibers_supported) return error.SkipZigTest;
+    var rt: Runtime = try .init(std.testing.allocator, options());
+    defer rt.deinit();
+
+    _ = rt.io();
+    const fixture = try std.testing.allocator.create(Fixture);
+    defer std.testing.allocator.destroy(fixture);
+
+    for ([_]u64{ 21, 22, 23, 24, 25, 26 }) |seed| {
+        const cancel_every: u32 = 1 + @as(u32, @intCast(seed % 3));
+        const count: u32 = 6 + @as(u32, @intCast(seed % 4)) * 6;
+        try fixture_init(fixture, &rt, seed, count, cancel_every);
+        const context = std.mem.asBytes(&fixture);
+        const body: concurrency.Body = .{ .future = canceler_body };
+        const alignment: std.mem.Alignment = .of(*Fixture);
+        const canceler = concurrency.task_create(&rt, 0, .@"1", context, alignment, body) orelse {
+            return error.OutOfMemory;
+        };
+        _ = try rt.sched.spawn(concurrency.task_entry, canceler);
+        fixture_start(fixture);
+        rt.sched.run(rt.baselineIo());
+
+        try std.testing.expect(concurrency.task_is_done(canceler));
+        try check_ended(fixture, false);
+        // Each waiting member ended by acknowledging the cancel, once; the others never did.
+        const waiting = @divFloor(count + cancel_every - 1, cancel_every);
+        try std.testing.expectEqual(waiting, fixture.shared.canceled.load(.acquire));
+        concurrency.task_free(&rt, canceler);
     }
 }
