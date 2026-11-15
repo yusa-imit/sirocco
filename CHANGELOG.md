@@ -9,6 +9,11 @@ exemption recorded in `citadel/protocol/VERSIONING.md`.
 
 ### Changed
 
+- A group cancel mails a cancel to every member homed off the canceler's carrier
+  (`src/concurrency_group.zig`): the member's home applies it, and the member settles the mail
+  before it frees its own record. Tested with 6..24 members on peers 1..3 and seeded cancel
+  patterns (`src/group_peer_test.zig`, plan `005` item 7). The handler needs a free fiber on the
+  home carrier.
 - A seeded model test runs `await` and cancel of tasks homed on peers 1..3 of four carriers
   (`src/await_model_peers_test.zig`, 16 fixed seeds): awaiters on the test thread (before or after
   the finish) or on a peer fiber, cancelers on the test thread or a peer fiber, checked against the
