@@ -73,8 +73,9 @@ and then multi-carrier as plan 005. No consumer pins sirocco yet and zoltraak is
       end on a peer and the last one wakes the awaiter on its home
       (`src/group_peer_test.zig`). A group cancel mails a cancel to each member homed off the
       canceler's carrier; the member settles the mail before it frees its record, and the home
-      needs a free fiber to run the handler (`src/group_peer_test.zig`, 6 seeds). An awaiter
-      on a peer and an atomic `run_until` stop flag remain. A close
+      needs a free fiber to run the handler (`src/group_peer_test.zig`, 6 seeds). `run_until`
+      reads its stop flag atomically, after `inbox_version`, so a finisher on a peer cannot
+      strand the driver (`src/sched_test.zig`). An awaiter on a peer remains. A close
       from a fiber on a peer carrier is pinned by `src/net_close_peer_test.zig` (it takes the
       foreign-close path; only carrier 0 arms the poller, so the per-slot lock and armed mask of
       ADR 0004 section 4 come with item 8's placement). The seeded 4-carrier model test for

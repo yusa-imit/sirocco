@@ -496,3 +496,63 @@ test "here is one carrier per thread: a second scheduler's fiber does not see th
     try std.testing.expect(!first.in_fiber());
     try std.testing.expect(!second.in_fiber());
 }
+
+const StopRace = struct {
+    sched: *Sched,
+    io: Io,
+    fiber: ?*Fiber,
+    /// Set by the fiber just before it parks.
+    parked: u32,
+    stop: bool,
+    delay_spins: u32,
+};
+
+fn test_stop_parker(arg: ?*anyopaque) void {
+    const race: *StopRace = @ptrCast(@alignCast(arg.?));
+    race.fiber = race.sched.current_fiber();
+    @atomicStore(u32, &race.parked, 1, .release);
+    race.sched.park();
+}
+
+/// A finisher on another carrier: raises the stop flag, then notifies, as `task_publish` does.
+fn test_stop_raiser(race: *StopRace) void {
+    for (0..std.math.maxInt(u32)) |_| {
+        if (@atomicLoad(u32, &race.parked, .acquire) == 1) break;
+        std.Thread.yield() catch {}; // Only a scheduling hint; spinning again is the fallback.
+    }
+    for (0..race.delay_spins) |_| std.atomic.spinLoopHint();
+    @atomicStore(bool, &race.stop, true, .release);
+    race.sched.notify(race.io);
+}
+
+test "run_until is woken by a stop flag raised from another thread at any moment" {
+    if (!supported) return error.SkipZigTest;
+    const rounds_max: u32 = 1500;
+    const delay_spins_max: u32 = 4000;
+    var sched: Sched = undefined;
+    try sched.init(std.testing.allocator, test_options(2, 32 * 1024));
+    defer sched.deinit(std.testing.allocator);
+
+    var prng = std.Random.DefaultPrng.init(0x5709_0001);
+    for (0..rounds_max) |_| {
+        var race: StopRace = .{
+            .sched = &sched,
+            .io = std.testing.io,
+            .fiber = null,
+            .parked = 0,
+            .stop = false,
+            .delay_spins = prng.random().uintLessThan(u32, delay_spins_max),
+        };
+        _ = try sched.spawn(test_stop_parker, &race);
+        const raiser = try std.Thread.spawn(.{}, test_stop_raiser, .{&race});
+        // The fiber parks, so the carrier idles; the raiser's notify must end that sleep.
+        sched.run_until(std.testing.io, &race.stop);
+        raiser.join();
+        try std.testing.expect(race.stop);
+        try std.testing.expectEqual(@as(u32, 1), sched.live_count);
+
+        sched.unpark_foreign(std.testing.io, race.fiber.?);
+        sched.run(std.testing.io);
+        try std.testing.expectEqual(@as(u32, 0), sched.live_count);
+    }
+}

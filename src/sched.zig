@@ -618,11 +618,11 @@ pub fn run(sched: *Sched, io: Io) void {
 }
 
 /// Like `run`, but returns as soon as `stop.*` is true after a fiber has switched out (or no fiber
-/// is alive), leaving the other fibers alive for a later `run`/`run_until`. `stop` is written
-/// only by fibers on this thread. Same preconditions as `run`.
+/// is alive), leaving the other fibers alive for a later `run`/`run_until`. `stop` is written by
+/// a fiber on any carrier, with an atomic store followed by `notify`. Same preconditions as `run`.
 pub fn run_until(sched: *Sched, io: Io, stop: *const bool) void {
     sched.run_loop(io, stop);
-    if (!stop.*) assert(sched.live_count == 0);
+    if (!@atomicLoad(bool, stop, .acquire)) assert(sched.live_count == 0);
 }
 
 fn run_loop(sched: *Sched, io: Io, stop: ?*const bool) void {
@@ -637,10 +637,12 @@ fn run_loop(sched: *Sched, io: Io, stop: ?*const bool) void {
     }
 
     while (sched.live_count > 0) {
-        if (stop) |flag| {
-            if (flag.*) break;
-        }
+        // `version` first: a finisher on another carrier raises `stop` and then notifies, so a
+        // notify that lands after this read changes the word `idle_wait` sleeps on.
         const version = @atomicLoad(u32, &sched.inbox_version, .acquire);
+        if (stop) |flag| {
+            if (@atomicLoad(bool, flag, .acquire)) break;
+        }
         sched.inbox_drain();
         mail.drain(sched);
         const deadline_ns = sleep.fire(sched, io);
