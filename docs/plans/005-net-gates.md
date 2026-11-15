@@ -75,7 +75,10 @@ and then multi-carrier as plan 005. No consumer pins sirocco yet and zoltraak is
       canceler's carrier; the member settles the mail before it frees its record, and the home
       needs a free fiber to run the handler (`src/group_peer_test.zig`, 6 seeds). `run_until`
       reads its stop flag atomically, after `inbox_version`, so a finisher on a peer cannot
-      strand the driver (`src/sched_test.zig`). An awaiter on a peer remains. A close
+      strand the driver (`src/sched_test.zig`). A fiber on a peer may `await` a task of carrier 0:
+      it registers in the join word, parks on its own carrier and is resumed there
+      (`src/await_peer_test.zig`; `current_task` still knows only carrier 0's fibers, which
+      item 8's placement generalizes). A close
       from a fiber on a peer carrier is pinned by `src/net_close_peer_test.zig` (it takes the
       foreign-close path; only carrier 0 arms the poller, so the per-slot lock and armed mask of
       ADR 0004 section 4 come with item 8's placement). The seeded 4-carrier model test for

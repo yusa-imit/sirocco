@@ -497,6 +497,20 @@ fn task_publish(task: *Task) void {
     }
 }
 
+/// The carrier of `rt`, carrier 0 or a peer, whose fiber is the calling one; null on any other
+/// thread, and on carrier 0's thread outside `run` (the driver). Any thread.
+fn fiber_carrier(rt: *Runtime) ?*Sched {
+    const here = Sched.here() orelse return null;
+    if (!here.in_fiber()) return null;
+    if (here.index == 0) {
+        assert(here == &rt.sched);
+        return here;
+    }
+    assert(here.index <= rt.peers.len);
+    assert(here == &rt.peers[here.index - 1].sched);
+    return here;
+}
+
 /// Waits for `task` (parking inside a fiber, driving the scheduler outside one), moves the result
 /// out and frees the record.
 fn task_finish(
@@ -507,8 +521,9 @@ fn task_finish(
 ) void {
     assert(task.sched == &rt.sched);
     assert(result.len == task.result_len);
-    if (rt.sched.in_fiber()) {
-        if (join.await_fiber(&task.join, rt.sched.current_fiber())) rt.sched.park();
+    if (fiber_carrier(rt)) |here| {
+        // The awaiter parks on its own carrier; the finisher wakes it on `fiber.home`.
+        if (join.await_fiber(&task.join, here.current_fiber())) here.park();
     } else {
         // Outside any fiber the carrier loop is not running (all fibers run inside `run`).
         assert(!rt.sched.running);
