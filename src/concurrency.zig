@@ -490,7 +490,7 @@ fn task_publish(task: *Task) void {
         .none => {},
         .driver => {
             // The driver is carrier 0's thread; once it sees the flag it may free the record.
-            task.driver_stop = true;
+            @atomicStore(bool, &task.driver_stop, true, .release);
             rt.sched.notify(rt.baselineIo());
         },
         .fiber => |fiber| join.wake_fiber(fiber, rt.baselineIo()),

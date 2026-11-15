@@ -9,6 +9,10 @@ exemption recorded in `citadel/protocol/VERSIONING.md`.
 
 ### Changed
 
+- `Sched.run_until` reads `inbox_version` before the stop flag and reads the flag atomically, and
+  `task_publish` raises `driver_stop` with an atomic store: a finisher on a peer carrier that
+  raises the flag and notifies between the two reads no longer leaves the driver asleep on the
+  new version (`src/sched_test.zig`, plan `005` item 7).
 - A group cancel mails a cancel to every member homed off the canceler's carrier
   (`src/concurrency_group.zig`): the member's home applies it, and the member settles the mail
   before it frees its own record. Tested with 6..24 members on peers 1..3 and seeded cancel
