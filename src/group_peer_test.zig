@@ -6,6 +6,7 @@
 
 const std = @import("std");
 const stdx = @import("stdx.zig");
+const cancel_mail = @import("cancel_mail.zig");
 const concurrency = @import("concurrency.zig");
 const group = @import("concurrency_group.zig");
 const mail = @import("mail.zig");
@@ -41,6 +42,8 @@ const Member = struct {
     task: ?*Task,
     /// The member runs until a cancel is acknowledged, ignoring `Shared.go`.
     wait_cancel: bool,
+    /// The member runs until a cancel mail was posted for it, then ends without handling it.
+    wait_posted: bool,
 };
 
 const Fixture = struct {
@@ -55,13 +58,17 @@ const Fixture = struct {
 };
 
 fn options() Runtime.Options {
+    return options_for(32); // A cancel handler needs a free fiber beside every parked member.
+}
+
+fn options_for(fibers_max: u32) Runtime.Options {
     return .{
         .backend = .threaded,
         .unimplemented = .forward,
         .environ = .empty,
         .argv0 = .empty,
         .carriers = 4,
-        .fibers_max = 32, // A cancel handler needs a free fiber beside every parked member.
+        .fibers_max = fibers_max,
         .batch_ops_max = 8,
         .fiber_stack_size = 128 * 1024,
         .offload_threads = 2,
@@ -84,6 +91,12 @@ fn member_body(context: *const anyopaque) void {
         }
         _ = member.shared.finished.fetchAdd(1, .release);
         return;
+    }
+    if (member.wait_posted) {
+        for (0..spin_max) |_| {
+            if (@atomicLoad(bool, &member.task.?.cancel_slot.posted, .acquire)) break;
+            here.yield();
+        }
     }
     for (0..spin_max) |_| {
         if (member.shared.go.load(.acquire)) break;
@@ -121,6 +134,7 @@ fn fixture_init(
             .yields = prng.random().uintLessThan(u32, yields_max),
             .task = null,
             .wait_cancel = cancel_every != 0 and index % cancel_every == 0,
+            .wait_posted = false,
         };
         const context = std.mem.asBytes(&member);
         const body: concurrency.Body = .{ .member = member_body };
@@ -267,5 +281,36 @@ test "a group cancel reaches members homed on three peers" {
         const waiting = @divFloor(count + cancel_every - 1, cancel_every);
         try std.testing.expectEqual(waiting, fixture.shared.canceled.load(.acquire));
         concurrency.task_free(&rt, canceler);
+    }
+}
+
+test "members that fill their home's fibers end before their cancel mails can start" {
+    if (!Runtime.fibers_supported) return error.SkipZigTest;
+    const fibers_count: u32 = 2;
+    var rt: Runtime = try .init(std.testing.allocator, options_for(fibers_count));
+    defer rt.deinit();
+
+    _ = rt.io();
+    const fixture = try std.testing.allocator.create(Fixture);
+    defer std.testing.allocator.destroy(fixture);
+
+    for ([_]u64{ 31, 32, 33 }) |seed| {
+        try fixture_init(fixture, &rt, seed, fibers_count, 0);
+        fixture.shared.go.store(true, .release);
+        // Every member homes on peer 1, whose fibers are all taken by the members themselves.
+        for (0..fixture.count) |index| {
+            fixture.members[index].wait_posted = true;
+            fixture.tasks[index].sched = &rt.peers[0].sched;
+        }
+        fixture_start(fixture);
+        // The cancel mails queue behind the start mails; no fiber is free to run a handler, so
+        // each member must retire its own mail when it ends or it would wait for it forever.
+        for (0..fixture.count) |index| {
+            cancel_mail.request(fixture.tasks[index], rt.baselineIo());
+        }
+        try spin_until_idle(fixture.rec);
+        try std.testing.expectEqual(fixture.count, fixture.shared.finished.load(.acquire));
+        try std.testing.expectEqual(@as(u32, 0), fixture.rec.pending);
+        rt.threaded.allocator.destroy(fixture.rec);
     }
 }

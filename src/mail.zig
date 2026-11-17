@@ -87,6 +87,32 @@ pub fn drain(sched: *Sched) void {
     if (sched.mailbox.pending_head == null) assert(sched.mailbox.pending_tail == null);
 }
 
+/// Takes back `mail` when its fiber has not been spawned yet: true means it was still waiting and
+/// nothing will ever read it, false means `drain` already started it. For the carrier thread, from
+/// a fiber or outside one (a fiber runs between drains, never inside one). Precondition: `mail`
+/// was posted to `sched` and not withdrawn before. The walk is bounded by `outstanding_max`.
+pub fn withdraw(sched: *Sched, mail: *Mail) bool {
+    assert(Sched.here() == sched);
+    mailbox_collect(&sched.mailbox);
+    var before: ?*Mail = null;
+    var node = sched.mailbox.pending_head;
+    for (0..outstanding_max) |_| {
+        const current = node orelse return false;
+        if (current == mail) {
+            if (before) |previous| previous.next = current.next else {
+                sched.mailbox.pending_head = current.next;
+            }
+            if (sched.mailbox.pending_tail == current) sched.mailbox.pending_tail = before;
+            current.next = null;
+            if (sched.mailbox.pending_head == null) assert(sched.mailbox.pending_tail == null);
+            return true;
+        }
+        before = current;
+        node = current.next;
+    }
+    unreachable; // A pending list never exceeds `outstanding_max` entries.
+}
+
 /// Appends the posted stack to the pending FIFO in posting order; the walk is bounded by
 /// `outstanding_max`.
 fn mailbox_collect(mailbox: *Mailbox) void {

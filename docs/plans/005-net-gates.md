@@ -73,7 +73,9 @@ and then multi-carrier as plan 005. No consumer pins sirocco yet and zoltraak is
       end on a peer and the last one wakes the awaiter on its home
       (`src/group_peer_test.zig`). A group cancel mails a cancel to each member homed off the
       canceler's carrier; the member settles the mail before it frees its record, and the home
-      needs a free fiber to run the handler (`src/group_peer_test.zig`, 6 seeds). `run_until`
+      needs a free fiber to run the handler (`src/group_peer_test.zig`, 6 seeds); a member that ends
+      before its mail started takes the mail back (`mail.withdraw`), so a home whose fibers all
+      belong to members cannot stall on it. `run_until`
       reads its stop flag atomically, after `inbox_version`, so a finisher on a peer cannot
       strand the driver (`src/sched_test.zig`). A fiber on a peer may `await` a task of carrier 0:
       it registers in the join word, parks on its own carrier and is resumed there
