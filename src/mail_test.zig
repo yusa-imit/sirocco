@@ -29,6 +29,11 @@ const Probe = struct {
     release: std.atomic.Value(u32),
     started: std.atomic.Value(u32),
     parked: ?*Sched.Fiber,
+    /// What `withdraw` returned for the middle and the last of three waiting mails, and for the
+    /// mail whose fiber is running it.
+    took_middle: bool,
+    took_last: bool,
+    took_running: bool,
 
     fn record(probe: *Probe, id: u32) void {
         assert(probe.ids_len < probe.ids.len);
@@ -37,7 +42,13 @@ const Probe = struct {
     }
 };
 
-const Job = struct { probe: *Probe, id: u32, mail: Mail };
+const Job = struct {
+    probe: *Probe,
+    id: u32,
+    mail: Mail,
+    target: ?*Job = null,
+    target_last: ?*Job = null,
+};
 
 fn probe_make(sched: *Sched) Probe {
     return .{
@@ -51,6 +62,9 @@ fn probe_make(sched: *Sched) Probe {
         .release = .init(0),
         .started = .init(0),
         .parked = null,
+        .took_middle = false,
+        .took_last = false,
+        .took_running = true,
     };
 }
 
@@ -86,6 +100,23 @@ fn entry_hold(arg: ?*anyopaque) void {
         if (probe.release.load(.acquire) == 1) break;
         probe.sched.yield();
     }
+    probe.record(job.id);
+    _ = probe.done.fetchAdd(1, .release);
+}
+
+/// Holds its fiber, then takes back two of the three mails still waiting for one: the middle one
+/// and the last one, in that order (`Job.target` and `Job.target_last`).
+fn entry_withdraw(arg: ?*anyopaque) void {
+    const job = job_of(arg);
+    const probe = job.probe;
+    probe.started.store(1, .release);
+    for (0..spin_max) |_| {
+        if (probe.release.load(.acquire) == 1) break;
+        probe.sched.yield();
+    }
+    probe.took_middle = mail.withdraw(probe.sched, &job.target.?.mail);
+    probe.took_last = mail.withdraw(probe.sched, &job.target_last.?.mail);
+    probe.took_running = mail.withdraw(probe.sched, &job.mail);
     probe.record(job.id);
     _ = probe.done.fetchAdd(1, .release);
 }
@@ -300,4 +331,39 @@ test "mail posted by several threads at once all runs, none twice" {
 
     const total: u32 = producers * mails_per_producer;
     try std.testing.expectEqual(total, probe.done.load(.acquire));
+}
+
+test "a withdrawn mail never starts, one already running cannot be taken back" {
+    if (!Sched.supported) return error.SkipZigTest;
+    const io = std.testing.io;
+    var peer: Peer = undefined;
+    try peer.start(options_futex(1), io);
+    var probe = probe_make(&peer.sched);
+    var first = job_make(&probe, 1, entry_withdraw);
+    var head = job_make(&probe, 2, entry_plain);
+    var middle = job_make(&probe, 3, entry_plain);
+    var last = job_make(&probe, 4, entry_plain);
+    first.target = &middle;
+    first.target_last = &last;
+
+    job_post(&first, io);
+    for (0..spin_max) |_| {
+        if (probe.started.load(.acquire) == 1) break;
+        std.Thread.yield() catch {}; // A scheduling hint only; spinning again is the fallback.
+    }
+    // The only fiber is held, so all three wait; the carrier is busy and has not collected them.
+    job_post(&head, io);
+    job_post(&middle, io);
+    job_post(&last, io);
+    probe.release.store(1, .release);
+    wait_done(&probe, 2) catch |err| {
+        peer.finish(io);
+        return err;
+    };
+    peer.finish(io);
+
+    try std.testing.expect(probe.took_middle);
+    try std.testing.expect(probe.took_last);
+    try std.testing.expect(!probe.took_running);
+    try std.testing.expectEqualSlices(u32, &.{ 1, 2 }, probe.ids[0..probe.ids_len]);
 }

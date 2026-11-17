@@ -355,9 +355,9 @@ pub fn member_finish(task: *Task) void {
     // awaiter, which may free it once idle, so only `waiter` is used from here. A mailed cancel
     // holds a pointer into the task until its home has read it. The group may already read as
     // idle, so a canceler can return while this last member still settles; its fiber ends before
-    // the carriers halt. The handler needs a free fiber on the home, so a home whose fibers all
-    // wait here would stall: placement (item 8) must keep one spare.
-    if (mailed) cancel_mail.settle(task);
+    // the carriers halt. A mail not started yet is taken back, so a home whose fibers all end here
+    // does not wait for a handler that has no fiber to run on.
+    if (mailed) cancel_mail.retire(task);
     concurrency.task_free(rt, task);
     if (waiter) |fiber| join.wake_fiber(fiber, rt.baselineIo());
 }

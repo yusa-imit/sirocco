@@ -11,7 +11,8 @@
 //! Invariants: a task is canceled once, so a slot posts at most one mail. The handler skips the
 //! request when the task is already done (it ran to completion first), which is decided on the
 //! home, where finishing and canceling cannot interleave. A group member is its own settler: it
-//! settles on its home before it frees its record (`src/concurrency_group.zig`). The handler's
+//! retires the mail on its home before it frees its record (`src/concurrency_group.zig`), taking
+//! the mail back when no fiber was free to start it. The handler's
 //! last touch of the task is the wake of the settler.
 //!
 //! Allocation: none; the mail and join word are part of the `Task`. Threads: `request` and
@@ -91,6 +92,18 @@ pub fn settle(task: *Task) void {
         }
     }
     assert_always(join.is_done(&slot.join));
+}
+
+/// The end of a group member that was mailed a cancel, on its home carrier. The member holds a
+/// fiber while it ends, so waiting for a handler that needs a free fiber could stall a home whose
+/// fibers all end this way. A mail that has not started yet is taken back instead (nothing reads
+/// the slot afterwards); one that has started already has its fiber, so the member settles.
+/// Precondition: `request` mailed this task, and the caller is the task's own fiber.
+pub fn retire(task: *Task) void {
+    assert(task.cancel_slot.posted);
+    assert(Sched.here() == task.sched);
+    if (mail.withdraw(task.sched, &task.cancel_slot.mail)) return;
+    settle(task);
 }
 
 /// Fiber body started on the home carrier by the posted mail.
